@@ -6,8 +6,8 @@ from companion.brokers.models import (
     OrderStatus, OrdersQuery, PositionSide, QuotesQuery,
 )
 from companion.brokers.schwab_adapter import SchwabAdapter, normalize_account, normalize_fills, normalize_order
-from companion.brokers.canonical_view import build_canonical_state
-from companion.brokers.canonical_view import _ledger_fills
+from companion.brokers.canonical_view import _ledger_fills, _pending, build_canonical_state
+from companion.orders import pending_orders
 from companion.pnl import fills_from_transactions
 
 
@@ -53,20 +53,69 @@ def test_schwab_bracket_tree_maps_entry_and_exit_roles():
            "childOrderStrategies": [{"orderId": 101, "orderStrategyType": "OCO",
                                      "childOrderStrategies": [
                                          {"orderId": 102, "status": "WORKING", "orderType": "STOP",
+                                          "quantity": 2, "remainingQuantity": 2,
                                           "stopPrice": 95, "orderLegCollection": [leg("SELL")]},
                                          {"orderId": 103, "status": "WORKING", "orderType": "LIMIT",
+                                          "quantity": 2, "remainingQuantity": 2,
                                           "price": 110, "orderLegCollection": [leg("SELL")]},
                                      ]}]}
     group = normalize_order(raw)
     assert group.order_class == OrderClass.BRACKET
     assert [order.role for order in group.orders] == [OrderRole.ENTRY, OrderRole.STOP, OrderRole.TARGET]
-    assert group.orders[1].parent_id == "100"
+    assert group.orders[1].parent_id == "101"
     assert group.orders[1].stop_price == Decimal(95)
     assert group.orders[2].legs[0].instruction == OrderInstruction.SELL
+    def shape(rows):
+        return [(str(row.order_id), str(row.parent_id), str(row.oco_id),
+                 row.status, row.role, row.qty, row.stop, row.price, row.live)
+                for row in rows]
+    assert shape(_pending((group,))) == shape(pending_orders([raw]))
+
+
+def test_canonical_pending_keeps_schwab_activation_and_terminal_dedup():
+    def stop(oid, status):
+        return {"orderId": oid, "orderStrategyType": "SINGLE", "status": status,
+                "orderType": "STOP", "quantity": 2, "remainingQuantity": 2,
+                "stopPrice": 95, "orderLegCollection": [{
+                    "legId": 1, "instruction": "SELL", "positionEffect": "CLOSING",
+                    "quantity": 2, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]}
+    waiting = stop(20, "PENDING_ACTIVATION")
+    assert _pending((normalize_order(waiting),))[0].live
+    frozen = stop(21, "WORKING")
+    final = stop(21, "FILLED")
+    rows = _pending((normalize_order(frozen), normalize_order(final)))
+    assert rows == pending_orders([frozen, final]) == []
+
+
+def test_canonical_pending_preserves_multileg_close_and_remaining_quantity():
+    raw = {"orderId": 22, "orderStrategyType": "SINGLE", "status": "WORKING",
+           "orderType": "NET_DEBIT", "quantity": 2, "remainingQuantity": 1,
+           "price": 0.4, "orderLegCollection": [
+               {"legId": 1, "instruction": "BUY_TO_CLOSE", "positionEffect": "CLOSING",
+                "quantity": 2, "instrument": {"symbol": "AAPL  261113C00100000",
+                                               "assetType": "OPTION", "underlyingSymbol": "AAPL"}},
+               {"legId": 2, "instruction": "SELL_TO_CLOSE", "positionEffect": "CLOSING",
+                "quantity": 2, "instrument": {"symbol": "AAPL  261113C00105000",
+                                               "assetType": "OPTION", "underlyingSymbol": "AAPL"}},
+           ]}
+    rows = _pending((normalize_order(raw),))
+    assert [(row.role, row.qty, row.legs) for row in rows] == [
+        ("EXIT", 1.0, 2), ("EXIT", 1.0, 2)]
+    assert [(row.symbol, row.role, row.qty) for row in rows] == [
+        (row.symbol, row.role, row.qty) for row in pending_orders([raw])]
+
+
+def test_canonical_pending_does_not_claim_missing_remaining_quantity():
+    raw = {"orderId": 23, "orderStrategyType": "SINGLE", "status": "WORKING",
+           "orderType": "STOP", "stopPrice": 95, "orderLegCollection": [
+               {"instruction": "SELL", "quantity": 2,
+                "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]}
+    assert _pending((normalize_order(raw),))[0].qty == 0
 
 
 def test_schwab_standalone_exit_is_not_counted_as_an_entry():
     raw = {"orderId": 200, "orderStrategyType": "SINGLE", "status": "WORKING",
+           "quantity": 2, "remainingQuantity": 2,
            "orderType": "STOP", "stopPrice": 95, "orderLegCollection": [
                {"instruction": "SELL", "quantity": 2,
                 "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]}

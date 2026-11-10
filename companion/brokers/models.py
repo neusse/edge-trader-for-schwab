@@ -193,12 +193,16 @@ class OrderLeg:
     role: OrderRole = OrderRole.ENTRY
     underlying: str | None = None
     leg_ref: str | None = None
+    remaining_quantity: Decimal | None = None
+    position_effect: str | None = None
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:
             raise ValueError("order leg quantity must be positive")
         if self.filled_quantity < 0 or self.filled_quantity > self.quantity:
             raise ValueError("filled quantity must be between zero and quantity")
+        if self.remaining_quantity is not None and self.remaining_quantity < 0:
+            raise ValueError("remaining quantity cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -218,6 +222,12 @@ class BrokerOrder:
     trail_percent: Decimal | None = None
     entered_at: datetime | None = None
     updated_at: datetime | None = None
+    status_detail: str | None = None
+    order_type_detail: str | None = None
+    duration_detail: str | None = None
+    oco_id: BrokerOrderId | None = None
+    trail_link: str | None = None
+    trail_basis: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +236,7 @@ class OrderGroup:
     order_class: OrderClass
     status: OrderStatus
     orders: tuple[BrokerOrder, ...]
+    strategy_detail: str | None = None
 
 
 @dataclass(frozen=True)
