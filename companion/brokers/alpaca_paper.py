@@ -6,15 +6,17 @@ from decimal import Decimal
 import re
 
 from .adapter import BrokerAdapter
+from .alpaca_orders import build_order_request
 from .capabilities import ALPACA_PAPER
 from .configuration import paper_credentials, paper_trading_client
 from .models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand,
+    CancelOrder,
     BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery, MarketSession, MarketSessionsQuery,
-    MutationResult, OptionChain, OptionChainQuery, OptionContract, OptionType,
+    MutationResult, MutationStatus, OptionChain, OptionChainQuery, OptionContract, OptionType,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery,
     OrderRole, OrdersQuery, OrderStatus, OrderType, Position, PositionSide, Quote,
-    QuotesQuery,
+    QuotesQuery, ReplaceOrder, SubmitOrder,
     TimeInForce,
 )
 
@@ -242,4 +244,45 @@ class AlpacaPaperAdapter(BrokerAdapter):
         )
 
     def _execute(self, command: BrokerCommand) -> MutationResult:
-        raise NotImplementedError("Alpaca Paper order execution is not connected yet")
+        from alpaca.common.exceptions import APIError
+        from alpaca.trading.requests import ReplaceOrderRequest
+
+        try:
+            if isinstance(command, SubmitOrder):
+                request = build_order_request(command.intent)
+                raw = self._client.submit_order(request)
+                return MutationResult(MutationStatus.ACCEPTED, str(raw.id))
+            if isinstance(command, CancelOrder):
+                self._client.cancel_order_by_id(command.order_id)
+                return MutationResult(MutationStatus.ACCEPTED, command.order_id)
+            if isinstance(command, ReplaceOrder):
+                request = ReplaceOrderRequest(
+                    qty=float(command.quantity) if command.quantity is not None else None,
+                    limit_price=float(command.limit_price) if command.limit_price is not None else None,
+                    stop_price=float(command.stop_price) if command.stop_price is not None else None,
+                    trail=float(command.trail) if command.trail is not None else None,
+                )
+                raw = self._client.replace_order_by_id(command.order_id, request)
+                return MutationResult(MutationStatus.ACCEPTED, str(raw.id))
+            raise TypeError(f"unknown Alpaca command: {type(command).__name__}")
+        except ValueError as exc:
+            return MutationResult(MutationStatus.REJECTED, message=str(exc))
+        except APIError as exc:
+            if exc.status_code == 429:
+                headers = getattr(getattr(exc, "_http_error", None), "response", None)
+                value = headers.headers.get("Retry-After") if headers is not None else None
+                try:
+                    retry = float(value) if value is not None else None
+                except ValueError:
+                    retry = None
+                return MutationResult(MutationStatus.RATE_LIMITED,
+                                      message="Alpaca Paper rate limit", retry_after_seconds=retry)
+            if exc.status_code is None or exc.status_code >= 500 or exc.status_code == 408:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Order outcome unknown; reconcile with Alpaca before retrying")
+            return MutationResult(MutationStatus.REJECTED,
+                                  message=f"Alpaca Paper rejected the request (HTTP {exc.status_code})")
+        except Exception:
+            # A timeout may happen after Alpaca accepted an order. Never retry here.
+            return MutationResult(MutationStatus.UNKNOWN,
+                                  message="Order outcome unknown; reconcile by client order ID before retrying")
