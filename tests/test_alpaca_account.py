@@ -143,3 +143,24 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
         assert poller.trader.status()["armed"] is False
     finally:
         poller.stop()
+
+
+def test_option_contract_query_paginates_and_normalizes():
+    from datetime import date
+    from alpaca.trading.models import OptionContract as RawContract
+    from companion.brokers.models import OptionChainQuery, OptionType
+
+    class Client:
+        def get_option_contracts(self, request):
+            number = 2 if request.page_token else 1
+            raw = RawContract.model_construct(
+                symbol=f"AAPL261113C00{number}000000", underlying_symbol="AAPL",
+                expiration_date=date(2026, 11, 13), strike_price=str(number * 100),
+                type="call", multiplier="100", tradable=True, open_interest="10")
+            return SimpleNamespace(option_contracts=[raw],
+                                   next_page_token=None if number == 2 else "next")
+
+    chain = AlpacaPaperAdapter(Client()).query(
+        OptionChainQuery("AAPL", date(2026, 11, 13), OptionType.CALL))
+    assert len(chain.contracts) == 2
+    assert all(contract.option_type == OptionType.CALL for contract in chain.contracts)

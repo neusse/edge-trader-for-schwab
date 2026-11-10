@@ -1,7 +1,7 @@
 """Alpaca paper adapter. Read operations are added as their dashboard paths migrate."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import re
 
@@ -11,7 +11,8 @@ from .configuration import paper_credentials, paper_trading_client
 from .models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand,
     BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery, MarketSession, MarketSessionsQuery,
-    MutationResult, OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery,
+    MutationResult, OptionChain, OptionChainQuery, OptionContract, OptionType,
+    OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery,
     OrderRole, OrdersQuery, OrderStatus, OrderType, Position, PositionSide, Quote,
     QuotesQuery,
     TimeInForce,
@@ -134,6 +135,32 @@ class AlpacaPaperAdapter(BrokerAdapter):
         raise NotImplementedError(f"Alpaca Paper quotes for {asset_type.value} are not supported")
 
     def _query(self, query: BrokerQuery) -> BrokerQueryResult:
+        if isinstance(query, OptionChainQuery):
+            from alpaca.trading.enums import ContractType
+            from alpaca.trading.requests import GetOptionContractsRequest
+            filters = {"underlying_symbols": [query.underlying.upper()], "limit": 1000}
+            if query.expiration:
+                filters["expiration_date"] = query.expiration
+            else:
+                filters["expiration_date_gte"] = date.today()
+                filters["expiration_date_lte"] = date.today() + timedelta(days=30)
+            if query.option_type:
+                filters["type"] = ContractType(query.option_type.value)
+            contracts = []
+            while True:
+                page = self._client.get_option_contracts(GetOptionContractsRequest(**filters))
+                for raw in page.option_contracts or ():
+                    contracts.append(OptionContract(
+                        symbol=raw.symbol, underlying=raw.underlying_symbol,
+                        expiration=raw.expiration_date, strike=Decimal(str(raw.strike_price)),
+                        option_type=OptionType(_enum_value(raw.type)),
+                        multiplier=Decimal(str(raw.multiplier or 100)),
+                        tradable=bool(raw.tradable), open_interest=_decimal(raw.open_interest),
+                    ))
+                if not page.next_page_token:
+                    return OptionChain(query.underlying.upper(), tuple(contracts),
+                                       datetime.now(timezone.utc))
+                filters["page_token"] = page.next_page_token
         if isinstance(query, QuotesQuery):
             from alpaca.data.enums import DataFeed, OptionsFeed
             from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestQuoteRequest
