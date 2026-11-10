@@ -32,6 +32,10 @@ _ASSET = {"EQUITY": AssetType.EQUITY, "OPTION": AssetType.OPTION,
           "FUTURE": AssetType.FUTURE}
 _STATUS = {
     "WORKING": OrderStatus.WORKING, "QUEUED": OrderStatus.PENDING,
+    "ACCEPTED": OrderStatus.PENDING, "NEW": OrderStatus.PENDING,
+    "AWAITING_STOP_CONDITION": OrderStatus.PENDING,
+    "AWAITING_RELEASE_TIME": OrderStatus.PENDING,
+    "AWAITING_MANUAL_REVIEW": OrderStatus.PENDING,
     "PENDING_ACTIVATION": OrderStatus.PENDING, "AWAITING_PARENT_ORDER": OrderStatus.PENDING,
     "AWAITING_CONDITION": OrderStatus.PENDING, "PENDING_CANCEL": OrderStatus.PENDING,
     "PENDING_REPLACE": OrderStatus.PENDING, "FILLED": OrderStatus.FILLED,
@@ -42,6 +46,7 @@ _STATUS = {
 _ORDER_TYPE = {"MARKET": OrderType.MARKET, "LIMIT": OrderType.LIMIT,
                "STOP": OrderType.STOP, "STOP_LIMIT": OrderType.STOP_LIMIT,
                "TRAILING_STOP": OrderType.TRAILING_STOP,
+               "TRAILING_STOP_LIMIT": OrderType.TRAILING_STOP,
                "NET_DEBIT": OrderType.LIMIT, "NET_CREDIT": OrderType.LIMIT,
                "NET_ZERO": OrderType.LIMIT}
 
@@ -101,11 +106,19 @@ def normalize_order(raw: dict) -> OrderGroup:
             root_instructions.add(OrderInstruction(name))
         except ValueError:
             pass
-    root_role = (OrderRole.EXIT if strategy != "TRIGGER" and root_instructions and
-                 root_instructions <= closing else OrderRole.ENTRY)
+    root_legs = raw.get("orderLegCollection") or ()
+    closing_effect = bool(root_legs) and all(leg.get("positionEffect") == "CLOSING"
+                                             for leg in root_legs)
+    root_role = (OrderRole.EXIT if closing_effect or (root_instructions and root_instructions <= closing)
+                 else OrderRole.ENTRY)
 
-    def visit(node: dict, parent_id: str | None, role: OrderRole) -> None:
+    def visit(node: dict, parent_id: str | None, role: OrderRole,
+              oco_id: str | None) -> None:
         node_id = str(node.get("orderId") or root_id)
+        order_qty = _decimal(node.get("quantity"))
+        remaining = _decimal(node.get("remainingQuantity"))
+        if remaining is None:
+            remaining = order_qty
         legs = []
         for row in node.get("orderLegCollection") or ():
             instrument = row.get("instrument") or {}
@@ -115,12 +128,15 @@ def normalize_order(raw: dict) -> OrderGroup:
             name = (row.get("instruction") or "").lower().replace("_", "-")
             if not asset or not symbol or not quantity or not name:
                 continue
+            ratio = quantity / order_qty if order_qty else Decimal(1)
             legs.append(OrderLeg(
                 symbol=symbol, asset_type=asset, instruction=OrderInstruction(name),
                 quantity=quantity,
-                filled_quantity=min(quantity, _decimal(node.get("filledQuantity")) or Decimal(0)),
+                filled_quantity=min(quantity, (_decimal(node.get("filledQuantity")) or Decimal(0)) * ratio),
                 role=role, underlying=instrument.get("underlyingSymbol"),
                 leg_ref=str(row.get("legId")) if row.get("legId") is not None else None,
+                remaining_quantity=remaining * ratio if remaining is not None else Decimal(0),
+                position_effect=row.get("positionEffect"),
             ))
         status = _STATUS.get(node.get("status"), OrderStatus.UNKNOWN)
         if legs:
@@ -131,19 +147,31 @@ def normalize_order(raw: dict) -> OrderGroup:
                 time_in_force=TimeInForce.GTC if node.get("duration") in
                 ("GOOD_TILL_CANCEL", "GTC") else TimeInForce.DAY,
                 legs=tuple(legs), role=role, group_id=root_id, parent_id=parent_id,
+                client_order_id=node.get("tag"),
                 limit_price=_decimal(node.get("price")), stop_price=_decimal(node.get("stopPrice")),
+                trail_price=_decimal(node.get("stopPriceOffset"))
+                if node.get("stopPriceLinkType") != "PERCENT" else None,
+                trail_percent=_decimal(node.get("stopPriceOffset"))
+                if node.get("stopPriceLinkType") == "PERCENT" else None,
                 entered_at=datetime.fromisoformat(node["enteredTime"].replace("Z", "+00:00"))
                 if node.get("enteredTime") else None,
+                status_detail=node.get("status"), order_type_detail=kind,
+                duration_detail=node.get("duration"), oco_id=oco_id,
+                trail_link=node.get("stopPriceLinkType"),
+                trail_basis=node.get("stopPriceLinkBasis"),
             ))
+        child_oco = node_id if node.get("orderStrategyType") == "OCO" else oco_id
         for child in node.get("childOrderStrategies") or ():
             kind = child.get("orderType")
-            child_role = (OrderRole.STOP if kind in ("STOP", "STOP_LIMIT", "TRAILING_STOP")
+            child_role = (OrderRole.STOP if kind in ("STOP", "STOP_LIMIT", "TRAILING_STOP",
+                                                    "TRAILING_STOP_LIMIT")
                           else OrderRole.TARGET if kind == "LIMIT" else OrderRole.EXIT)
-            visit(child, node_id if legs else parent_id, child_role)
+            visit(child, node_id, child_role, child_oco)
 
-    visit(raw, None, root_role)
+    visit(raw, None, root_role, None)
     return OrderGroup(root_id, order_class,
-                      _STATUS.get(raw.get("status"), OrderStatus.UNKNOWN), tuple(members))
+                      _STATUS.get(raw.get("status"), OrderStatus.UNKNOWN), tuple(members),
+                      strategy_detail=strategy or "SINGLE")
 
 
 def normalize_fills(transactions: list[dict]) -> tuple[Fill, ...]:

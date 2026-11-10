@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from .orders import PendingOrder, pending_orders, stop_coverage
+from .orders import PendingOrder, stop_coverage
 from .pnl import (Book, Fill, build_book, opening_inventory,
                   session_day)
 
@@ -275,15 +275,16 @@ def _filled_in_orders(orders: list[dict], day) -> float:
     return total
 
 
-def build_state(*, account: dict | None, orders: list[dict], fills: list[Fill], quotes: dict,
+def build_state(*, account: dict | None, orders: list[dict], pending: list[PendingOrder],
+                fills: list[Fill], quotes: dict,
                 prev_session: dict[str, tuple[float, float | None]], freshness: dict,
                 history_complete: bool, orders_fresh: bool, auth_hours_left: float | None,
-                known_terminal: set[int] | None = None, now: datetime | None = None) -> dict:
+                now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     eq_today = session_day(now, "EQUITY")
     fut_today = session_day(now, "FUTURE")      # rolls at 18:00 ET
     book = build_book(fills, opening_inventory(fills, prev_session, eq_today))
-    pend = pending_orders(orders, known_terminal)
+    pend = pending
     acct = (account or {}).get("securitiesAccount") or {}
 
     positions = _position_rows(acct, pend, quotes, book, orders_fresh) if acct else []

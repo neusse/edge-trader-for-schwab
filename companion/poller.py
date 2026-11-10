@@ -30,8 +30,8 @@ from email.utils import parsedate_to_datetime
 from . import schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, Fill, session_day
-from .brokers.canonical_view import _ledger_fills
-from .brokers.schwab_adapter import normalize_fills
+from .brokers.canonical_view import _ledger_fills, _pending
+from .brokers.schwab_adapter import normalize_fills, normalize_order
 from .store import Store, now_iso
 from .view import build_state, ticket_pnl
 
@@ -393,12 +393,20 @@ class Poller:
         day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()
         txns = self.store.transactions_since(since)
         fills = _ledger_fills(normalize_fills(txns))
-        st = build_state(account=self.account, orders=self._merged_orders(),
+        merged = self._merged_orders()
+        try:
+            pending = _pending(tuple(normalize_order(order) for order in merged), self.terminal)
+            orders_fresh = self._orders_fresh()
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("canonical Schwab order normalization failed: %r", exc)
+            pending = []
+            orders_fresh = False
+            self.fresh["orders_sweep"]["error"] = "order normalization incomplete"
+        st = build_state(account=self.account, orders=merged, pending=pending,
                          fills=fills, quotes=self.quotes,
                          prev_session=self.store.load_prev_session(day),
                          freshness=self.fresh, history_complete=self.history_complete,
-                         orders_fresh=self._orders_fresh(), auth_hours_left=schwab.auth_hours_left(),
-                         known_terminal=self.terminal)
+                         orders_fresh=orders_fresh, auth_hours_left=schwab.auth_hours_left())
         self.last_rebuild = now_iso()
         st["status"] = self.status
         st["last_rebuild"] = self.last_rebuild
@@ -431,8 +439,7 @@ class Poller:
                 self.trader.spreads.attach_fill_ids(st["spreads"] + st["spreads_closed"])
             st["trading"] = self.trader.status()
             st["brackets"] = self.trader.brackets(
-                today, pending_orders(self._merged_orders(), self.terminal), positions,
-                self._orders_fresh() and self._fresh("account"))
+                today, pending, positions, orders_fresh and self._fresh("account"))
             ticket_pnl(st["brackets"], st.get("positions") or [], st.get("closed") or [])
             self._add_r_and_log(st, today, fills)
             self._auto_be(st)

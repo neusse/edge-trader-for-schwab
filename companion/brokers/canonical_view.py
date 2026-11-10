@@ -48,12 +48,17 @@ def _ledger_fills(fills: tuple[Fill, ...]) -> list[LedgerFill]:
     return sorted(rows, key=lambda row: (row.time, sequence(row)))
 
 
-def _pending(groups: tuple[OrderGroup, ...]) -> list[PendingOrder]:
+def _pending(groups: tuple[OrderGroup, ...],
+             known_terminal: set[str] | None = None) -> list[PendingOrder]:
     rows = []
     seen = set()
+    done = {str(value) for value in (known_terminal or ())} | {
+        order.order_id for group in groups for order in group.orders
+        if order.status in _TERMINAL
+    }
     for group in groups:
         for order in group.orders:
-            if order.status in _TERMINAL:
+            if order.order_id in done:
                 continue
             for index, leg in enumerate(order.legs):
                 key = (order.order_id, leg.leg_ref or index)
@@ -62,36 +67,43 @@ def _pending(groups: tuple[OrderGroup, ...]) -> list[PendingOrder]:
                 seen.add(key)
                 role = order.role
                 if role == OrderRole.EXIT:
-                    if order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT,
-                                            OrderType.TRAILING_STOP):
+                    native_type = order.order_type_detail
+                    if (native_type in ("STOP", "STOP_LIMIT", "TRAILING_STOP", "TRAILING_STOP_LIMIT")
+                            or (native_type is None and order.order_type in (
+                                OrderType.STOP, OrderType.STOP_LIMIT, OrderType.TRAILING_STOP))):
                         role = OrderRole.STOP
-                    elif order.order_type == OrderType.LIMIT:
+                    elif native_type == "LIMIT" or (native_type is None and order.order_type == OrderType.LIMIT):
                         role = OrderRole.TARGET
                 rows.append(PendingOrder(
                     order_id=order.order_id, leg_id=leg.leg_ref or str(index + 1),
                     legs=len(order.legs), group_id=group.group_id,
-                    group_type=group.order_class.value.upper(), parent_id=order.parent_id,
-                    oco_id=group.group_id if group.order_class.value in ("oco", "bracket")
-                    and role != OrderRole.ENTRY else None,
+                    group_type=group.strategy_detail or group.order_class.value.upper(),
+                    parent_id=order.parent_id,
+                    oco_id=order.oco_id or (group.group_id if group.order_class.value in ("oco", "bracket")
+                    and role != OrderRole.ENTRY else None),
                     # Pending activation is deliberately not counted as broker-held protection.
-                    status=("WORKING" if order.status in _ACTIVE else "PENDING_NEW"),
+                    status=order.status_detail or
+                    ("WORKING" if order.status in _ACTIVE else "PENDING_NEW"),
                     symbol=leg.symbol, underlying=leg.underlying or leg.symbol,
                     asset_type=leg.asset_type.value.upper(),
                     instruction=leg.instruction.value.upper().replace("-", "_"),
-                    effect=("OPENING" if leg.instruction in _OPEN else
+                    effect=leg.position_effect or ("OPENING" if leg.instruction in _OPEN else
                             "CLOSING" if leg.instruction in _CLOSE else None),
-                    order_type=order.order_type.value.upper().replace("-", "_"),
-                    qty=float(leg.quantity - leg.filled_quantity),
+                    order_type=order.order_type_detail or
+                    order.order_type.value.upper().replace("-", "_"),
+                    qty=float(leg.remaining_quantity if leg.remaining_quantity is not None else
+                              leg.quantity - leg.filled_quantity),
                     filled=float(leg.filled_quantity),
                     price=float(order.limit_price) if order.limit_price is not None else None,
                     stop=float(order.stop_price) if order.stop_price is not None else None,
-                    duration=order.time_in_force.value.upper(),
+                    duration=order.duration_detail or order.time_in_force.value.upper(),
                     entered=order.entered_at.isoformat() if order.entered_at else "",
                     tag=order.client_order_id, role=role.value.upper(),
                     trail_offset=float(order.trail_price or order.trail_percent)
                     if order.trail_price is not None or order.trail_percent is not None else None,
-                    trail_link="PERCENT" if order.trail_percent is not None else
-                               "VALUE" if order.trail_price is not None else None,
+                    trail_link=order.trail_link or ("PERCENT" if order.trail_percent is not None else
+                               "VALUE" if order.trail_price is not None else None),
+                    trail_basis=order.trail_basis,
                 ))
     return sorted(rows, key=lambda row: (row.underlying, str(row.group_id),
                                          row.role, str(row.order_id), str(row.leg_id)))
