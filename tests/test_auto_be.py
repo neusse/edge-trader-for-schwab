@@ -41,7 +41,8 @@ def _state(mark, quote_ms=None):
     pos = {"symbol": "CRWV", "side": "SHORT", "qty": 675,
            "r": {"ticket_id": "t1", "side": "SHORT", "entry": 58.39, "stop": 59.13, "rps": 0.74,
                  "first_fill": "2026-10-27T15:33:19+0000"}}
-    return {"positions": [pos]}, {"CRWV": {"quote": {"mark": mark, "quoteTime": quote_ms}}}
+    return {"positions": [pos]}, {"CRWV": {"realtime": True,
+        "quote": {"mark": mark, "quoteTime": quote_ms}}}
 
 
 def test_fires_once_when_the_mark_touches_1r(tmp_path, monkeypatch):
@@ -74,6 +75,17 @@ def test_ignores_a_quote_from_before_the_fill_and_stale_data(tmp_path, monkeypat
     st, p.quotes = _state(57.00)
     p._auto_be(st)
     assert p.trader.calls == [] and p.trader.store.auto_be("t1")["state"] == "PENDING"
+
+
+def test_missing_or_future_quote_timestamp_cannot_trigger_auto_be(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch)
+    st, p.quotes = _state(57.00)
+    del p.quotes["CRWV"]["quote"]["quoteTime"]
+    p._auto_be(st)
+    assert p.trader.calls == []
+    st, p.quotes = _state(57.00, quote_ms=time.time() * 1000 + 60_000)
+    p._auto_be(st)
+    assert p.trader.calls == []
 
 
 def test_live_r_comes_from_the_ticket_that_opened_the_position(tmp_path, monkeypatch):

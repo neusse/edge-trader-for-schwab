@@ -31,6 +31,7 @@ from . import schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, Fill, session_day
 from .brokers.canonical_view import _ledger_fills, _pending
+from .brokers.models import AccountSnapshot, Quote
 from .brokers.schwab_adapter import normalize_account, normalize_fills, normalize_order, normalize_quotes
 from .store import Store, now_iso
 from .view import build_state, ticket_pnl
@@ -234,9 +235,10 @@ class Poller:
             data = self._call(name, lambda: self.client.account_details(h, fields="positions"))
             if not isinstance(data, dict) or "securitiesAccount" not in data:
                 return False
+            canonical = normalize_account(data, h)
             self.account = data
             self.store.save_positions(data)
-            self._record_prev_session(data)
+            self._record_prev_session(canonical)
         elif name == "orders_today":
             data = self._call(name, lambda: self.client.account_orders(h, self._session_start_utc(), now))
             if not isinstance(data, list):
@@ -297,36 +299,20 @@ class Poller:
                 else:
                     self.orders_followed.pop(oid, None)
 
-    def _record_prev_session(self, data: dict) -> None:
+    def _record_prev_session(self, account: AccountSnapshot) -> None:
         day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()
         rows: dict[str, tuple[float, float | None]] = {}
-        for p in (data.get("securitiesAccount") or {}).get("positions") or []:
-            sym = (p.get("instrument") or {}).get("symbol")
-            prev = float(p.get("previousSessionLongQuantity") or 0) - float(p.get("previousSessionShortQuantity") or 0)
-            if not sym or abs(prev) < 1e-9:
-                continue
-            qty = float(p.get("longQuantity") or 0) - float(p.get("shortQuantity") or 0)
-            untouched = abs(qty - prev) < 1e-9 and not float(p.get("currentDayCost") or 0)
-            # Schwab's average describes yesterday's inventory only while nothing traded today.
-            rows[sym] = (prev, float(p["averagePrice"]) if untouched and p.get("averagePrice") else None)
+        for position in account.previous_session_positions:
+            rows[position.symbol] = (float(position.quantity),
+                                     float(position.average_price) if position.average_price else None)
         if rows:
             self.store.save_prev_session(day, rows)
 
     def _quote_symbols(self) -> list[str]:
-        syms: set[str] = set()
-        acct = (self.account or {}).get("securitiesAccount") or {}
-        for p in acct.get("positions") or []:
-            s = (p.get("instrument") or {}).get("symbol")
-            if s:
-                syms.add(s)
-        for o in self._merged_orders():
-            if o.get("status") in TERMINAL or o.get("orderId") in self.terminal:
-                continue
-            for leg in o.get("orderLegCollection") or []:
-                syms.add(leg["instrument"]["symbol"])
-            for ch in o.get("childOrderStrategies") or []:
-                for leg in ch.get("orderLegCollection") or []:
-                    syms.add(leg["instrument"]["symbol"])
+        account = normalize_account(self.account, self.account_hash) if self.account else None
+        groups = tuple(normalize_order(order) for order in self._merged_orders())
+        syms = {position.symbol for position in account.positions} if account else set()
+        syms.update(order.symbol for order in _pending(groups, self.terminal))
         return sorted(syms)[:200]
 
     def _merged_orders(self) -> list[dict]:
@@ -431,14 +417,12 @@ class Poller:
         if self.trader is not None:
             today = list(self.orders_today.values())
             self.trader.reconcile(today)
-            positions = {}
-            for p in ((self.account or {}).get("securitiesAccount") or {}).get("positions") or []:
-                sym = (p.get("instrument") or {}).get("symbol")
-                if sym:
-                    positions[sym] = float(p.get("longQuantity") or 0) - float(p.get("shortQuantity") or 0)
+            positions = {position.symbol: float(position.quantity) *
+                         (1 if position.side.value == "long" else -1)
+                         for position in account.positions} if account else {}
             if self.trader.spreads:
                 # Companion spreads: persist fills, judge each one against the account, show them.
-                fresh = self._orders_fresh() and self._fresh("account") and self.account is not None
+                fresh = orders_fresh and self._fresh("account") and account is not None
                 merged = self._merged_orders()
                 st["spreads"] = [self.trader.spreads.view(sp) for sp in self.trader.spreads.reconcile(
                                      merged, positions if fresh else None, datetime.now(ET).date(), fresh,
@@ -456,37 +440,41 @@ class Poller:
                 today, pending, positions, orders_fresh and self._fresh("account"))
             ticket_pnl(st["brackets"], st.get("positions") or [], st.get("closed") or [])
             self._add_r_and_log(st, today, fills)
-            self._auto_be(st)
-        self._trail_estimates(st)
+            self._auto_be(st, quotes)
+        self._trail_estimates(st, quotes)
         with self._lock:
             self.state = st
 
-    def _trail_estimates(self, st: dict) -> None:
+    def _trail_estimates(self, st: dict, quotes: dict[str, Quote] | None = None) -> None:
         """Where each Schwab trailing stop sits now. Schwab's own stop price when it reports one;
         otherwise the best mark seen since we first saw the order, minus the offset. Seen from
         polls only, so the estimate never runs ahead of the real stop (it can lag behind it)."""
         from decimal import Decimal
         from .bracket import ticks_for, trail_level
+        quotes = quotes if quotes is not None else normalize_quotes(self.quotes, tuple(self.quotes))
         live_ids = set()
         for p in st.get("positions") or []:
             t = p.get("trail")
             if not t:
                 continue
             live_ids.add(t["order_id"])
-            raw = (self.quotes.get(p["symbol"]) or {}).get("quote") or {}
-            px = {"MARK": raw.get("mark") or raw.get("lastPrice"), "LAST": raw.get("lastPrice"),
-                  "BID": raw.get("bidPrice"), "ASK": raw.get("askPrice")}.get((t.get("basis") or "MARK").upper())
+            quote = quotes.get(p["symbol"])
+            basis = (t.get("basis") or "MARK").upper()
+            px = ({"MARK": quote.mark or quote.last, "LAST": quote.last,
+                   "BID": quote.bid, "ASK": quote.ask}.get(basis) if quote else None)
             # A quote from before the order was entered could be a better price the trail never
             # saw: only quotes stamped after entry count.
-            qt = raw.get("tradeTime") if (t.get("basis") or "MARK").upper() == "LAST" else raw.get("quoteTime")
+            qt = (quote.last_observed_at if basis == "LAST" else
+                  quote.observed_at if quote.timestamp_verified else None) if quote else None
             try:
-                entered = datetime.strptime(t.get("entered") or "", "%Y-%m-%dT%H:%M:%S%z").timestamp() * 1000
+                entered = datetime.fromisoformat((t.get("entered") or "").replace("Z", "+00:00"))
             except ValueError:
                 entered = None
-            if entered is None or not qt or qt < entered:
+            if entered is None or entered.tzinfo is None or qt is None or qt < entered:
                 px = None
             best = self.trail_best.get(t["order_id"])
-            if px:
+            if px is not None:
+                px = float(px)
                 better = best is None or (px > best if p["side"] == "LONG" else px < best)
                 best = px if better else best
                 self.trail_best[t["order_id"]] = best
@@ -494,7 +482,7 @@ class Poller:
                 t.update({"level": t["schwab_stop"], "estimated": False, "best": best})
             elif best and t.get("offset") and t.get("whole"):
                 spec = {"offset": Decimal(str(t["offset"])), "link": t.get("link") or "VALUE"}
-                pen = ((self.quotes.get(p["symbol"]) or {}).get("reference") or {}).get("isPennyPilot")
+                pen = quote.penny_pilot if quote else None
                 tk = ticks_for(p.get("asset_type"), p.get("underlying"), pen if isinstance(pen, bool) else None)
                 lvl = float(trail_level(Decimal(str(best)), spec, p["side"], tk))
                 t.update({"level": lvl, "estimated": True, "best": best})
@@ -506,14 +494,15 @@ class Poller:
             if oid not in live_ids:
                 del self.trail_best[oid]
 
-    def _auto_be(self, st: dict) -> None:
+    def _auto_be(self, st: dict, quotes: dict[str, Quote] | None = None) -> None:
         """Tickets sent with Auto B/E: show where each one fires, and when the mark touches +1R
         (frozen R of the ticket that opened the position) claim it and hand the one stop move to the
         trader in its own thread. The poller itself never waits on an order."""
         from .trading import market_open
+        quotes = quotes if quotes is not None else normalize_quotes(self.quotes, tuple(self.quotes))
         live = (self._fresh("quotes") and self._fresh("account") and self._fresh("transactions")
                 and self._orders_fresh() and market_open())
-        now_ms = time.time() * 1000
+        now = datetime.now(timezone.utc)
         for p in st.get("positions") or []:
             r = p.get("r")
             ab = self.trader.store.auto_be(r["ticket_id"]) if r else None
@@ -524,17 +513,16 @@ class Poller:
             p["auto_be"] = {"state": ab["state"], "trigger": trigger, "detail": ab["detail"]}
             if ab["state"] != "PENDING" or not live:
                 continue
-            entry = self.quotes.get(p["symbol"]) or {}
-            q = entry.get("quote") or {}
-            mark = q.get("mark")
-            if entry.get("realtime") is False:
+            quote = quotes.get(p["symbol"])
+            if quote is None or not quote.realtime or not quote.timestamp_verified:
                 continue
+            mark = float(quote.mark) if quote.mark is not None else None
             try:   # only a real-time quote from after the entry fill and under 15 s old counts
-                filled = datetime.strptime(r.get("first_fill") or "", "%Y-%m-%dT%H:%M:%S%z").timestamp() * 1000
+                filled = datetime.fromisoformat((r.get("first_fill") or "").replace("Z", "+00:00"))
             except ValueError:
                 continue
-            qt = q.get("quoteTime")
-            if not mark or not qt or qt < filled or now_ms - qt > 15_000:
+            age = (now - quote.observed_at).total_seconds()
+            if mark is None or filled.tzinfo is None or quote.observed_at < filled or not 0 <= age <= 15:
                 continue
             if mark < trigger - 1e-9 if long else mark > trigger + 1e-9:
                 continue

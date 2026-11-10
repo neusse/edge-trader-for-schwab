@@ -11,6 +11,9 @@ from companion.brokers.schwab_adapter import (
 from companion.brokers.canonical_view import _ledger_fills, _pending, build_canonical_state
 from companion.orders import pending_orders
 from companion.pnl import fills_from_transactions
+from companion.pnl import session_day
+from companion.poller import Poller
+from companion.store import Store
 from companion.view import _filled_in_orders, build_state
 
 
@@ -77,6 +80,50 @@ def test_reversed_position_is_not_classified_as_carried():
                         fills=[], quotes={}, prev_session={}, freshness={},
                         history_complete=True, orders_fresh=True, auth_hours_left=None)
     assert state["positions"][0]["held"] == "INTRADAY"
+
+
+def test_canonical_previous_session_keeps_position_closed_today(tmp_path):
+    raw = {"securitiesAccount": {"currentBalances": {}, "positions": [
+        {"instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
+         "longQuantity": 0, "shortQuantity": 0,
+         "previousSessionLongQuantity": 2, "averagePrice": 100,
+         "currentDayCost": 200}]}}
+    account = normalize_account(raw, "hash")
+    assert account.positions == ()
+    assert account.previous_session_positions[0].quantity == 2
+    assert account.previous_session_positions[0].average_price is None
+    store = Store(tmp_path / "state.db")
+    try:
+        poller = Poller(store)
+        poller._record_prev_session(account)
+        day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()
+        assert store.load_prev_session(day)["AAPL"] == (2.0, None)
+    finally:
+        store.close()
+
+
+def test_poller_quote_symbols_include_nested_live_exit_but_not_terminal_copy(tmp_path):
+    raw = {"orderId": 300, "orderStrategyType": "TRIGGER", "status": "FILLED",
+           "orderType": "MARKET", "orderLegCollection": [{
+               "instruction": "BUY", "quantity": 1,
+               "instrument": {"symbol": "MSFT", "assetType": "EQUITY"}}],
+           "childOrderStrategies": [{"orderId": 301, "orderStrategyType": "OCO",
+                                     "childOrderStrategies": [{
+                                         "orderId": 302, "status": "WORKING", "orderType": "STOP",
+                                         "quantity": 1, "stopPrice": 95,
+                                         "orderLegCollection": [{"instruction": "SELL", "quantity": 1,
+                                                                 "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]}]}]}
+    store = Store(tmp_path / "state.db")
+    try:
+        poller = Poller(store)
+        poller.account_hash = "hash"
+        poller.account = {"securitiesAccount": {"currentBalances": {}, "positions": []}}
+        poller.orders_today = {300: raw}
+        assert poller._quote_symbols() == ["AAPL"]
+        poller.terminal.add(302)
+        assert poller._quote_symbols() == []
+    finally:
+        store.close()
 
 
 def test_schwab_bracket_tree_maps_entry_and_exit_roles():
