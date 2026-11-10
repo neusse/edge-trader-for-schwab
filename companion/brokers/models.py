@@ -239,6 +239,8 @@ class Fill:
     price: Decimal
     occurred_at: datetime
     fees: Decimal = Decimal("0")
+    underlying: str | None = None
+    multiplier: Decimal | None = None
 
 
 @dataclass(frozen=True)

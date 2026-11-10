@@ -7,6 +7,8 @@ from companion.brokers.models import (
 )
 from companion.brokers.schwab_adapter import SchwabAdapter, normalize_account, normalize_fills, normalize_order
 from companion.brokers.canonical_view import build_canonical_state
+from companion.brokers.canonical_view import _ledger_fills
+from companion.pnl import fills_from_transactions
 
 
 class Response:
@@ -164,6 +166,37 @@ def test_schwab_trade_items_keep_opaque_fill_ids_and_fees():
     assert fills[0].fees == Decimal("-0.65")
     assert fills[1].instruction == OrderInstruction.SELL_TO_CLOSE
     assert fills[1].fees == 0
+
+
+def test_schwab_canonical_fills_preserve_option_and_future_ledger_economics():
+    raw = {"activityId": 500, "type": "TRADE", "status": "VALID",
+           "time": "2026-11-10T15:30:00+00:00", "transferItems": [
+               {"amount": 2, "price": 1.25, "cost": 250, "positionEffect": "OPENING",
+                "instrument": {"symbol": "AAPL  261113C00100000", "assetType": "OPTION",
+                               "underlyingSymbol": "AAPL"}},
+               {"amount": -1, "price": 21000, "cost": -42000, "positionEffect": "CLOSING",
+                "instrument": {"symbol": "/MNQZ26:XCME", "assetType": "FUTURE",
+                               "rootSymbol": "/MNQ"}},
+               {"cost": -0.65, "instrument": {"assetType": "CURRENCY"}},
+           ]}
+    old = fills_from_transactions([raw])
+    new = _ledger_fills(normalize_fills([raw]))
+    assert [(f.symbol, f.underlying, f.qty, f.multiplier, f.fees, f.effect)
+            for f in new] == [(f.symbol, f.underlying, f.qty, f.multiplier, f.fees, f.effect)
+                           for f in old]
+
+
+def test_canonical_fill_sequence_matches_numeric_schwab_activity_order():
+    row = {"activityId": 9, "type": "TRADE", "status": "VALID",
+           "time": "2026-11-10T15:30:00+00:00", "transferItems": [
+               {"amount": 1, "price": 100 + index, "positionEffect": "OPENING",
+                "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}
+               for index in range(12)]}
+    later = {**row, "activityId": 10, "transferItems": row["transferItems"][:1]}
+    old = fills_from_transactions([later, row, row])
+    new = _ledger_fills(normalize_fills([later, row, row]))
+    assert [fill.id for fill in new] == [fill.id for fill in old]
+    assert len(new) == 13
 
 
 def test_schwab_fill_query_bisects_when_response_hits_cap():

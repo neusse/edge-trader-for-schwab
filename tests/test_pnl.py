@@ -162,10 +162,13 @@ def test_futures_evening_fill_belongs_to_next_session():
 def test_closed_trade_lists_its_executions():
     from datetime import datetime, timezone
     from companion.view import build_state
+    from companion.brokers.canonical_view import _ledger_fills
+    from companion.brokers.schwab_adapter import normalize_fills
     txns = [txn("2026-10-20T14:00:00+0000", "TSX", 100, 10.0, "OPENING"),
             txn("2026-10-20T14:05:00+0000", "TSX", -60, 12.0, "CLOSING", fee=1.0),
             txn("2026-10-20T14:06:00+0000", "TSX", -40, 9.0, "CLOSING")]
-    st = build_state(account=None, orders=[], txns=txns, quotes={}, prev_session={}, freshness={},
+    st = build_state(account=None, orders=[], fills=_ledger_fills(normalize_fills(txns)),
+                     quotes={}, prev_session={}, freshness={},
                      history_complete=True, orders_fresh=True, auth_hours_left=100,
                      now=datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc))
     (t,) = st["closed"]

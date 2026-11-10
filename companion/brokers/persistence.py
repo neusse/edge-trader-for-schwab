@@ -16,6 +16,8 @@ def save_fills(store: Store, fills: tuple[Fill, ...]) -> None:
         "orderId": fill.order_id, "symbol": fill.symbol,
         "assetType": fill.asset_type.value, "instruction": fill.instruction.value,
         "quantity": str(fill.quantity), "price": str(fill.price), "fees": str(fill.fees),
+        "underlying": fill.underlying, "multiplier": str(fill.multiplier)
+        if fill.multiplier is not None else None,
     } for fill in fills])
 
 
@@ -28,4 +30,6 @@ def load_fills(store: Store, since: datetime) -> tuple[Fill, ...]:
         instruction=OrderInstruction(row["instruction"]),
         quantity=Decimal(row["quantity"]), price=Decimal(row["price"]),
         occurred_at=datetime.fromisoformat(row["time"]), fees=Decimal(row["fees"]),
+        underlying=row.get("underlying"),
+        multiplier=Decimal(row["multiplier"]) if row.get("multiplier") is not None else None,
     ) for row in store.transactions_since(since.isoformat()))

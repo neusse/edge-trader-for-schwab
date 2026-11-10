@@ -33,14 +33,19 @@ def _ledger_fills(fills: tuple[Fill, ...]) -> list[LedgerFill]:
         rows.append(LedgerFill(
             id=fill.activity_id, order_id=fill.order_id, time=fill.occurred_at,
             symbol=fill.symbol, asset_type=fill.asset_type.value.upper(),
-            underlying=fill.symbol, qty=float(fill.quantity) *
+            underlying=fill.underlying or fill.symbol, qty=float(fill.quantity) *
             (1 if fill.instruction in _BUY else -1), price=float(fill.price),
-            multiplier=100.0 if fill.asset_type.value == "option" else 1.0,
+            multiplier=float(fill.multiplier) if fill.multiplier is not None else
+            100.0 if fill.asset_type.value == "option" else 1.0,
             fees=-abs(float(fill.fees)),
             effect="OPENING" if fill.instruction in _OPEN else
                    "CLOSING" if fill.instruction in _CLOSE else None,
         ))
-    return sorted(rows, key=lambda row: (row.time, row.id))
+    def sequence(row):
+        activity, _, index = row.id.partition(":")
+        return (int(activity) if activity.isdigit() else 0,
+                int(index) if index.isdigit() else 0)
+    return sorted(rows, key=lambda row: (row.time, sequence(row)))
 
 
 def _pending(groups: tuple[OrderGroup, ...]) -> list[PendingOrder]:

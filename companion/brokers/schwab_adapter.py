@@ -165,6 +165,11 @@ def normalize_fills(transactions: list[dict]) -> tuple[Fill, ...]:
             amount, price = _decimal(row.get("amount")), _decimal(row.get("price"))
             if not asset or not symbol or not amount or not price or price <= 0:
                 continue
+            if asset == AssetType.FUTURE:
+                symbol = symbol.split(":")[0]
+            cost = _decimal(row.get("cost"))
+            multiplier = (abs(cost / (amount * price)).quantize(Decimal("0.0001"))
+                          if cost else None)
             activity_id = f"{transaction['activityId']}:{index}"
             if activity_id in seen:
                 continue
@@ -185,10 +190,17 @@ def normalize_fills(transactions: list[dict]) -> tuple[Fill, ...]:
                 symbol=symbol, asset_type=asset, instruction=instruction,
                 quantity=abs(amount), price=price, occurred_at=occurred_at,
                 fees=min(fees, Decimal(0)) if not charged else Decimal(0),
+                underlying=(instrument.get("underlyingSymbol") or
+                            instrument.get("rootSymbol") or symbol),
+                multiplier=multiplier,
             ))
             charged = True
             fee_charged.add(transaction_id)
-    return tuple(sorted(fills, key=lambda fill: (fill.occurred_at, fill.activity_id)))
+    def sequence(fill):
+        activity, _, index = fill.activity_id.partition(":")
+        return (int(activity) if activity.isdigit() else 0,
+                int(index) if index.isdigit() else 0)
+    return tuple(sorted(fills, key=lambda fill: (fill.occurred_at, sequence(fill))))
 
 
 class SchwabAdapter(BrokerAdapter):
