@@ -47,6 +47,10 @@ create table if not exists tickets (
 create table if not exists settings (key text primary key, value text);
 create table if not exists actions (
     created text, kind text, symbol text, order_id integer, status text, detail text);
+create table if not exists broker_mutations (
+    request_id text primary key, created text not null, updated text not null,
+    command text not null, order_id text, status text not null,
+    payload text not null, message text, client_order_id text);
 create table if not exists auto_be (
     ticket_id text primary key, symbol text, state text, created text, updated text, detail text);
 create table if not exists auto_be_orders (
@@ -79,6 +83,12 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._con = sqlite3.connect(path, check_same_thread=False)
         self._con.executescript(SCOPED_SCHEMA if scope and scope[0] != "schwab" else SCHEMA)
+        columns = {row[1] for row in self._con.execute("pragma table_info(broker_mutations)")}
+        if "client_order_id" not in columns:
+            self._con.execute("alter table broker_mutations add column client_order_id text")
+        self._con.execute("create unique index if not exists ix_mutation_client_id "
+                          "on broker_mutations(client_order_id)")
+        self._con.commit()
         self._lock = threading.Lock()
         self.scope = None
         if scope:
@@ -257,6 +267,59 @@ class Store:
             cols = [c[0] for c in cur.description]
             row = cur.fetchone()
         return dict(zip(cols, row)) if row else None
+
+    def record_mutation(self, request_id: str, command: str, payload: dict,
+                        client_order_id: str | None = None) -> bool:
+        """Record a unique order action before it can reach the broker."""
+        if not request_id or len(request_id) > 128:
+            raise ValueError("mutation request ID must contain 1 to 128 characters")
+        ts = now_iso()
+        try:
+            with self._lock, self._con:
+                self._con.execute(
+                    "insert into broker_mutations values (?,?,?,?,?,?,?,?,?)",
+                    (request_id, ts, ts, command, None, "SENDING", json.dumps(payload), None,
+                     client_order_id))
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def finish_mutation(self, request_id: str, status: str, order_id: str | None,
+                        message: str | None = None) -> None:
+        with self._lock, self._con:
+            cur = self._con.execute(
+                "update broker_mutations set updated=?, status=?, order_id=coalesce(?, order_id), "
+                "message=? where request_id=?",
+                (now_iso(), status, order_id, message, request_id))
+            if cur.rowcount != 1:
+                raise KeyError("mutation request ID does not exist")
+
+    def get_mutation(self, request_id: str) -> dict | None:
+        with self._lock:
+            cur = self._con.execute(
+                "select request_id, command, order_id, status, payload, message "
+                "from broker_mutations where request_id=?", (request_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        names = ("request_id", "command", "order_id", "status", "payload", "message")
+        result = dict(zip(names, row))
+        result["payload"] = json.loads(result["payload"])
+        return result
+
+    def get_mutation_by_client_id(self, client_order_id: str) -> dict | None:
+        with self._lock:
+            row = self._con.execute(
+                "select request_id from broker_mutations where client_order_id=?",
+                (client_order_id,)).fetchone()
+        return self.get_mutation(row[0]) if row else None
+
+    def open_mutations(self) -> list[dict]:
+        with self._lock:
+            rows = self._con.execute(
+                "select request_id, command, order_id, status from broker_mutations "
+                "where status in ('SENDING', 'unknown') order by created").fetchall()
+        return [dict(zip(("request_id", "command", "order_id", "status"), row)) for row in rows]
 
     # ---- auto B/E: one stop move per ticket, PENDING -> SENDING -> DONE | FAILED | SKIPPED ----
 

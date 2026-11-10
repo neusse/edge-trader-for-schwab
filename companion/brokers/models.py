@@ -22,6 +22,7 @@ class BrokerMode(str, Enum):
 class BrokerCapability(str, Enum):
     ACCOUNT_READ = "account-read"
     ORDER_READ = "order-read"
+    CLIENT_ORDER_LOOKUP = "client-order-lookup"
     FILL_READ = "fill-read"
     EQUITY_MARKET_DATA = "equity-market-data"
     OPTION_MARKET_DATA = "option-market-data"
@@ -314,6 +315,11 @@ class OrderQuery:
 
 
 @dataclass(frozen=True)
+class ClientOrderQuery:
+    client_order_id: str
+
+
+@dataclass(frozen=True)
 class FillsQuery:
     start: datetime
     end: datetime
@@ -346,6 +352,7 @@ BrokerQuery: TypeAlias = (
     AccountQuery
     | OrdersQuery
     | OrderQuery
+    | ClientOrderQuery
     | FillsQuery
     | QuotesQuery
     | MarketSessionsQuery

@@ -52,6 +52,7 @@ ALPACA_PAPER = BrokerIdentity(
     capabilities=_matrix(
         _READS
         | {
+            BrokerCapability.CLIENT_ORDER_LOOKUP,
             BrokerCapability.EQUITY_TRADING,
             BrokerCapability.OPTION_TRADING,
             BrokerCapability.MULTI_LEG_OPTIONS,

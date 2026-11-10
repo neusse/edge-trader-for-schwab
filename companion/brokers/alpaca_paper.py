@@ -11,7 +11,7 @@ from .capabilities import ALPACA_PAPER
 from .configuration import paper_credentials, paper_trading_client
 from .models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand,
-    CancelOrder,
+    CancelOrder, ClientOrderQuery,
     BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery, MarketSession, MarketSessionsQuery,
     MutationResult, MutationStatus, OptionChain, OptionChainQuery, OptionContract, OptionGreeks, OptionType,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery,
@@ -237,6 +237,16 @@ class AlpacaPaperAdapter(BrokerAdapter):
         if isinstance(query, OrderQuery):
             from alpaca.trading.requests import GetOrderByIdRequest
             return _order_group(self._client.get_order_by_id(query.order_id, GetOrderByIdRequest(nested=True)))
+        if isinstance(query, ClientOrderQuery):
+            from alpaca.common.exceptions import APIError
+            from alpaca.trading.requests import GetOrderByIdRequest
+            try:
+                raw = self._client.get_order_by_client_id(query.client_order_id)
+            except APIError as exc:
+                if exc.status_code == 404:
+                    return None
+                raise
+            return _order_group(self._client.get_order_by_id(str(raw.id), GetOrderByIdRequest(nested=True)))
         if isinstance(query, MarketSessionsQuery):
             from alpaca.trading.requests import GetCalendarRequest
             from zoneinfo import ZoneInfo

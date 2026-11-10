@@ -13,6 +13,7 @@ from .models import (
     BrokerQuery,
     BrokerQueryResult,
     CancelOrder,
+    ClientOrderQuery,
     FillsQuery,
     MarketSessionsQuery,
     MultiLegOrderIntent,
@@ -35,6 +36,8 @@ def required_query_capability(query: BrokerQuery) -> BrokerCapability:
         return BrokerCapability.ACCOUNT_READ
     if isinstance(query, (OrdersQuery, OrderQuery)):
         return BrokerCapability.ORDER_READ
+    if isinstance(query, ClientOrderQuery):
+        return BrokerCapability.CLIENT_ORDER_LOOKUP
     if isinstance(query, FillsQuery):
         return BrokerCapability.FILL_READ
     if isinstance(query, QuotesQuery):

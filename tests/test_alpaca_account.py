@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from companion.brokers.alpaca_paper import AlpacaPaperAdapter
-from companion.brokers.models import AccountQuery, AssetType, PositionSide
+from companion.brokers.models import AccountQuery, AssetType, ClientOrderQuery, PositionSide
 
 
 def test_paper_account_read_normalizes_positions_without_sdk_objects():
@@ -59,6 +59,32 @@ def test_nested_multi_leg_order_keeps_both_option_legs():
     assert len(normalized.orders) == 1
     assert [leg.instruction for leg in normalized.orders[0].legs] == [
         OrderInstruction.BUY_TO_OPEN, OrderInstruction.SELL_TO_OPEN]
+
+
+def test_client_order_lookup_fetches_nested_group():
+    from alpaca.trading.models import Order
+
+    raw = Order.model_construct(
+        id="paper-order-uuid", group_id=None, order_class="simple", group_role=None,
+        status="new", type="limit", time_in_force="day", legs=[],
+        symbol="AAPL", asset_class="us_equity", qty="1", filled_qty="0",
+        side="buy", position_intent=None, limit_price="100", stop_price=None,
+        trail_price=None, trail_percent=None, submitted_at=None, updated_at=None,
+        client_order_id="stable-client-id")
+
+    class Client:
+        def get_order_by_client_id(self, client_id):
+            assert client_id == "stable-client-id"
+            return raw
+
+        def get_order_by_id(self, order_id, request):
+            assert order_id == "paper-order-uuid"
+            assert request.nested is True
+            return raw
+
+    group = AlpacaPaperAdapter(Client()).query(ClientOrderQuery("stable-client-id"))
+    assert group.orders[0].order_id == "paper-order-uuid"
+    assert group.orders[0].client_order_id == "stable-client-id"
 
 
 def test_fill_read_normalizes_opaque_ids_and_option_side():
