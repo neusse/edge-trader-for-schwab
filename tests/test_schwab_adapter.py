@@ -6,6 +6,7 @@ from companion.brokers.models import (
     OrderStatus, OrdersQuery, PositionSide, QuotesQuery,
 )
 from companion.brokers.schwab_adapter import SchwabAdapter, normalize_account, normalize_fills, normalize_order
+from companion.brokers.canonical_view import build_canonical_state
 
 
 class Response:
@@ -22,9 +23,11 @@ def test_schwab_account_keeps_unknown_basis_and_short_direction():
     raw = {"securitiesAccount": {"currentBalances": {"liquidationValue": 10000},
                                  "positions": [
                                      {"instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
-                                      "longQuantity": 0, "shortQuantity": 3},
+                                      "longQuantity": 0, "shortQuantity": 3,
+                                      "previousSessionShortQuantity": 3},
                                      {"instrument": {"symbol": "MSFT", "assetType": "EQUITY"},
-                                      "longQuantity": 2, "shortQuantity": 0, "averagePrice": 100},
+                                      "longQuantity": 2, "shortQuantity": 0, "averagePrice": 100,
+                                      "previousSessionLongQuantity": 2, "currentDayCost": 0},
                                  ]}}
     account = normalize_account(raw, "opaque-hash")
     assert account.account_ref == "opaque-hash"
@@ -32,7 +35,10 @@ def test_schwab_account_keeps_unknown_basis_and_short_direction():
     assert account.positions[0].side == PositionSide.SHORT
     assert account.positions[0].quantity == Decimal(3)
     assert account.positions[0].average_price is None
+    assert account.positions[0].previous_session_quantity == Decimal(-3)
     assert account.positions[1].average_price == Decimal(100)
+    assert account.positions[1].previous_session_quantity == Decimal(2)
+    assert account.positions[1].current_day_cost == Decimal(0)
 
 
 def test_schwab_bracket_tree_maps_entry_and_exit_roles():
@@ -55,6 +61,44 @@ def test_schwab_bracket_tree_maps_entry_and_exit_roles():
     assert group.orders[1].parent_id == "100"
     assert group.orders[1].stop_price == Decimal(95)
     assert group.orders[2].legs[0].instruction == OrderInstruction.SELL
+
+
+def test_schwab_standalone_exit_is_not_counted_as_an_entry():
+    raw = {"orderId": 200, "orderStrategyType": "SINGLE", "status": "WORKING",
+           "orderType": "STOP", "stopPrice": 95, "orderLegCollection": [
+               {"instruction": "SELL", "quantity": 2,
+                "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]}
+    group = normalize_order(raw)
+    assert group.orders[0].role == OrderRole.EXIT
+    account = normalize_account({"securitiesAccount": {"currentBalances": {}, "positions": [
+        {"instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
+         "longQuantity": 2, "shortQuantity": 0, "averagePrice": 100}]}}, "hash")
+    state = build_canonical_state(account, (group,), (), {},
+                                  now=datetime.now(timezone.utc), orders_fresh=True)
+    assert state["positions"][0]["protection"] == "FULL"
+    assert state["positions"][0]["stop_price"] == 95
+
+
+def test_schwab_query_keeps_working_child_of_filled_bracket():
+    root = {"orderId": 300, "orderStrategyType": "TRIGGER", "status": "FILLED",
+            "orderType": "MARKET", "orderLegCollection": [
+                {"instruction": "BUY", "quantity": 1,
+                 "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}],
+            "childOrderStrategies": [{"orderId": 301, "orderStrategyType": "OCO",
+                                      "childOrderStrategies": [{
+                                          "orderId": 302, "status": "WORKING",
+                                          "orderType": "STOP", "stopPrice": 95,
+                                          "orderLegCollection": [{"instruction": "SELL", "quantity": 1,
+                                                                  "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]}]}]}
+    class Client:
+        def account_orders(self, account_hash, start, end):
+            return Response([root])
+    adapter = SchwabAdapter(Client(), account_hash="hash")
+    now = datetime.now(timezone.utc)
+    groups = adapter.query(OrdersQuery(now, now, frozenset({OrderStatus.WORKING})))
+    assert len(groups) == 1
+    assert [order.status for order in groups[0].orders] == [OrderStatus.FILLED,
+                                                            OrderStatus.WORKING]
 
 
 def test_schwab_adapter_returns_only_canonical_models():
