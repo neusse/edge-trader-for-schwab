@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from .adapter import BrokerAdapter
 from .models import (
     AccountQuery, BrokerCommand, ClientOrderQuery, MarketSessionsQuery,
-    MutationResult, MutationStatus, OrderStatus, SubmitOrder,
+    MutationResult, MutationStatus, OrderQuery, OrderStatus, SubmitOrder,
 )
 from ..store import Store
 
@@ -143,5 +143,47 @@ class BrokerOrderService:
             message = f"Reconciled against broker order status {match.status.value}"
             self.store.finish_mutation(request_id, status.value, match.order_id, message)
             return MutationResult(status, match.order_id, message)
+        finally:
+            self._lock.release()
+
+    def reconcile_cancel(self, request_id: str) -> MutationResult:
+        """Release an ambiguous cancel only after a fresh broker read confirms it is final."""
+        if not self._lock.acquire(blocking=False):
+            return MutationResult(MutationStatus.UNKNOWN, message="Another order action is in progress")
+        try:
+            row = self.store.get_mutation(request_id)
+            if row is None:
+                return MutationResult(MutationStatus.REJECTED, message="Unknown request ID")
+            if row["command"] != "CancelOrder":
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="This request is not a cancel action")
+            if row["status"] not in ("SENDING", MutationStatus.UNKNOWN.value):
+                return self._previous(row)
+            order_id = row["payload"]["order_id"]
+            try:
+                account = self.adapter.query(AccountQuery())
+                if account.account_ref != self.account_ref:
+                    return MutationResult(MutationStatus.UNKNOWN,
+                                          message="Active account changed; cannot reconcile")
+                group = self.adapter.query(OrderQuery(order_id))
+            except Exception:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Broker lookup failed; cancel outcome is still unknown")
+            order = next((item for item in group.orders if item.order_id == order_id), None)
+            if order is None:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Broker response did not match the order ID")
+            if order.status == OrderStatus.CANCELED:
+                result = MutationResult(MutationStatus.ACCEPTED, order_id,
+                                        "Broker confirms the order was canceled")
+            elif order.status in (OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                result = MutationResult(MutationStatus.REJECTED, order_id,
+                                        f"Broker confirms order status {order.status.value}; cancel did not protect it")
+            else:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message=f"Broker order is {order.status.value}; cancel outcome remains unknown")
+            self.store.finish_mutation(request_id, result.status.value,
+                                       result.order_id, result.message)
+            return result
         finally:
             self._lock.release()

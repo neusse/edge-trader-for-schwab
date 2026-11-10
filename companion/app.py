@@ -28,8 +28,8 @@ from . import __version__
 from .brokers.capabilities import BROKERS
 from .brokers.configuration import BrokerSelection
 from .brokers.bootstrap import AlpacaBootstrapPoller
-from .brokers.models import (AccountQuery, AssetType, OrderStatus, OrdersQuery,
-                             QuotesQuery, SubmitOrder)
+from .brokers.models import (AccountQuery, AssetType, CancelOrder, OrderClass, OrderQuery,
+                             OrderRole, OrderStatus, OrdersQuery, QuotesQuery, SubmitOrder)
 from .brokers.paper_equity import entry_plan
 from .poller import Poller
 from .trading import OCC_RE, Trader
@@ -76,7 +76,7 @@ APP_WORKFLOWS = {
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket entry is available. Equity management, options, and spreads are still being connected.",
+    "alpaca-paper": "Paper equity bracket entry and unfilled entry cancellation are available. Other equity management, options, and spreads are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -417,6 +417,58 @@ def _send_paper_entry(body: dict, request_id: str):
     with BROKER_ACTION_LOCK:
         service, intent, _ = _paper_entry(body, True)
         return service.execute(SubmitOrder(intent), request_id)
+
+
+@app.post("/api/paper/entry/cancel")
+async def paper_entry_cancel(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        order_id = str(UUID(str(body.get("order_id"))))
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_cancel_paper_entry, order_id, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper cancel preflight failed; no cancel was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _cancel_paper_entry(order_id: str, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, _ = _paper_service()
+        group = service.adapter.query(OrderQuery(order_id))
+        order = next((item for item in group.orders if item.order_id == order_id), None)
+        active = {OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED}
+        if (order is None or group.order_class != OrderClass.BRACKET or
+                order.role != OrderRole.ENTRY or order.parent_id is not None or
+                order.status not in active or order.status_detail in ("PENDING_CANCEL", "PENDING_REPLACE") or
+                len(order.legs) != 1 or
+                order.legs[0].asset_type != AssetType.EQUITY or
+                order.legs[0].filled_quantity != 0):
+            raise ValueError("Only an unfilled Alpaca Paper equity entry can be canceled here")
+        return service.execute(CancelOrder(order_id), request_id)
+
+
+@app.post("/api/paper/entry/cancel/reconcile")
+async def paper_entry_cancel_reconcile(request: Request):
+    _guard(request)
+    try:
+        request_id = str(UUID(str((await request.json()).get("request_id"))))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(400, "request_id must be a UUID") from None
+    def reconcile():
+        with BROKER_ACTION_LOCK:
+            service, _ = _paper_service()
+            return service.reconcile_cancel(request_id)
+    result = await run_in_threadpool(reconcile)
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
 
 
 @app.post("/api/paper/entry/reconcile")

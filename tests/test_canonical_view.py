@@ -60,6 +60,18 @@ def test_stale_orders_and_missing_quote_never_claim_protection_or_complete_pnl()
     assert state["summary"]["realized"]["complete"] is False
 
 
+def test_partially_filled_native_order_still_counts_remaining_stop_protection():
+    stop = BrokerOrder("stop-uuid", OrderStatus.PARTIALLY_FILLED, OrderType.STOP,
+                       TimeInForce.GTC,
+                       (OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL,
+                                 D("3"), filled_quantity=D("1")),),
+                       OrderRole.STOP, stop_price=D("95"), status_detail="PARTIALLY_FILLED")
+    groups = (OrderGroup("stop-uuid", OrderClass.SIMPLE, OrderStatus.PARTIALLY_FILLED,
+                         (stop,)),)
+    state = build_canonical_state(account(), groups, (), {}, now=NOW, orders_fresh=True)
+    assert state["positions"][0]["protection"] == "FULL"
+
+
 def test_fake_broker_can_drive_a_complete_dashboard_without_network():
     fake = FakeBrokerAdapter(SCHWAB)
     fills = (Fill("fill-1", "entry-1", "AAPL", AssetType.EQUITY,

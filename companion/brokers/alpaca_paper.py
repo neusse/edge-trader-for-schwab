@@ -101,6 +101,7 @@ def _order_group(raw) -> OrderGroup:
                 limit_price=_decimal(member.limit_price), stop_price=_decimal(member.stop_price),
                 trail_price=_decimal(member.trail_price), trail_percent=_decimal(member.trail_percent),
                 entered_at=member.submitted_at, updated_at=member.updated_at,
+                status_detail=_enum_value(member.status).upper(),
             ))
         for child in () if group_class == OrderClass.MULTI_LEG else member.legs or ():
             child_role = {"take_profit": OrderRole.TARGET, "stop_loss": OrderRole.STOP,
