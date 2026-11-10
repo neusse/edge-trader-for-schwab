@@ -118,7 +118,8 @@ def test_submit_cancel_and_replace_use_opaque_ids_without_retries():
             self.calls.append(("cancel", order_id))
 
         def replace_order_by_id(self, order_id, request):
-            self.calls.append(("replace", order_id, request.limit_price))
+            self.calls.append(("replace", order_id, request.limit_price,
+                               request.client_order_id))
             return SimpleNamespace(id="uuid-replacement")
 
     client = Client()
@@ -126,10 +127,13 @@ def test_submit_cancel_and_replace_use_opaque_ids_without_retries():
     intent = SimpleOrderIntent(equity(), OrderType.MARKET, TimeInForce.DAY, "stable-key")
     assert adapter.execute(SubmitOrder(intent)).order_id == "uuid-order"
     assert adapter.execute(CancelOrder("uuid-order")).accepted
-    assert adapter.execute(ReplaceOrder("uuid-order", limit_price=D("100"))).order_id == "uuid-replacement"
+    replacement = adapter.execute(ReplaceOrder("uuid-order", limit_price=D("100"),
+                                               client_order_id="stable-replace-id"))
+    assert replacement.order_id == "uuid-replacement"
+    assert replacement.status == MutationStatus.UNKNOWN
     assert adapter.execute(ReplaceOrder("uuid-order", replacement=intent)).status == MutationStatus.REJECTED
     assert client.calls == [("submit", "stable-key"), ("cancel", "uuid-order"),
-                            ("replace", "uuid-order", 100)]
+                            ("replace", "uuid-order", 100, "stable-replace-id")]
 
 
 def test_unsupported_option_bracket_fails_before_external_call():

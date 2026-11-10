@@ -1261,7 +1261,7 @@ function renderAlpacaOverview(st) {
     <td>${p.last == null ? "—" : money(p.last, false)}${p.quote_stale ? " <small>(stale)</small>" : ""}<br><small>${esc(p.quote_source || "No quote")}</small></td>
     <td>${p.open_pnl == null ? "—" : money(p.open_pnl)}</td><td>${esc(p.protection)}${p.stop_qty ? ` (${esc(p.stop_qty)}/${esc(p.qty)})` : ""}</td></tr>`).join("");
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td>
-    <td>${o.cancellable && o.group_type === "BRACKET" && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button>` : ""}</td></tr>`).join("");
+    <td>${o.cancellable && o.group_type === "BRACKET" && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}</td></tr>`).join("");
   const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
   const fillRows = fills.map(f => `<tr><td>${esc(new Date(f.time).toLocaleString())}</td><td>${esc(f.symbol)}</td><td>${esc(f.instruction)}</td><td>${esc(f.quantity)}</td><td>${money(Number(f.price), false)}</td></tr>`).join("");
   panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
@@ -1535,12 +1535,12 @@ $("paper-reconcile").addEventListener("click", async () => {
   if (!paperRequestId || paperBusy) return;
   paperBusy = true; renderPaperControls(lastState);
   try {
-    const path = paperCommand === "CancelOrder" ? "/api/paper/entry/cancel/reconcile" : "/api/paper/entry/reconcile";
+    const path = paperCommand === "CancelOrder" ? "/api/paper/entry/cancel/reconcile" : paperCommand === "ReplaceOrder" ? "/api/paper/entry/reprice/reconcile" : "/api/paper/entry/reconcile";
     const result = await post(path, {request_id: paperRequestId});
     paperMessage(result.message || result.detail || "Outcome remains unknown");
     if (result.status === "accepted") {
-      paperOutcome = paperCommand === "CancelOrder" ? null : "accepted";
-      if (paperCommand === "CancelOrder") paperRequestId = null;
+      paperOutcome = paperCommand === "SubmitOrder" ? "accepted" : null;
+      if (paperCommand !== "SubmitOrder") paperRequestId = null;
     }
     if (result.status === "rejected") { paperOutcome = null; paperRequestId = null; }
   } catch (err) { paperMessage(String(err.message || err)); }
@@ -1574,6 +1574,50 @@ $("alpaca-overview").addEventListener("click", async e => {
     if (sent) {
       paperOutcome = "unknown";
       paperMessage(`Cancel may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(String(err.message || err));
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
+$("alpaca-overview").addEventListener("click", async e => {
+  const button = e.target.closest("[data-paper-reprice]");
+  if (!button || paperBusy || paperOutcome === "unknown" || lastState?.broker?.key !== "alpaca-paper") return;
+  const orderId = button.dataset.paperReprice;
+  const order = (lastState.orders || []).find(row => row.order_id === orderId && row.cancellable &&
+    row.group_type === "BRACKET" && row.order_type === "LIMIT" && ["NEW", "WORKING"].includes(row.status));
+  if (!order || !lastState.broker_ready) return;
+  const input = window.prompt(`New limit price for ${order.display}`, String(order.price ?? ""));
+  if (input === null) return;
+  const price = Number(input);
+  if (!Number.isFinite(price) || price <= 0) { paperMessage("Enter a positive limit price."); return; }
+  const requestId = crypto.randomUUID();
+  paperBusy = true; paperRequestId = requestId; paperCommand = "ReplaceOrder";
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const payload = {order_id: orderId, limit_price: input, request_id: requestId};
+    const preview = await post("/api/paper/entry/reprice/preview", payload);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Replace preview refused");
+    if (!window.confirm(`Replace ${preview.symbol} entry limit ${preview.old_price} → ${preview.new_price}? ` +
+        `Stop ${preview.stop}, target ${preview.target} remain attached. Send to Alpaca Paper?`)) {
+      paperMessage("Paper entry replacement canceled."); return;
+    }
+    paperMessage("Sending paper entry replacement once…");
+    sent = true;
+    const result = await post("/api/paper/entry/reprice", payload);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown";
+      paperMessage(`${result.message || "Replacement pending"}. Reconcile before another order action.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(result.ok ? `Alpaca Paper confirmed replacement ${result.order_id}.` :
+        result.message || result.error || result.detail || "Replacement refused");
+    }
+  } catch (err) {
+    if (sent) {
+      paperOutcome = "unknown";
+      paperMessage(`Replacement may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
     } else {
       paperRequestId = null;
       paperMessage(String(err.message || err));

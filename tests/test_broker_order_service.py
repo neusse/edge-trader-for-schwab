@@ -8,7 +8,7 @@ from companion.brokers.models import (
     BrokerOrder, ClientOrderQuery, MarketSession, MarketSessionsQuery, OrderQuery,
     MutationResult, MutationStatus, OrderClass, OrderGroup, OrderRole,
     OrderStatus, OrderLeg,
-    OrderInstruction, OrderLegIntent, OrderType, SimpleOrderIntent,
+    OrderInstruction, OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent,
     SubmitOrder, TimeInForce,
 )
 from companion.brokers.order_service import BrokerOrderService
@@ -160,5 +160,37 @@ def test_unknown_cancel_blocks_actions_until_broker_confirms_final_status(tmp_pa
         assert service.reconcile_cancel("cancel-1").status == MutationStatus.ACCEPTED
         assert store.open_mutations() == []
         assert service.reconcile_cancel("cancel-1").status == MutationStatus.ACCEPTED
+    finally:
+        store.close()
+
+
+def test_replacement_waits_for_exact_client_order_id_and_working_status(tmp_path):
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT, ACCOUNT, ACCOUNT, ACCOUNT, ACCOUNT)
+    adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, "new-order"))
+    service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
+    def replacement(status, client_id, price="99"):
+        order = BrokerOrder("new-order", status, OrderType.LIMIT, TimeInForce.DAY,
+                            (OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY,
+                                      Decimal(1)),), OrderRole.ENTRY,
+                            client_order_id=client_id, limit_price=Decimal(price))
+        return OrderGroup("new-order", OrderClass.BRACKET, status, (order,))
+    try:
+        command = ReplaceOrder("old-order", limit_price=Decimal("99"),
+                               client_order_id="replacement-client-id")
+        assert service.execute(command, "replace-1").status == MutationStatus.UNKNOWN
+        assert service.execute(CancelOrder("other-order"), "cancel-2").status == MutationStatus.UNKNOWN
+        adapter.given_query(ClientOrderQuery, None,
+                            replacement(OrderStatus.WORKING, "wrong-id"),
+                            replacement(OrderStatus.WORKING, "replacement-client-id", "98"),
+                            replacement(OrderStatus.PENDING, "replacement-client-id"),
+                            replacement(OrderStatus.WORKING, "replacement-client-id"))
+        for _ in range(4):
+            assert service.reconcile_replace("replace-1").status == MutationStatus.UNKNOWN
+        final = service.reconcile_replace("replace-1")
+        assert final.status == MutationStatus.ACCEPTED and final.order_id == "new-order"
+        assert store.open_mutations() == []
+        assert len(adapter.commands) == 1
     finally:
         store.close()

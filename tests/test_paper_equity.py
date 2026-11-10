@@ -12,7 +12,8 @@ from companion.brokers.models import (
     AccountQuery, AccountSnapshot, BalanceSnapshot, MarketSession,
     MarketSessionsQuery, MutationResult, MutationStatus, OrdersQuery, OrderQuery,
     OrderClass, OrderGroup, BrokerOrder, OrderLeg, OrderRole, OrderStatus,
-    OrderInstruction, OrderType, TimeInForce, AssetType, CancelOrder, Quote, QuotesQuery,
+    OrderInstruction, OrderType, TimeInForce, AssetType, CancelOrder, ClientOrderQuery,
+    ReplaceOrder, Quote, QuotesQuery,
     SubmitOrder,
 )
 from companion.brokers.order_service import BrokerOrderService
@@ -158,6 +159,72 @@ def test_paper_cancel_route_rechecks_unfilled_entry_and_selected_broker(monkeypa
         assert len(adapter.commands) == 1
         selected.selected = "schwab"
         assert client.post("/api/paper/entry/cancel", json=body, headers=headers).status_code == 409
+    finally:
+        store.close()
+        poller.store.close()
+
+
+def test_paper_reprice_previews_bracket_and_reconciles_exact_replacement(monkeypatch, tmp_path):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    order_id, replacement_id, request_id = str(uuid4()), str(uuid4()), str(uuid4())
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    def entry_group():
+        leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY, Decimal(2))
+        entry_order = BrokerOrder(order_id, OrderStatus.WORKING, OrderType.LIMIT,
+                                  TimeInForce.DAY, (leg,), OrderRole.ENTRY,
+                                  limit_price=Decimal(100), status_detail="NEW")
+        target = BrokerOrder(str(uuid4()), OrderStatus.PENDING, OrderType.LIMIT,
+                             TimeInForce.GTC, (leg,), OrderRole.TARGET,
+                             limit_price=Decimal(110))
+        stop = BrokerOrder(str(uuid4()), OrderStatus.PENDING, OrderType.STOP,
+                           TimeInForce.GTC, (leg,), OrderRole.STOP,
+                           stop_price=Decimal(95))
+        return OrderGroup(order_id, OrderClass.BRACKET, OrderStatus.WORKING,
+                          (entry_order, target, stop))
+    adapter.given_query(OrderQuery, entry_group(), entry_group(), entry_group())
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot())
+    adapter.given_query(AccountQuery, account, account, account, account)
+    adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, replacement_id))
+    client_id = f"et-reprice-{request_id}"
+    confirmed = BrokerOrder(replacement_id, OrderStatus.WORKING, OrderType.LIMIT,
+                            TimeInForce.DAY,
+                            (OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY, Decimal(2)),),
+                            OrderRole.ENTRY, client_order_id=client_id,
+                            limit_price=Decimal(99))
+    adapter.given_query(ClientOrderQuery, OrderGroup(replacement_id, OrderClass.BRACKET,
+                                                     OrderStatus.WORKING, (confirmed,)))
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
+    poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
+                     "updated_at": now.isoformat(), "positions": [], "orders": []}}
+    class Selection:
+        def get(self): return "alpaca-paper"
+    monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
+    monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "BrokerSelection", Selection)
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    body = {"order_id": order_id, "request_id": request_id, "limit_price": "99"}
+    try:
+        refused = client.post("/api/paper/entry/reprice/preview",
+                              json={**body, "limit_price": "111"}, headers=headers).json()
+        assert not refused["ok"] and "between" in refused["error"]
+        preview = client.post("/api/paper/entry/reprice/preview",
+                              json=body, headers=headers).json()
+        assert preview["ok"] and preview["old_price"] == "100"
+        assert preview["stop"] == "95" and preview["target"] == "110"
+        sent = client.post("/api/paper/entry/reprice", json=body, headers=headers).json()
+        assert sent["status"] == "unknown" and sent["order_id"] == replacement_id
+        assert len(adapter.commands) == 1
+        assert adapter.commands[0].client_order_id == client_id
+        assert len(store.open_mutations()) == 1
+        resolved = client.post("/api/paper/entry/reprice/reconcile",
+                               json={"request_id": request_id}, headers=headers).json()
+        assert resolved["status"] == "accepted" and resolved["order_id"] == replacement_id
+        assert store.open_mutations() == []
     finally:
         store.close()
         poller.store.close()

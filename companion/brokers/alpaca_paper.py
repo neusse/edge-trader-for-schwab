@@ -331,6 +331,7 @@ class AlpacaPaperAdapter(BrokerAdapter):
                     limit_price=float(command.limit_price) if command.limit_price is not None else None,
                     stop_price=float(command.stop_price) if command.stop_price is not None else None,
                     trail=float(command.trail) if command.trail is not None else None,
+                    client_order_id=command.client_order_id,
                 )
             elif not isinstance(command, CancelOrder):
                 raise TypeError(f"unknown Alpaca command: {type(command).__name__}")
@@ -346,7 +347,9 @@ class AlpacaPaperAdapter(BrokerAdapter):
                 return MutationResult(MutationStatus.ACCEPTED, command.order_id)
             if isinstance(command, ReplaceOrder):
                 raw = self._client.replace_order_by_id(command.order_id, request)
-                return MutationResult(MutationStatus.ACCEPTED, str(raw.id))
+                # The replacement may still be rejected if the original fills first.
+                return MutationResult(MutationStatus.UNKNOWN, str(raw.id),
+                                      "Replacement received; reconcile its broker status before another action")
         except APIError as exc:
             if exc.status_code == 429:
                 headers = getattr(getattr(exc, "_http_error", None), "response", None)

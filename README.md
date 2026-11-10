@@ -17,8 +17,10 @@ coverage from paper fills and IEX/indicative quotes. Stale or incomplete data is
 equity bracket form accepts a flat symbol with no active order, whole-share long or short market/limit
 entry, one target, and one fixed stop. Arm entries for the market day, review the plan, then confirm
 the Paper order. The target and stop are broker-held after the entry fills. An unfilled Paper bracket
-entry can be canceled from the working-order list after a fresh broker check. A lost submit or cancel
-response blocks new order actions until the broker confirms its outcome. Other Alpaca order workflows are still being
+entry can be canceled, or its limit price replaced, from the working-order list after a fresh broker
+check. A replacement keeps the same stop and target and remains blocked until Alpaca confirms the
+new order ID and reviewed price. A lost submit or cancel response also blocks new order actions until
+the broker confirms its outcome. Other Alpaca order workflows are still being
 connected. Select Schwab in the app for the existing Schwab trading workflows. Switching disarms
 entries and loads a fresh broker runtime before order controls can be used again.
 The strip below the header explains which workflows the selected broker can currently use; Demo
@@ -63,7 +65,7 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, and cancellation of an unfilled bracket entry. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, and cancellation or limit repricing of an unfilled bracket entry. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.

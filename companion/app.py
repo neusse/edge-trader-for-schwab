@@ -17,6 +17,7 @@ import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from uuid import UUID
 
@@ -28,8 +29,10 @@ from . import __version__
 from .brokers.capabilities import BROKERS
 from .brokers.configuration import BrokerSelection
 from .brokers.bootstrap import AlpacaBootstrapPoller
-from .brokers.models import (AccountQuery, AssetType, CancelOrder, OrderClass, OrderQuery,
-                             OrderRole, OrderStatus, OrdersQuery, QuotesQuery, SubmitOrder)
+from .brokers.models import (AccountQuery, AssetType, CancelOrder,
+                             OrderClass, OrderInstruction, OrderQuery, OrderRole,
+                             OrderStatus, OrderType, OrdersQuery, QuotesQuery, ReplaceOrder,
+                             SubmitOrder)
 from .brokers.paper_equity import entry_plan
 from .poller import Poller
 from .trading import OCC_RE, Trader
@@ -76,7 +79,7 @@ APP_WORKFLOWS = {
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket entry and unfilled entry cancellation are available. Other equity management, options, and spreads are still being connected.",
+    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation, and limit repricing are available. Other equity management, options, and spreads are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -452,6 +455,109 @@ def _cancel_paper_entry(order_id: str, request_id: str):
                 order.legs[0].filled_quantity != 0):
             raise ValueError("Only an unfilled Alpaca Paper equity entry can be canceled here")
         return service.execute(CancelOrder(order_id), request_id)
+
+
+@app.post("/api/paper/entry/reprice")
+async def paper_entry_reprice(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        order_id = str(UUID(str(body.get("order_id"))))
+        request_id = str(UUID(str(body.get("request_id"))))
+        price = Decimal(str(body.get("limit_price")))
+        if not price.is_finite() or price <= 0:
+            raise ValueError("limit price must be a positive finite number")
+        result = await run_in_threadpool(_reprice_paper_entry, order_id, request_id, price)
+    except (ValueError, TypeError, AttributeError, InvalidOperation) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper replace preflight failed; no replace was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _paper_reprice_check(order_id: str, price: Decimal):
+    service, _ = _paper_service()
+    group = service.adapter.query(OrderQuery(order_id))
+    entry = next((item for item in group.orders if item.order_id == order_id), None)
+    if (entry is None or group.order_class != OrderClass.BRACKET or
+            entry.role != OrderRole.ENTRY or entry.parent_id is not None or
+            entry.order_type != OrderType.LIMIT or entry.status != OrderStatus.WORKING or
+            entry.status_detail not in (None, "NEW", "WORKING") or
+            len(entry.legs) != 1 or entry.legs[0].asset_type != AssetType.EQUITY or
+            entry.legs[0].filled_quantity != 0 or entry.limit_price is None):
+        raise ValueError("Only a working, unfilled Alpaca Paper equity bracket limit entry can be repriced")
+    targets = [order.limit_price for order in group.orders if order.role == OrderRole.TARGET
+               and order.limit_price is not None]
+    stops = [order.stop_price for order in group.orders if order.role == OrderRole.STOP
+             and order.stop_price is not None]
+    if len(targets) != 1 or len(stops) != 1:
+        raise ValueError("Bracket target and stop could not be verified; nothing was sent")
+    instruction = entry.legs[0].instruction
+    if instruction in (OrderInstruction.BUY, OrderInstruction.BUY_TO_OPEN):
+        valid = stops[0] < price < targets[0]
+    elif instruction in (OrderInstruction.SELL, OrderInstruction.SELL_SHORT):
+        valid = targets[0] < price < stops[0]
+    else:
+        valid = False
+    if not valid or price == entry.limit_price:
+        raise ValueError("New entry price must differ and stay between this bracket's stop and target")
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref or any(
+            position.symbol == entry.legs[0].symbol for position in account.positions):
+        raise ValueError("Account or position changed; no replace was sent")
+    return service, entry, stops[0], targets[0]
+
+
+@app.post("/api/paper/entry/reprice/preview")
+async def paper_entry_reprice_preview(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        order_id = str(UUID(str(body.get("order_id"))))
+        price = Decimal(str(body.get("limit_price")))
+        if not price.is_finite() or price <= 0:
+            raise ValueError("limit price must be a positive finite number")
+        def check():
+            with BROKER_ACTION_LOCK:
+                _, entry, stop, target = _paper_reprice_check(order_id, price)
+                return {"ok": True, "order_id": order_id, "symbol": entry.legs[0].symbol,
+                        "old_price": str(entry.limit_price), "new_price": str(price),
+                        "stop": str(stop), "target": str(target)}
+        return await run_in_threadpool(check)
+    except (ValueError, TypeError, AttributeError, InvalidOperation) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper replace preflight failed; no replace was sent"}
+
+
+def _reprice_paper_entry(order_id: str, request_id: str, price: Decimal):
+    with BROKER_ACTION_LOCK:
+        service, _, _, _ = _paper_reprice_check(order_id, price)
+        return service.execute(ReplaceOrder(order_id, limit_price=price,
+                                            client_order_id=f"et-reprice-{request_id}"), request_id)
+
+
+@app.post("/api/paper/entry/reprice/reconcile")
+async def paper_entry_reprice_reconcile(request: Request):
+    _guard(request)
+    try:
+        request_id = str(UUID(str((await request.json()).get("request_id"))))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(400, "request_id must be a UUID") from None
+    def reconcile():
+        with BROKER_ACTION_LOCK:
+            service, _ = _paper_service()
+            return service.reconcile_replace(request_id)
+    result = await run_in_threadpool(reconcile)
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
 
 
 @app.post("/api/paper/entry/cancel/reconcile")
