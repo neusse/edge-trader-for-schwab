@@ -226,7 +226,9 @@ class AlpacaBootstrapPoller:
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=20)
+            if self._thread.is_alive():
+                raise RuntimeError("Alpaca Paper polling did not stop; restart before switching brokers")
         for store in self._stores:
             store.close()
 

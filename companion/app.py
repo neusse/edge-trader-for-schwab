@@ -9,6 +9,7 @@ web page open in the browser cannot place orders through this server.
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 import subprocess
@@ -59,7 +60,7 @@ class DemoPoller:
         return st
 
     def start(self): pass
-    def stop(self): pass
+    def stop(self): self.store.close()
     def _merged_orders(self): return []
     def note_external_request(self, retry_after=None): pass
     def cooldown_left(self): return 0.0
@@ -67,6 +68,7 @@ class DemoPoller:
 
 POLLERS = {"demo": DemoPoller, "schwab": Poller, "alpaca-paper": AlpacaBootstrapPoller}
 BROKER_ACTION_LOCK = threading.RLock()
+BROKER_REQUEST_LOCK = asyncio.Lock()
 
 
 def make_poller(broker_key: str):
@@ -125,6 +127,13 @@ async def only_local_host(request: Request, call_next):
         reason = ("Demo mode: no orders and no Schwab calls." if DEMO else
                   "Alpaca Paper order and ticket integration is not ready yet; no order was sent.")
         return JSONResponse({"ok": False, "error": reason})
+    runtime_dependent = (request.method == "POST" and broker_mutation or
+                         request.url.path in ("/api/state", "/api/brokers", "/api/ui/prefs",
+                                              "/api/paper/status",
+                                              "/api/auth/login", "/api/floating/open"))
+    if runtime_dependent:
+        async with BROKER_REQUEST_LOCK:
+            return await call_next(request)
     return await call_next(request)
 
 
@@ -233,21 +242,49 @@ async def broker_select(request: Request):
     key = (await request.json()).get("broker")
     if not isinstance(key, str) or key not in BROKERS:
         raise HTTPException(400, "unknown broker selection")
-    await run_in_threadpool(_save_broker_selection, key)
-    # The current runtime and its cached state stay bound to their original account. A
-    # process restart activates the persisted choice with a fresh poller and disarmed trader.
+    async with BROKER_REQUEST_LOCK:
+        try:
+            await run_in_threadpool(_switch_broker, key)
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc),
+                                 "restart_required": True}, status_code=503)
     return {"ok": True, "active": BROKER_KEY, "selected": key,
-            "restart_required": key != BROKER_KEY}
+            "restart_required": False}
 
 
-def _save_broker_selection(key: str) -> None:
+def _switch_broker(key: str) -> None:
+    global BROKER_KEY, DEMO, poller, trader
     with BROKER_ACTION_LOCK:
         trader.arm(False, reason="broker selection")
         if isinstance(poller, AlpacaBootstrapPoller) and poller.order_service is not None:
             poller.order_service.arm(False)
+        if key == BROKER_KEY:
+            return
+        # Persist first: an interrupted stop leaves a safe, disarmed runtime that
+        # activates the requested broker on process restart.
+        BrokerSelection().set(key)
+        old_poller = poller
+        old_poller.stop()
+        if isinstance(old_poller, Poller):
+            old_poller.store.close()
+        next_poller = make_poller(key)
+        next_trader = Trader(next_poller.store)
+        next_poller.trader = next_trader
+        next_trader.on_request = next_poller.note_external_request
+        next_trader.cooldown_left = next_poller.cooldown_left
+        next_trader.arm(False, reason="broker selection")
+        if key == "demo":
+            from . import demo as _demo
+            next_trader.quote = _demo.demo_quote
+            next_trader.expirations = _demo.demo_expirations
+            next_trader.chain = _demo.demo_chain
+        if _feature_routes and hasattr(app.state, "bind_spread_runtime"):
+            app.state.bind_spread_runtime(next_trader, next_poller, key == "demo")
+        poller, trader = next_poller, next_trader
+        BROKER_KEY, DEMO = key, key == "demo"
         UI["sel"] = None
         UI["sel_seq"] += 1
-        BrokerSelection().set(key)
+        next_poller.start()
 
 
 def _paper_service():
@@ -635,7 +672,8 @@ try:
 except ImportError:
     _feature_routes = None
 FEATURES = (_journal_routes.register(app, poller.store, _guard, demo=DEMO) if _journal_routes else []) + (
-    _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else [])
+    _feature_routes.register(app, trader, poller, _guard, demo=DEMO,
+                             action_lock=BROKER_ACTION_LOCK) if _feature_routes else [])
 
 
 @app.post("/api/position/resolve_close")

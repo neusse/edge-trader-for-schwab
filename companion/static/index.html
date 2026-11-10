@@ -330,7 +330,7 @@
 <body>
 <header>
   <h1>Edge Trader <span id="broker-name" style="font-weight:500;color:var(--muted)"></span></h1>
-  <select id="broker-select" class="pill" aria-label="Select broker" title="Choose a broker; restart Edge Trader to activate it">
+  <select id="broker-select" class="pill" aria-label="Select broker" title="Choose the active broker">
     <option value="alpaca-paper">Alpaca Paper</option>
     <option value="schwab">Schwab</option>
     <option value="demo">Demo</option>
@@ -1272,8 +1272,22 @@ function renderAlpacaOverview(st) {
     <div class="alpaca-list"><h2>Orders, last 30 days (${recent.length})</h2>${recent.length ? `<table><thead><tr><th>Symbol</th><th>Status</th><th>Type</th><th>Quantity</th></tr></thead><tbody>${orderRows}</tbody></table>` : `<p class="mut">No recent orders.</p>`}</div>
     <div class="alpaca-list"><h2>Recent fills (${fills.length}${(st.fills || []).length > fills.length ? "+" : ""})</h2>${fills.length ? `<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Quantity</th><th>Price</th></tr></thead><tbody>${fillRows}</tbody></table>` : `<p class="mut">No fills in the loaded history.</p>`}</div>`;
 }
+let renderedBroker = null;
 function render(st) {
   const broker = st.broker || {key: "schwab", name: "Schwab", mode: "live"};
+  if (renderedBroker !== broker.key) {
+    renderedBroker = broker.key;
+    for (const id of ["daylist", "workspace", "orders", "carried", "futures", "closed", "strip"])
+      if ($(id)) $(id).innerHTML = "";
+    $("t-go").disabled = true;
+    $("t-calc").innerHTML = "";
+    $("t-msg").textContent = "";
+    $("t-sym").value = "";
+    T.plan = null; T.ticketId = null; T.intentKey = null; T.sentKey = null; T.armed = false;
+    paperArmed = false; paperOutcome = null; paperRequestId = null;
+    TV.pos = null; TV.closed = null; TV.flat = {}; TV.said = {};
+    if ("speechSynthesis" in window) speechSynthesis.cancel();
+  }
   document.body.classList.toggle("alpaca-readonly", broker.key === "alpaca-paper");
   renderAlpacaOverview(st);
   if (broker.key === "alpaca-paper") renderPaperControls(st);
@@ -1281,7 +1295,7 @@ function render(st) {
   const selector = $("broker-select");
   if (document.activeElement !== selector) selector.value = st.pending_broker || broker.key;
   selector.disabled = !!st.demo;
-  selector.title = st.demo ? "Restart without --demo to switch brokers" : "Choose a broker; restart Edge Trader to activate it";
+  selector.title = st.demo ? "Restart without --demo to switch brokers" : "Choose the active broker";
   const mode = $("broker-mode");
   mode.style.display = broker.mode === "paper" ? "" : "none";
   mode.textContent = broker.mode === "paper" ? "PAPER" : "";
@@ -1508,11 +1522,16 @@ $("broker-select").addEventListener("change", async e => {
   selector.disabled = true;
   try {
     const result = await post("/api/brokers/select", {broker: selector.value});
-    if (!result.ok) throw new Error(result.detail || result.error || "Could not save broker selection");
+    if (!result.ok) throw new Error((result.detail || result.error || "Could not switch broker") +
+      (result.restart_required ? ". Restart Edge Trader to complete the switch." : ""));
     if (result.restart_required) {
       const banner = $("banner");
       banner.style.display = "block";
       banner.textContent = `${selector.options[selector.selectedIndex].text} selected. Restart Edge Trader to activate it.`;
+    } else {
+      paperArmed = false;
+      paperOutcome = null;
+      paperRequestId = null;
     }
     await tick();
   } catch (err) {
@@ -2067,8 +2086,8 @@ function updateHealth() {
     text = lastOk ? `DISCONNECTED · ${Math.round(browserAge)}s` : "DISCONNECTED";
     why = `Companion server not responding. Restart it from the desktop shortcut. Check open orders directly with ${brokerName}.`;
   } else if (broker?.key === "alpaca-paper") {
-    state = "stale";
-    text = lastState?.broker_ready ? "PAPER · READ ONLY" : "PAPER · CONNECTING";
+    state = lastState?.broker_ready ? "live" : "stale";
+    text = lastState?.broker_ready ? "PAPER · READY" : "PAPER · CONNECTING";
     why = lastState?.status || "Connecting to Alpaca Paper";
   } else {
     const f = lastState?.freshness || {};
