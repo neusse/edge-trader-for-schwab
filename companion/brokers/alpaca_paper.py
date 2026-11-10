@@ -226,14 +226,36 @@ class AlpacaPaperAdapter(BrokerAdapter):
                     return tuple(fills)
                 params["page_token"] = page[-1]["id"]
         if isinstance(query, OrdersQuery):
+            from alpaca.common.enums import Sort
             from alpaca.trading.enums import QueryOrderStatus
             from alpaca.trading.requests import GetOrdersRequest
-            raw = self._client.get_orders(GetOrdersRequest(
-                status=QueryOrderStatus.ALL, after=query.start, until=query.end,
-                limit=500, nested=True,
-            ))
-            groups = tuple(_order_group(order) for order in raw)
-            return tuple(group for group in groups if not query.statuses or group.status in query.statuses)
+            active = {OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED}
+            status = (QueryOrderStatus.OPEN if query.statuses and query.statuses <= active
+                      else QueryOrderStatus.ALL)
+            cursor = query.start
+            found = {}
+            for _ in range(100):
+                raw = self._client.get_orders(GetOrdersRequest(
+                    status=status, after=cursor, until=query.end,
+                    limit=500, nested=True, direction=Sort.ASC,
+                ))
+                before = len(found)
+                found.update((str(order.id), order) for order in raw)
+                if len(raw) < 500:
+                    break
+                last = raw[-1].submitted_at
+                if last is None or len(found) == before:
+                    raise ValueError("Alpaca order history pagination made no progress")
+                # Overlap the boundary and deduplicate: several orders can share a timestamp.
+                next_cursor = last - timedelta(microseconds=1)
+                if next_cursor <= cursor:
+                    raise ValueError("Alpaca order history has an ambiguous page boundary")
+                cursor = next_cursor
+            else:
+                raise ValueError("Alpaca order history exceeded the safe page limit")
+            groups = tuple(_order_group(order) for order in found.values())
+            return tuple(group for group in groups if not query.statuses or
+                         any(order.status in query.statuses for order in group.orders))
         if isinstance(query, OrderQuery):
             from alpaca.trading.requests import GetOrderByIdRequest
             return _order_group(self._client.get_order_by_id(query.order_id, GetOrderByIdRequest(nested=True)))

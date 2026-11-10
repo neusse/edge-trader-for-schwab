@@ -87,6 +87,36 @@ def test_client_order_lookup_fetches_nested_group():
     assert group.orders[0].client_order_id == "stable-client-id"
 
 
+def test_order_history_pages_with_boundary_overlap_and_uuid_deduplication():
+    from datetime import datetime, timedelta, timezone
+    from alpaca.trading.models import Order
+    from companion.brokers.models import OrdersQuery
+
+    now = datetime(2026, 11, 10, 16, tzinfo=timezone.utc)
+    raw = [Order.model_construct(
+        id=f"paper-{i}", group_id=None, order_class="simple", group_role=None,
+        status="new", type="limit", time_in_force="day", legs=[],
+        symbol="AAPL", asset_class="us_equity", qty="1", filled_qty="0",
+        side="buy", position_intent=None, limit_price="100", stop_price=None,
+        trail_price=None, trail_percent=None, submitted_at=now - timedelta(hours=1),
+        updated_at=None, client_order_id=f"client-{i}") for i in range(501)]
+
+    class Client:
+        calls = 0
+
+        def get_orders(self, request):
+            self.calls += 1
+            assert request.nested is True
+            assert request.direction.value == "asc"
+            return raw[:500] if self.calls == 1 else raw[499:]
+
+    client = Client()
+    groups = AlpacaPaperAdapter(client).query(OrdersQuery(now - timedelta(days=1), now))
+    assert client.calls == 2
+    assert len(groups) == 501
+    assert len({group.group_id for group in groups}) == 501
+
+
 def test_fill_read_normalizes_opaque_ids_and_option_side():
     from datetime import datetime, timezone
     from companion.brokers.models import FillsQuery, OrderInstruction
@@ -134,6 +164,7 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
     from companion.brokers.models import (
         AccountSnapshot, BalanceSnapshot, BrokerOrder, OrderClass, OrderGroup, OrderLeg,
         OrderRole, OrderStatus, OrderType, OrdersQuery, OrderInstruction, Position,
+        FillsQuery, QuotesQuery,
         TimeInForce,
     )
     from companion.store import Store
@@ -150,9 +181,20 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
                         TimeInForce.DAY, (leg,), OrderRole.ENTRY)
 
     class Adapter:
+        from companion.brokers.capabilities import ALPACA_PAPER
+        identity = ALPACA_PAPER
+
         def query(self, query):
-            return account if isinstance(query, AccountQuery) else (
-                OrderGroup("order-uuid", OrderClass.SIMPLE, OrderStatus.WORKING, (order,)),)
+            if isinstance(query, AccountQuery):
+                return account
+            if isinstance(query, OrdersQuery):
+                return (OrderGroup("order-uuid", OrderClass.SIMPLE,
+                                   OrderStatus.WORKING, (order,)),)
+            if isinstance(query, FillsQuery):
+                return ()
+            if isinstance(query, QuotesQuery):
+                return {}
+            raise AssertionError(type(query))
 
     poller = AlpacaBootstrapPoller(Adapter())
     from companion.trading import Trader
@@ -163,7 +205,8 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
         assert state["broker_ready"] is True
         assert state["alpaca"]["positions"][0]["symbol"] == "AAPL"
         assert state["alpaca"]["orders"][0]["id"] == "order-uuid"
-        assert state["orders"] == []  # legacy trading controls receive no actionable order
+        assert state["positions"][0]["symbol"] == "AAPL"
+        assert state["orders"][0]["order_id"] == "order-uuid"
         assert poller.store.scope == ("alpaca-paper", "paper-account")
         assert poller.trader.store is poller.store
         assert poller.trader.status()["armed"] is False

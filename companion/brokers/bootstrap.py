@@ -6,7 +6,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .alpaca_paper import AlpacaPaperAdapter
-from .models import AccountQuery, OrdersQuery
+from .canonical_view import build_canonical_state
+from .models import AccountQuery, AssetType, FillsQuery, OrdersQuery, OrderStatus, QuotesQuery
+from .order_service import BrokerOrderService
+from .persistence import load_fills, save_fills
 from ..store import Store
 
 
@@ -24,6 +27,8 @@ class AlpacaBootstrapPoller:
                        "positions": [], "orders": [], "broker_ready": False}
         self._thread: threading.Thread | None = None
         self._verified_account: str | None = None
+        self.order_service: BrokerOrderService | None = None
+        self._last_fill_read: datetime | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -50,14 +55,61 @@ class AlpacaBootstrapPoller:
                     self.trader.arm(False, reason="account scope change")
                 with self._lock:
                     self.store = scoped
+                    self.order_service = BrokerOrderService(self._adapter, scoped,
+                                                             account.account_ref)
                     if self.trader is not None:
                         self.trader.store = scoped
                     self._stores.append(scoped)
                 if self.trader is not None:
                     self.trader.arm(False, reason="account scope activated")
                 self._verified_account = account.account_ref
+                self._last_fill_read = None
             now = datetime.now(timezone.utc)
-            groups = self._adapter.query(OrdersQuery(now - timedelta(days=30), now))
+            recent = self._adapter.query(OrdersQuery(now - timedelta(days=30), now))
+            active = frozenset({OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED})
+            working = self._adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                        statuses=active))
+            groups = tuple({group.group_id: group for group in (*recent, *working)}.values())
+            fill_error = None
+            since = now - timedelta(days=60)
+            if self._last_fill_read is None or (now - self._last_fill_read).total_seconds() >= 60:
+                try:
+                    fresh_fills = self._adapter.query(FillsQuery(since, now))
+                    save_fills(self.store, fresh_fills)
+                    self._last_fill_read = now
+                except Exception as exc:
+                    fill_error = f"{type(exc).__name__}; fill history is incomplete"
+            fills = load_fills(self.store, since)
+            symbols = [(position.symbol, position.asset_type) for position in account.positions]
+            symbols.extend((leg.symbol, leg.asset_type) for group in groups
+                           for order in group.orders if order.status in active for leg in order.legs)
+            quotes = {}
+            quote_error = None
+            for asset_type in (AssetType.EQUITY, AssetType.OPTION):
+                names = tuple(dict.fromkeys(symbol for symbol, kind in symbols
+                                            if kind == asset_type))[:30]
+                if len({symbol for symbol, kind in symbols if kind == asset_type}) > 30:
+                    quote_error = "Quote limit reached; some symbols are unpriced"
+                if names:
+                    try:
+                        quotes.update(self._adapter.query(QuotesQuery(names, asset_type)))
+                    except Exception as exc:
+                        quote_error = f"{type(exc).__name__}; quotes are incomplete"
+            freshness = {
+                "account": {"ok_at": now.isoformat(), "error": None, "interval": 10},
+                "orders_today": {"ok_at": now.isoformat(), "error": None, "interval": 10},
+                "orders_sweep": {"ok_at": now.isoformat(), "error": None, "interval": 10},
+                "transactions": {"ok_at": self._last_fill_read.isoformat()
+                                 if self._last_fill_read else None,
+                                 "error": fill_error, "interval": 60},
+                "quotes": {"ok_at": now.isoformat() if not quote_error else None,
+                           "error": quote_error, "interval": 10},
+            }
+            canonical = build_canonical_state(
+                account, groups, fills, quotes, now=now,
+                orders_fresh=True, history_complete=fill_error is None and
+                self._last_fill_read is not None, freshness=freshness)
             positions = [{"symbol": p.symbol, "asset_type": p.asset_type.value,
                           "side": p.side.value, "quantity": str(p.quantity),
                           "average_price": str(p.average_price)} for p in account.positions]
@@ -66,8 +118,8 @@ class AlpacaBootstrapPoller:
                        "symbols": [leg.symbol for leg in o.legs],
                        "quantities": [str(leg.quantity) for leg in o.legs]}
                       for group in groups for o in group.orders]
-            state = {"status": "Alpaca Paper connected; trading integration in progress",
-                     "booting": False, "positions": [], "orders": [], "broker_ready": True,
+            state = {**canonical, "status": "Alpaca Paper connected; trading integration in progress",
+                     "booting": False, "broker_ready": True,
                      "alpaca": {"account_status": account.status,
                                 "equity": str(account.balances.equity) if account.balances.equity is not None else None,
                                 "cash": str(account.balances.available_funds) if account.balances.available_funds is not None else None,

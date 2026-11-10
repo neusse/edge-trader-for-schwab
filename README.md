@@ -11,9 +11,14 @@ order, and lets you enter a fully protected bracket (entry, stop and target, siz
 want to risk) and manage it with one click: stop to break-even, move the stop, trail it, replace the
 target, take partials, cancel or close. It runs on your own computer, next to thinkorswim or your charts.
 
-- **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks only to Schwab.
+**Alpaca Paper preview:** New installations select Alpaca Paper by default. Its account overview shows
+balances, positions, recent and working orders, stop coverage, and P&L coverage from paper fills and
+IEX/indicative quotes. Alpaca order controls are currently read-only while paper workflows are being
+connected. Select Schwab in the app and restart for the existing Schwab trading workflows.
+
+- **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks to the selected broker.
 - **Every order is your click.** No signals, no auto-trading. Two exceptions, both opt-in per trade: pick "Auto B/E 1R" on the ticket and the app moves that trade's stop to break-even once, when price reaches +1R; tick "Send when hit" on a spread's stop and the app sends that spread's close once, when the stop is reached.
-- **Protection first.** Entries go in as one Schwab bracket, so the stop and target live at Schwab even if the app or your PC is off. Leaving out the stop is possible only when you size by quantity, and the ticket asks you to confirm it every time.
+- **Protection first for Schwab trades.** Entries go in as one Schwab bracket, so the stop and target live at Schwab even if the app or your PC is off. Leaving out the stop is possible only when you size by quantity, and the ticket asks you to confirm it every time.
 - **Honest numbers.** P&L comes from your own fills, and anything incomplete is labeled as such, never shown as complete.
 - **Free and MIT licensed.** No paid tier.
 
@@ -42,19 +47,20 @@ name are refused). It needs no account and sends no telemetry.
 
 ### What stays local
 
-- Your Schwab tokens (`~/.schwabdev/tokens.db`, managed by Schwabdev) and your app key and secret (`.env`).
-- Everything the app records: positions, orders, fills, the action log and your settings, in `data/companion.db`.
+- Your broker credentials in `.env` and Schwab tokens (`~/.schwabdev/tokens.db`, managed by Schwabdev).
+- Everything the app records: positions, orders, fills, the action log and settings, in account-scoped SQLite databases under `data/`. The existing Schwab database remains `data/companion.db`.
 
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads. Stock quotes use Alpaca IEX data and option quotes use indicative data. Paper order controls remain disabled in this preview.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
 
 ### API keys
 
-Keys live in `.env` on your machine, which is never committed. Do not share or commit `.env`, the
+Keys live in `.env` or your process environment on your machine, which is never committed. Do not share or commit `.env`, the
 `data` folder, the tokens file, or screenshots of your real account.
 
 ## What's inside
@@ -163,9 +169,10 @@ Requirements: Windows 10 or 11 and [Python 3.11 or newer](https://www.python.org
 
 **Windows:** download or clone this repo, then
 
-1. `setup.bat`, once. It creates `.venv`, installs Schwabdev, FastAPI and the rest, and creates `.env`.
-2. Put your Schwab App Key and Secret in `.env` (see [Your Schwab app](#your-schwab-app)).
-3. `login.bat`. It opens Schwab's sign-in page through Schwabdev; approve, then paste the address of
+1. `setup.bat`, once. It creates `.venv`, installs dependencies, and creates `.env`.
+2. For the default Alpaca Paper overview, put `alpaca_paper_api_key` and `alpaca_paper_secret` in `.env`.
+   For Schwab trading, select Schwab in the app, put your Schwab App Key and Secret in `.env`, then restart.
+3. For Schwab, run `login.bat`. It opens Schwab's sign-in page through Schwabdev; approve, then paste the address of
    the page you land on (it will not load, that is expected). Repeat about once a week: Schwab's
    sign-in lasts 7 days.
 4. `launch.bat`, every time. It opens http://127.0.0.1:8770. `stop.bat` stops it.
@@ -175,12 +182,12 @@ Requirements: Windows 10 or 11 and [Python 3.11 or newer](https://www.python.org
 ```bash
 python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt     # Windows: .venv\Scripts\python.exe
-cp .env.example .env                                     # then put your App Key and Secret in it
-.venv/bin/python -m companion.login                      # sign in to Schwab
-.venv/bin/python -m companion                            # then open http://127.0.0.1:8770
+cp .env.example .env                                     # add Alpaca Paper credentials for the default overview
+.venv/bin/python -m companion.login                      # only when using Schwab
+.venv/bin/python -m companion                            # open http://127.0.0.1:8770
 ```
 
-Every install starts empty: Edge Trader shows only what your Schwab account reports, and keeps
+Every install starts empty: Edge Trader shows only what the selected broker reports, and keeps
 nothing from anyone else.
 
 ## Updating to a new release
@@ -197,7 +204,9 @@ folder across, run `setup.bat` once, then `launch.bat`.
 
 | Variable | What it does |
 |---|---|
-| `SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET` | Your Schwab app (required). |
+| `alpaca_paper_api_key`, `alpaca_paper_secret` | Alpaca Paper credentials for the default broker. Live credentials are not accepted. |
+| `alpaca_paper_endpoint` | Optional; only `https://paper-api.alpaca.markets` is accepted. |
+| `SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET` | Your Schwab app, when Schwab is selected. |
 | `SCHWAB_CALLBACK_URL` | Must match your app's callback URL. Default `https://127.0.0.1`. |
 | `SCHWAB_TOKENS_DB` | Where Schwabdev keeps the tokens. Default `~/.schwabdev/tokens.db`. |
 | `SCHWAB_ENV_FILE` | Read the keys from another app's `.env`, to share one Schwab sign-in between apps. |

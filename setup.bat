@@ -25,25 +25,25 @@ if not exist ".venv\Scripts\python.exe" (
     if errorlevel 1 goto :fail
 )
 
-echo [2/3] Installing the packages (schwabdev, FastAPI, uvicorn, pywebview)
+echo [2/3] Installing the packages (alpaca-py, schwabdev, FastAPI, uvicorn, pywebview)
 ".venv\Scripts\python.exe" -m pip install --quiet --upgrade pip
 ".venv\Scripts\python.exe" -m pip install --quiet -r requirements.txt
 if errorlevel 1 goto :fail
 
-echo [3/3] Creating .env for your Schwab app key and secret
+echo [3/3] Creating .env for your selected broker
 if exist ".env" (
     echo       .env already exists, left as it is
 ) else (
     copy ".env.example" ".env" >nul
-    echo       Created. Open .env and paste your Schwab App Key and Secret.
+    echo       Created. Open .env and paste your selected broker's credentials.
 )
 
 echo.
 echo Setup finished. Next:
-echo   1. Put your Schwab App Key and Secret in .env  (see README, "Your Schwab app")
-echo   2. Run login.bat to sign in to Schwab
+echo   1. Put Alpaca Paper credentials in .env for the default paper account overview
+echo   2. Or select Schwab, add its keys to .env, and run login.bat
 echo   3. Run launch.bat, then use http://127.0.0.1:8770
-echo Every install starts empty: Edge Trader only shows what your Schwab account reports.
+echo Every install starts empty: Edge Trader only shows what the selected broker reports.
 echo.
 pause
 exit /b 0
