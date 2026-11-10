@@ -79,21 +79,28 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._con = sqlite3.connect(path, check_same_thread=False)
         self._con.executescript(SCOPED_SCHEMA if scope and scope[0] != "schwab" else SCHEMA)
+        self._lock = threading.Lock()
+        self.scope = None
         if scope:
-            broker, account = scope
-            if not _SCOPE_KEY.fullmatch(broker) or not account:
-                raise ValueError("invalid broker or account scope")
+            try:
+                self.bind_scope(*scope)
+            except Exception:
+                self._con.close()
+                raise
+        self._last_positions_hash: str | None = None
+
+    def bind_scope(self, broker: str, account: str) -> None:
+        """Pin an existing database to the account discovered at broker connection."""
+        if not _SCOPE_KEY.fullmatch(broker) or not account:
+            raise ValueError("invalid broker or account scope")
+        with self._lock, self._con:
             self._con.execute("create table if not exists store_scope (broker text not null, account text not null)")
             rows = self._con.execute("select broker, account from store_scope").fetchall()
             if rows and rows != [(broker, account)]:
-                self._con.close()
                 raise ValueError("database belongs to a different broker or account")
             if not rows:
-                self._con.execute("insert into store_scope values (?,?)", scope)
-                self._con.commit()
-        self.scope = scope
-        self._lock = threading.Lock()
-        self._last_positions_hash: str | None = None
+                self._con.execute("insert into store_scope values (?,?)", (broker, account))
+        self.scope = (broker, account)
 
     @classmethod
     def for_broker(cls, broker: str, account: str, root: Path = DB.parent) -> Store:

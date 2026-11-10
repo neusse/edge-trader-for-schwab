@@ -129,6 +129,8 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
                 OrderGroup("order-uuid", OrderClass.SIMPLE, OrderStatus.WORKING, (order,)),)
 
     poller = AlpacaBootstrapPoller(Adapter())
+    from companion.trading import Trader
+    poller.trader = Trader(poller.store)
     try:
         poller.poll_once()
         state = poller.snapshot()
@@ -136,5 +138,8 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
         assert state["alpaca"]["positions"][0]["symbol"] == "AAPL"
         assert state["alpaca"]["orders"][0]["id"] == "order-uuid"
         assert state["orders"] == []  # legacy trading controls receive no actionable order
+        assert poller.store.scope == ("alpaca-paper", "paper-account")
+        assert poller.trader.store is poller.store
+        assert poller.trader.status()["armed"] is False
     finally:
         poller.stop()

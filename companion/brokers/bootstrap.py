@@ -13,6 +13,7 @@ from ..store import Store
 class AlpacaBootstrapPoller:
     def __init__(self, adapter: AlpacaPaperAdapter | None = None):
         self.store = Store(Path(":memory:"))
+        self._stores = [self.store]
         self.trader = None
         self.terminal: set[str] = set()
         self.orders_today: dict[str, dict] = {}
@@ -42,9 +43,18 @@ class AlpacaBootstrapPoller:
                 self._adapter = AlpacaPaperAdapter()
             account = self._adapter.query(AccountQuery())
             if self._verified_account != account.account_ref:
-                # Verify ownership before presenting any data from this account.
+                # Keep earlier handles open until shutdown so an in-flight settings read
+                # can finish even while the active account scope is replaced.
                 scoped = Store.for_broker("alpaca-paper", account.account_ref)
-                scoped.close()
+                if self.trader is not None:
+                    self.trader.arm(False, reason="account scope change")
+                with self._lock:
+                    self.store = scoped
+                    if self.trader is not None:
+                        self.trader.store = scoped
+                    self._stores.append(scoped)
+                if self.trader is not None:
+                    self.trader.arm(False, reason="account scope activated")
                 self._verified_account = account.account_ref
             now = datetime.now(timezone.utc)
             groups = self._adapter.query(OrdersQuery(now - timedelta(days=30), now))
@@ -76,7 +86,8 @@ class AlpacaBootstrapPoller:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
-        self.store.close()
+        for store in self._stores:
+            store.close()
 
     def snapshot(self) -> dict:
         with self._lock:

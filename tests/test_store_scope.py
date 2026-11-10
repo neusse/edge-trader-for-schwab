@@ -58,3 +58,17 @@ def test_scope_rejects_path_injection_and_wrong_metadata(tmp_path):
     scoped.close()
     with pytest.raises(ValueError, match="different broker or account"):
         Store(path, scope=("schwab", "paper-account"))
+
+
+def test_existing_schwab_store_binds_after_account_discovery(tmp_path):
+    path = tmp_path / "companion.db"
+    store = Store(path)
+    store.save_orders([{"orderId": 42, "status": "WORKING"}])
+    store.bind_scope("schwab", "account-a")
+    assert store.scope == ("schwab", "account-a")
+    assert store.get_order(42)["status"] == "WORKING"
+    with pytest.raises(ValueError, match="different broker or account"):
+        store.bind_scope("schwab", "account-b")
+    store.close()
+    with pytest.raises(ValueError, match="different broker or account"):
+        Store(path, scope=("schwab", "account-b"))
