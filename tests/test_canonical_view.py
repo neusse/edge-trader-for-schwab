@@ -2,8 +2,11 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 
 from companion.brokers.canonical_view import build_canonical_state
+from companion.brokers.capabilities import SCHWAB
+from companion.brokers.fake import FakeBrokerAdapter
 from companion.brokers.models import (
-    AccountSnapshot, AssetType, BalanceSnapshot, BrokerOrder, Fill, OrderClass,
+    AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerOrder, Fill, FillsQuery,
+    OrdersQuery, QuotesQuery, OrderClass,
     OrderGroup, OrderInstruction, OrderLeg, OrderRole, OrderStatus, OrderType,
     Position, PositionSide, Quote, TimeInForce,
 )
@@ -55,3 +58,24 @@ def test_stale_orders_and_missing_quote_never_claim_protection_or_complete_pnl()
     assert position["open_pnl"] is None
     assert state["summary"]["open_pnl"]["complete"] is False
     assert state["summary"]["realized"]["complete"] is False
+
+
+def test_fake_broker_can_drive_a_complete_dashboard_without_network():
+    fake = FakeBrokerAdapter(SCHWAB)
+    fills = (Fill("fill-1", "entry-1", "AAPL", AssetType.EQUITY,
+                  OrderInstruction.BUY, D("2"), D("100"), NOW),)
+    quote = Quote("AAPL", D("104"), D("106"), None, D("105"), NOW,
+                  True, "Fake Schwab")
+    fake.given_query(AccountQuery, account())
+    fake.given_query(OrdersQuery, group())
+    fake.given_query(FillsQuery, fills)
+    fake.given_query(QuotesQuery, {"AAPL": quote})
+    state = build_canonical_state(
+        fake.query(AccountQuery()),
+        fake.query(OrdersQuery(NOW, NOW)),
+        fake.query(FillsQuery(NOW, NOW)),
+        fake.query(QuotesQuery(("AAPL",), AssetType.EQUITY)),
+        now=NOW, orders_fresh=True, history_complete=True)
+    assert state["positions"][0]["protection"] == "FULL"
+    assert state["positions"][0]["open_pnl"] == 10
+    assert state["summary"]["realized"]["complete"]

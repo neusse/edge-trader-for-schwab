@@ -62,6 +62,9 @@ def normalize_account(raw: dict, account_ref: str) -> AccountSnapshot:
             side=PositionSide.LONG if qty > 0 else PositionSide.SHORT,
             quantity=abs(qty), average_price=_decimal(row.get("averagePrice")),
             underlying=instrument.get("underlyingSymbol") or instrument.get("rootSymbol") or symbol,
+            previous_session_quantity=(Decimal(str(row.get("previousSessionLongQuantity") or 0)) -
+                                       Decimal(str(row.get("previousSessionShortQuantity") or 0))),
+            current_day_cost=_decimal(row.get("currentDayCost")),
         ))
     return AccountSnapshot(
         account_ref=account_ref, status="CONNECTED",
@@ -89,6 +92,17 @@ def normalize_order(raw: dict) -> OrderGroup:
     else:
         order_class = OrderClass.SIMPLE
     members = []
+    closing = {OrderInstruction.SELL, OrderInstruction.BUY_TO_COVER,
+               OrderInstruction.BUY_TO_CLOSE, OrderInstruction.SELL_TO_CLOSE}
+    root_instructions = set()
+    for leg in raw.get("orderLegCollection") or ():
+        name = (leg.get("instruction") or "").lower().replace("_", "-")
+        try:
+            root_instructions.add(OrderInstruction(name))
+        except ValueError:
+            pass
+    root_role = (OrderRole.EXIT if strategy != "TRIGGER" and root_instructions and
+                 root_instructions <= closing else OrderRole.ENTRY)
 
     def visit(node: dict, parent_id: str | None, role: OrderRole) -> None:
         node_id = str(node.get("orderId") or root_id)
@@ -127,7 +141,7 @@ def normalize_order(raw: dict) -> OrderGroup:
                           else OrderRole.TARGET if kind == "LIMIT" else OrderRole.EXIT)
             visit(child, node_id if legs else parent_id, child_role)
 
-    visit(raw, None, OrderRole.ENTRY)
+    visit(raw, None, root_role)
     return OrderGroup(root_id, order_class,
                       _STATUS.get(raw.get("status"), OrderStatus.UNKNOWN), tuple(members))
 
@@ -202,7 +216,8 @@ class SchwabAdapter(BrokerAdapter):
         if isinstance(query, OrdersQuery):
             raw = _response(client.account_orders(account_hash, query.start, query.end))
             groups = tuple(normalize_order(row) for row in raw)
-            return tuple(group for group in groups if not query.statuses or group.status in query.statuses)
+            return tuple(group for group in groups if not query.statuses or
+                         any(order.status in query.statuses for order in group.orders))
         if isinstance(query, OrderQuery):
             return normalize_order(_response(client.order_details(account_hash, query.order_id)))
         if isinstance(query, FillsQuery):
