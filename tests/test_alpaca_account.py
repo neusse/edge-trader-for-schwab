@@ -199,25 +199,50 @@ def test_fill_read_paginates_without_losing_opaque_activities():
     assert len({fill.activity_id for fill in fills}) == 101
 
 
-def test_broker_selection_persists_without_reusing_current_runtime(monkeypatch, tmp_path):
+def test_broker_selection_replaces_runtime_and_clears_cached_state(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
     from companion import app as appmod
     from companion.brokers.configuration import BrokerSelection
+    from companion.store import Store
+    from companion.trading import Trader
+
+    class RuntimePoller:
+        def __init__(self, name):
+            self.store = Store(tmp_path / f"{name}.db")
+            self.trader = None
+            self.terminal = set()
+            self.stopped = False
+            self.started = False
+        def snapshot(self): return {"booting": True, "status": "fresh runtime"}
+        def start(self): self.started = True
+        def stop(self): self.stopped = True
+        def _merged_orders(self): return []
+        def note_external_request(self, retry_after=None): pass
+        def cooldown_left(self): return 0.0
+    old, new = RuntimePoller("old"), RuntimePoller("new")
 
     selection = BrokerSelection(tmp_path / "broker-selection.json")
     monkeypatch.setattr(appmod, "BrokerSelection", lambda: selection)
     monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
     monkeypatch.setattr(appmod, "DEMO", False)
+    monkeypatch.setattr(appmod, "poller", old)
+    monkeypatch.setattr(appmod, "trader", Trader(old.store))
+    monkeypatch.setattr(appmod, "make_poller", lambda key: new)
+    monkeypatch.setattr(appmod, "_feature_routes", None)
     client = TestClient(appmod.app, base_url="http://127.0.0.1:8770")
     response = client.post("/api/brokers/select", json={"broker": "schwab"},
                            headers={"X-Companion": "1"})
-    assert response.json() == {"ok": True, "active": "alpaca-paper",
-                               "selected": "schwab", "restart_required": True}
+    assert response.json() == {"ok": True, "active": "schwab",
+                               "selected": "schwab", "restart_required": False}
     assert selection.get() == "schwab"
     state = client.get("/api/state").json()
-    assert state["broker"]["key"] == "alpaca-paper"
-    assert state["pending_broker"] == "schwab"
+    assert state["broker"]["key"] == "schwab"
+    assert state["pending_broker"] is None
+    assert state["status"] == "fresh runtime"
+    assert old.stopped and new.started
     assert appmod.trader.status()["armed"] is False
+    old.store.close()
+    new.store.close()
 
 
 def test_demo_override_never_shows_or_persists_another_broker(monkeypatch, tmp_path):

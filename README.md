@@ -18,7 +18,8 @@ equity bracket form accepts a flat symbol with no active order, whole-share long
 entry, one target, and one fixed stop. Arm entries for the market day, review the plan, then confirm
 the Paper order. The target and stop are broker-held after the entry fills. A lost response blocks new
 orders until the exact client order ID is reconciled. Other Alpaca order workflows are still being
-connected. Select Schwab in the app and restart for the existing Schwab trading workflows.
+connected. Select Schwab in the app for the existing Schwab trading workflows. Switching disarms
+entries and loads a fresh broker runtime before order controls can be used again.
 
 ![Alpaca Paper equity bracket form with invented demo state](docs/screenshot-paper-entry-demo.png)
 
@@ -177,7 +178,8 @@ Requirements: Windows 10 or 11 and [Python 3.11 or newer](https://www.python.org
 
 1. `setup.bat`, once. It creates `.venv`, installs dependencies, and creates `.env`.
 2. For the default Alpaca Paper overview, put `alpaca_paper_api_key` and `alpaca_paper_secret` in `.env`.
-   For Schwab trading, select Schwab in the app, put your Schwab App Key and Secret in `.env`, then restart.
+   For Schwab trading, put your Schwab App Key and Secret in `.env`, then select Schwab in the app.
+   Credentials added to `.env` require a process restart to load into the environment.
 3. For Schwab, run `login.bat`. It opens Schwab's sign-in page through Schwabdev; approve, then paste the address of
    the page you land on (it will not load, that is expected). Repeat about once a week: Schwab's
    sign-in lasts 7 days.

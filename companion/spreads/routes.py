@@ -14,32 +14,49 @@ STATIC = Path(__file__).resolve().parent / "static"
 DEMO_REFUSAL = {"ok": False, "error": "Demo mode: no orders and no Schwab calls."}
 
 
-def register(app, trader, poller, guard, demo: bool = False) -> list[str]:
+def register(app, trader, poller, guard, demo: bool = False,
+             action_lock: threading.RLock | None = None) -> list[str]:
     """Add the spread ticket's endpoints; returns the page scripts the dashboard should load."""
     if not trader.spreads:
         return []
-    desk = SpreadDesk(trader)
-    desk.snapshot = poller._merged_orders
-    desk.sweep_fresh = (lambda: poller._fresh("orders_sweep")) if hasattr(poller, "_fresh") else None
+    action_lock = action_lock or threading.RLock()
+    generation = 0
+    desk = None
 
-    def held_quote(symbol: str):
-        """The poller's latest quote of a contract it already polls (every held leg), if current."""
-        if not hasattr(poller, "_fresh") or not poller._fresh("quotes"):
-            return None
-        e = (getattr(poller, "quotes", None) or {}).get(symbol) or {}
-        q = e.get("quote") or {}
-        if q.get("bidPrice") is None or q.get("askPrice") is None:
-            return None
-        return {"symbol": symbol, "found": True, "bid": q.get("bidPrice"), "ask": q.get("askPrice"),
-                "mark": q.get("mark"), "realtime": e.get("realtime"),
-                "is_penny": ((e.get("reference") or {}).get("isPennyPilot"))}
-    desk.held_quotes = held_quote
+    def bind_runtime(next_trader, next_poller, next_demo: bool) -> None:
+        """Replace the route target; callbacks from a stopped poller become inert."""
+        nonlocal trader, poller, demo, desk, generation
+        generation += 1
+        active_generation = generation
+        next_desk = SpreadDesk(next_trader)
+        next_desk.snapshot = next_poller._merged_orders
+        next_desk.sweep_fresh = (lambda: next_poller._fresh("orders_sweep")) \
+            if hasattr(next_poller, "_fresh") else None
 
-    def fire(sid: str) -> None:
-        """A stop with Send on fired: its one close goes out on a worker thread (the poller never waits)."""
-        if not demo:
-            threading.Thread(target=desk.auto_stop, args=(sid,), name=f"auto-stop-{sid}", daemon=True).start()
-    trader.spreads.on_fire = fire
+        def held_quote(symbol: str):
+            if not hasattr(next_poller, "_fresh") or not next_poller._fresh("quotes"):
+                return None
+            e = (getattr(next_poller, "quotes", None) or {}).get(symbol) or {}
+            q = e.get("quote") or {}
+            if q.get("bidPrice") is None or q.get("askPrice") is None:
+                return None
+            return {"symbol": symbol, "found": True, "bid": q.get("bidPrice"), "ask": q.get("askPrice"),
+                    "mark": q.get("mark"), "realtime": e.get("realtime"),
+                    "is_penny": ((e.get("reference") or {}).get("isPennyPilot"))}
+        next_desk.held_quotes = held_quote
+
+        def fire(sid: str) -> None:
+            def send_if_current():
+                with action_lock:
+                    if generation == active_generation:
+                        next_desk.auto_stop(sid)
+            if not next_demo and generation == active_generation:
+                threading.Thread(target=send_if_current, name=f"auto-stop-{sid}", daemon=True).start()
+        next_trader.spreads.on_fire = fire
+        trader, poller, demo, desk = next_trader, next_poller, next_demo, next_desk
+
+    bind_runtime(trader, poller, demo)
+    app.state.bind_spread_runtime = bind_runtime
 
     @app.get("/features/{name}.js", include_in_schema=False)
     def feature_js(name: str):

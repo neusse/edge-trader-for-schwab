@@ -100,6 +100,10 @@ class Poller:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=20)
+            if self._thread.is_alive():
+                raise RuntimeError("Schwab polling did not stop; restart before switching brokers")
 
     def snapshot(self) -> dict:
         with self._lock:

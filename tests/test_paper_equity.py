@@ -16,6 +16,7 @@ from companion.brokers.models import (
 from companion.brokers.order_service import BrokerOrderService
 from companion.brokers.paper_equity import entry_plan
 from companion.store import Store
+from companion.trading import Trader
 
 
 def quote(now, symbol="AAPL"):
@@ -72,9 +73,24 @@ def test_paper_entry_route_arms_previews_sends_once_and_disarms_on_selection(mon
         def get(self): return self.selected
         def set(self, key): self.selected = key
     selected = Selection()
+    class IdlePoller:
+        def __init__(self):
+            self.store = Store(tmp_path / "next.db")
+            self.trader = None
+            self.terminal = set()
+            self.started = False
+        def start(self): self.started = True
+        def stop(self): self.store.close()
+        def _merged_orders(self): return []
+        def note_external_request(self, retry_after=None): pass
+        def cooldown_left(self): return 0.0
+    next_poller = IdlePoller()
     monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
     monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "trader", Trader(poller.store))
     monkeypatch.setattr(appmod, "BrokerSelection", lambda: selected)
+    monkeypatch.setattr(appmod, "make_poller", lambda key: next_poller)
+    monkeypatch.setattr(appmod, "_feature_routes", None)
     client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
     headers = {"X-Companion": "1"}
     body = entry()
@@ -85,9 +101,12 @@ def test_paper_entry_route_arms_previews_sends_once_and_disarms_on_selection(mon
         result = client.post("/api/paper/entry/submit", json=body, headers=headers).json()
         assert result["status"] == "accepted" and result["order_id"] == "order-1"
         assert len(adapter.commands) == 1
-        assert client.post("/api/brokers/select", json={"broker": "schwab"}, headers=headers).json()["restart_required"]
+        switched = client.post("/api/brokers/select", json={"broker": "schwab"}, headers=headers).json()
+        assert switched == {"ok": True, "active": "schwab", "selected": "schwab", "restart_required": False}
+        assert next_poller.started
         assert not poller.order_service.armed
         assert client.post("/api/paper/entry/submit", json=body, headers=headers).status_code == 409
     finally:
         store.close()
         poller.store.close()
+        next_poller.store.close()
