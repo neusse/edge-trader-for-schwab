@@ -10,7 +10,9 @@ from companion.brokers.capabilities import ALPACA_PAPER
 from companion.brokers.fake import FakeBrokerAdapter
 from companion.brokers.models import (
     AccountQuery, AccountSnapshot, BalanceSnapshot, MarketSession,
-    MarketSessionsQuery, MutationResult, MutationStatus, OrdersQuery, Quote, QuotesQuery,
+    MarketSessionsQuery, MutationResult, MutationStatus, OrdersQuery, OrderQuery,
+    OrderClass, OrderGroup, BrokerOrder, OrderLeg, OrderRole, OrderStatus,
+    OrderInstruction, OrderType, TimeInForce, AssetType, CancelOrder, Quote, QuotesQuery,
     SubmitOrder,
 )
 from companion.brokers.order_service import BrokerOrderService
@@ -110,3 +112,52 @@ def test_paper_entry_route_arms_previews_sends_once_and_disarms_on_selection(mon
         store.close()
         poller.store.close()
         next_poller.store.close()
+
+
+def test_paper_cancel_route_rechecks_unfilled_entry_and_selected_broker(monkeypatch, tmp_path):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    order_id = str(uuid4())
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    def group(filled, status_detail=None):
+        order = BrokerOrder(order_id, OrderStatus.WORKING, OrderType.LIMIT,
+                            TimeInForce.DAY, (OrderLeg("AAPL", AssetType.EQUITY,
+                            OrderInstruction.BUY, Decimal(2), filled_quantity=Decimal(filled)),),
+                            OrderRole.ENTRY, status_detail=status_detail)
+        return OrderGroup(order_id, OrderClass.BRACKET, OrderStatus.WORKING, (order,))
+    adapter.given_query(OrderQuery, group(0), group(1), group(0, "PENDING_CANCEL"))
+    adapter.given_query(AccountQuery, AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot()))
+    adapter.given_command(CancelOrder, MutationResult(MutationStatus.ACCEPTED, order_id))
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
+    poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
+                     "updated_at": now.isoformat(), "positions": [], "orders": []}}
+    class Selection:
+        selected = "alpaca-paper"
+        def get(self): return self.selected
+    selected = Selection()
+    monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
+    monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "BrokerSelection", lambda: selected)
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    try:
+        body = {"order_id": order_id, "request_id": str(uuid4())}
+        accepted = client.post("/api/paper/entry/cancel", json=body, headers=headers).json()
+        assert accepted["status"] == "accepted" and accepted["order_id"] == order_id
+        assert len(adapter.commands) == 1
+        refused = client.post("/api/paper/entry/cancel", json={**body, "request_id": str(uuid4())},
+                              headers=headers).json()
+        assert not refused["ok"] and "unfilled" in refused["error"]
+        assert len(adapter.commands) == 1
+        transitional = client.post("/api/paper/entry/cancel", json={**body, "request_id": str(uuid4())},
+                                   headers=headers).json()
+        assert not transitional["ok"] and "unfilled" in transitional["error"]
+        assert len(adapter.commands) == 1
+        selected.selected = "schwab"
+        assert client.post("/api/paper/entry/cancel", json=body, headers=headers).status_code == 409
+    finally:
+        store.close()
+        poller.store.close()

@@ -5,7 +5,7 @@ from companion.brokers.capabilities import ALPACA_PAPER
 from companion.brokers.fake import FakeBrokerAdapter
 from companion.brokers.models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, CancelOrder,
-    BrokerOrder, ClientOrderQuery, MarketSession, MarketSessionsQuery,
+    BrokerOrder, ClientOrderQuery, MarketSession, MarketSessionsQuery, OrderQuery,
     MutationResult, MutationStatus, OrderClass, OrderGroup, OrderRole,
     OrderStatus, OrderLeg,
     OrderInstruction, OrderLegIntent, OrderType, SimpleOrderIntent,
@@ -135,5 +135,30 @@ def test_submit_refused_without_arming_or_regular_session(tmp_path):
         service.arm(True)
         assert service.execute(command(), "second").status == MutationStatus.REJECTED
         assert adapter.commands == []
+    finally:
+        store.close()
+
+
+def test_unknown_cancel_blocks_actions_until_broker_confirms_final_status(tmp_path):
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT, ACCOUNT)
+    adapter.given_command(CancelOrder, MutationResult(MutationStatus.UNKNOWN,
+                                                      message="timeout"))
+    service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
+    def group(status):
+        order = BrokerOrder("order-uuid", status, OrderType.LIMIT, TimeInForce.DAY,
+                            (OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY,
+                                      Decimal(1)),), OrderRole.ENTRY)
+        return OrderGroup("order-uuid", OrderClass.SIMPLE, status, (order,))
+    try:
+        assert service.execute(CancelOrder("order-uuid"), "cancel-1").status == MutationStatus.UNKNOWN
+        assert service.execute(CancelOrder("another-order"), "cancel-2").status == MutationStatus.UNKNOWN
+        assert len(adapter.commands) == 1
+        adapter.given_query(OrderQuery, group(OrderStatus.WORKING), group(OrderStatus.CANCELED))
+        assert service.reconcile_cancel("cancel-1").status == MutationStatus.UNKNOWN
+        assert service.reconcile_cancel("cancel-1").status == MutationStatus.ACCEPTED
+        assert store.open_mutations() == []
+        assert service.reconcile_cancel("cancel-1").status == MutationStatus.ACCEPTED
     finally:
         store.close()
