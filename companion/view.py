@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
+from .brokers.models import AccountSnapshot, Position, Quote
 from .orders import PendingOrder, stop_coverage
 from .pnl import (Book, Fill, build_book, opening_inventory,
                   session_day)
@@ -34,12 +35,15 @@ def _f(x) -> float:
         return 0.0
 
 
-def _mark(sym: str, quotes: dict) -> dict | None:
-    q = (quotes.get(sym) or {}).get("quote") or {}
-    if not q:
+def _mark(sym: str, quotes: dict[str, Quote]) -> dict | None:
+    q = quotes.get(sym)
+    if q is None:
         return None
-    return {"last": q.get("lastPrice"), "bid": q.get("bidPrice"), "ask": q.get("askPrice"),
-            "mark": q.get("mark"), "change_pct": q.get("netPercentChange")}
+    return {"last": float(q.last) if q.last is not None else None,
+            "bid": float(q.bid) if q.bid is not None else None,
+            "ask": float(q.ask) if q.ask is not None else None,
+            "mark": float(q.mark) if q.mark is not None else None,
+            "change_pct": float(q.change_percent) if q.change_percent is not None else None}
 
 
 def _order_row(p: PendingOrder, quotes: dict) -> dict:
@@ -98,32 +102,33 @@ def private_view(snap: dict) -> dict:
     return out
 
 
-def _held(p: dict, side: str, qty: float) -> str:
-    prev = _f(p.get("previousSessionLongQuantity") if side == "LONG" else p.get("previousSessionShortQuantity"))
+def _held(p: Position, side: str, qty: float) -> str:
+    signed_prev = float(p.previous_session_quantity or 0)
+    prev = max(0.0, signed_prev if side == "LONG" else -signed_prev)
     if prev < 1e-9:
         return "INTRADAY"
-    if abs(prev - abs(qty)) < 1e-9 and _f(p.get("currentDayCost")) == 0:
+    if abs(prev - abs(qty)) < 1e-9 and _f(p.current_day_cost) == 0:
         return "CARRIED"
     return "MIXED"   # carried and traded today: not purely either
 
 
-def _position_rows(account: dict, pend: list[PendingOrder], quotes: dict, book: Book,
+def _position_rows(account: AccountSnapshot, pend: list[PendingOrder],
+                   quotes: dict[str, Quote], book: Book,
                    orders_fresh: bool) -> list[dict]:
     rows = []
-    for p in account.get("positions") or []:
-        ins = p.get("instrument") or {}
-        sym = ins.get("symbol", "?")
-        at = ins.get("assetType", "?")
-        qty = _f(p.get("longQuantity")) - _f(p.get("shortQuantity"))
+    for p in account.positions:
+        sym = p.symbol
+        at = p.asset_type.value.upper()
+        qty = float(p.quantity) * (1 if p.side.value == "long" else -1)
         if abs(qty) < 1e-9:
             continue
         side = "LONG" if qty > 0 else "SHORT"
         size = abs(qty)
         mult = 100.0 if at == "OPTION" else 1.0
-        avg = _f(p.get("averagePrice"))
-        open_pnl = _f(p.get("longOpenProfitLoss") if side == "LONG" else p.get("shortOpenProfitLoss"))
+        avg = _f(p.average_price)
+        open_pnl = _f(p.open_profit_loss)
         m = _mark(sym, quotes)
-        last = (m or {}).get("last") or (abs(_f(p.get("marketValue"))) / (size * mult))
+        last = (m or {}).get("last") or (abs(_f(p.market_value)) / (size * mult))
         direction = 1 if side == "LONG" else -1
 
         covered, alloc = stop_coverage(pend, sym, side, size)
@@ -155,11 +160,11 @@ def _position_rows(account: dict, pend: list[PendingOrder], quotes: dict, book: 
         open_trade = next((t for t in book.open_trades() if t.symbol == sym), None)
         rows.append({
             "symbol": sym, "display": pretty_symbol(sym, at), "asset_type": at,
-            "underlying": ins.get("underlyingSymbol") or sym, "side": side, "qty": size,
+            "underlying": p.underlying or sym, "side": side, "qty": size,
             "avg_price": avg, "last": last, "quote": m, "multiplier": mult,
-            "market_value": _f(p.get("marketValue")), "open_pnl": open_pnl,
+            "market_value": _f(p.market_value), "open_pnl": open_pnl,
             "open_pnl_pct": (open_pnl / (avg * size * mult) * 100) if avg else None,
-            "day_pnl": _f(p.get("currentDayProfitLoss")), "held": _held(p, side, qty),
+            "day_pnl": _f(p.current_day_profit_loss), "held": _held(p, side, qty),
             "stop_price": ((min if side == "LONG" else max)(stop_prices) if stop_prices else None),
             "stop_best": ((max if side == "LONG" else min)(stop_prices) if stop_prices else None),
             "target_price": ((max if side == "LONG" else min)(o.price for o in targets) if targets else None),
@@ -275,8 +280,8 @@ def _filled_in_orders(orders: list[dict], day) -> float:
     return total
 
 
-def build_state(*, account: dict | None, orders: list[dict], pending: list[PendingOrder],
-                fills: list[Fill], quotes: dict,
+def build_state(*, account: AccountSnapshot | None, orders: list[dict], pending: list[PendingOrder],
+                fills: list[Fill], quotes: dict[str, Quote],
                 prev_session: dict[str, tuple[float, float | None]], freshness: dict,
                 history_complete: bool, orders_fresh: bool, auth_hours_left: float | None,
                 now: datetime | None = None) -> dict:
@@ -285,9 +290,7 @@ def build_state(*, account: dict | None, orders: list[dict], pending: list[Pendi
     fut_today = session_day(now, "FUTURE")      # rolls at 18:00 ET
     book = build_book(fills, opening_inventory(fills, prev_session, eq_today))
     pend = pending
-    acct = (account or {}).get("securitiesAccount") or {}
-
-    positions = _position_rows(acct, pend, quotes, book, orders_fresh) if acct else []
+    positions = _position_rows(account, pend, quotes, book, orders_fresh) if account else []
     closed_today = sorted(book.closed_on(eq_today, {"EQUITY", "OPTION"})
                           + book.closed_on(fut_today, {"FUTURE"}),
                           key=lambda t: t.closed, reverse=True)
@@ -313,7 +316,7 @@ def build_state(*, account: dict | None, orders: list[dict], pending: list[Pendi
     fills_by_id = {f.id: f for f in fills}
     open_by = {h: sum(p["open_pnl"] for p in positions if p["held"] == h)
                for h in ("INTRADAY", "MIXED", "CARRIED")}
-    cb = acct.get("currentBalances") or {}
+    balances = account.balances if account else None
 
     return {
         "generated": now.isoformat(),
@@ -346,7 +349,14 @@ def build_state(*, account: dict | None, orders: list[dict], pending: list[Pendi
             "note": "Schwab's API does not return futures positions or futures orders. "
                     "Open futures and their stops: check thinkorswim.",
         },
-        "balances": {k: cb.get(k) for k in (
-            "liquidationValue", "equity", "buyingPower", "dayTradingBuyingPower",
-            "availableFunds", "maintenanceRequirement")},
+        "balances": {
+            "liquidationValue": _f(balances.liquidation_value) if balances and balances.liquidation_value is not None else None,
+            "equity": _f(balances.equity) if balances and balances.equity is not None else None,
+            "buyingPower": _f(balances.buying_power) if balances and balances.buying_power is not None else None,
+            "dayTradingBuyingPower": _f(balances.day_trading_buying_power)
+            if balances and balances.day_trading_buying_power is not None else None,
+            "availableFunds": _f(balances.available_funds) if balances and balances.available_funds is not None else None,
+            "maintenanceRequirement": _f(balances.maintenance_requirement)
+            if balances and balances.maintenance_requirement is not None else None,
+        },
     }

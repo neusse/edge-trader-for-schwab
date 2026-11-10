@@ -168,6 +168,9 @@ class Position:
     underlying: str | None = None
     previous_session_quantity: Decimal | None = None
     current_day_cost: Decimal | None = None
+    market_value: Decimal | None = None
+    open_profit_loss: Decimal | None = None
+    current_day_profit_loss: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:
@@ -275,6 +278,7 @@ class Quote:
     source: str
     volume: Decimal | None = None
     greeks: OptionGreeks | None = None
+    change_percent: Decimal | None = None
 
 
 @dataclass(frozen=True)
