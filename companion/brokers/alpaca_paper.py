@@ -250,23 +250,28 @@ class AlpacaPaperAdapter(BrokerAdapter):
         try:
             if isinstance(command, SubmitOrder):
                 request = build_order_request(command.intent)
-                raw = self._client.submit_order(request)
-                return MutationResult(MutationStatus.ACCEPTED, str(raw.id))
-            if isinstance(command, CancelOrder):
-                self._client.cancel_order_by_id(command.order_id)
-                return MutationResult(MutationStatus.ACCEPTED, command.order_id)
-            if isinstance(command, ReplaceOrder):
+            elif isinstance(command, ReplaceOrder):
                 request = ReplaceOrderRequest(
                     qty=float(command.quantity) if command.quantity is not None else None,
                     limit_price=float(command.limit_price) if command.limit_price is not None else None,
                     stop_price=float(command.stop_price) if command.stop_price is not None else None,
                     trail=float(command.trail) if command.trail is not None else None,
                 )
+            elif not isinstance(command, CancelOrder):
+                raise TypeError(f"unknown Alpaca command: {type(command).__name__}")
+        except (ValueError, TypeError) as exc:
+            return MutationResult(MutationStatus.REJECTED, message=str(exc))
+
+        try:
+            if isinstance(command, SubmitOrder):
+                raw = self._client.submit_order(request)
+                return MutationResult(MutationStatus.ACCEPTED, str(raw.id))
+            if isinstance(command, CancelOrder):
+                self._client.cancel_order_by_id(command.order_id)
+                return MutationResult(MutationStatus.ACCEPTED, command.order_id)
+            if isinstance(command, ReplaceOrder):
                 raw = self._client.replace_order_by_id(command.order_id, request)
                 return MutationResult(MutationStatus.ACCEPTED, str(raw.id))
-            raise TypeError(f"unknown Alpaca command: {type(command).__name__}")
-        except ValueError as exc:
-            return MutationResult(MutationStatus.REJECTED, message=str(exc))
         except APIError as exc:
             if exc.status_code == 429:
                 headers = getattr(getattr(exc, "_http_error", None), "response", None)

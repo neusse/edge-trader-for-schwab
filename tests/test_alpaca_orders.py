@@ -95,6 +95,16 @@ def test_server_error_is_an_unknown_order_outcome():
     assert result.status == MutationStatus.UNKNOWN
 
 
+def test_response_parse_failure_after_submit_is_unknown():
+    class Client:
+        def submit_order(self, request):
+            raise ValueError("malformed response after sending")
+
+    intent = SimpleOrderIntent(equity(), OrderType.MARKET, TimeInForce.DAY, "stable-key")
+    result = AlpacaPaperAdapter(Client()).execute(SubmitOrder(intent))
+    assert result.status == MutationStatus.UNKNOWN
+
+
 def test_submit_cancel_and_replace_use_opaque_ids_without_retries():
     class Client:
         def __init__(self):
