@@ -245,6 +245,19 @@ def test_broker_selection_replaces_runtime_and_clears_cached_state(monkeypatch, 
     new.store.close()
 
 
+def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
+    from companion.app import broker_info
+
+    paper = broker_info("alpaca-paper")
+    assert "option-trading" in paper["capabilities"]
+    assert paper["workflows"] == ("equity-bracket",)
+    assert "option-bracket" in paper["unsupported"]
+    assert "Paper" in paper["help"]
+    demo = broker_info("demo")
+    assert demo["workflows"] == ()
+    assert "No broker orders" in demo["help"]
+
+
 def test_demo_override_never_shows_or_persists_another_broker(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
     from companion import app as appmod

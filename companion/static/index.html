@@ -324,6 +324,8 @@
   .alpaca-list { margin-bottom: 18px; overflow-x: auto; }
   .alpaca-list table { width: 100%; border-collapse: collapse; text-align: left; }
   .alpaca-list th, .alpaca-list td { padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  #broker-help { padding: 6px 16px; color: var(--muted); background: var(--panel2);
+    border-bottom: 1px solid var(--line); font-size: 11.5px; }
 </style>
 <link rel="stylesheet" href="/cockpit.css">
 </head>
@@ -349,6 +351,7 @@
     <button type="button" class="btn sm ghost" data-open="manage" title="Small always-on-top window to manage the selected position">Manage ⧉</button></span>
   <button type="button" class="btn sm ghost only-float" id="ontop" title="Keep this window on top of other windows">On top</button>
 </header>
+<div id="broker-help" role="note"></div>
 <div id="strip" class="strip only-manage"></div>
 <div class="banner update" id="update-banner"></div>
 <div class="banner close-alert" id="close-alert"></div>
@@ -1277,6 +1280,7 @@ function render(st) {
   const broker = st.broker || {key: "schwab", name: "Schwab", mode: "live"};
   if (renderedBroker !== broker.key) {
     renderedBroker = broker.key;
+    document.title = `${broker.name} · Edge Trader`;
     for (const id of ["daylist", "workspace", "orders", "carried", "futures", "closed", "strip"])
       if ($(id)) $(id).innerHTML = "";
     $("t-go").disabled = true;
@@ -1289,6 +1293,7 @@ function render(st) {
     if ("speechSynthesis" in window) speechSynthesis.cancel();
   }
   document.body.classList.toggle("alpaca-readonly", broker.key === "alpaca-paper");
+  $("broker-help").textContent = broker.help || "";
   renderAlpacaOverview(st);
   if (broker.key === "alpaca-paper") renderPaperControls(st);
   $("broker-name").textContent = `· ${broker.name}`;
@@ -1312,6 +1317,11 @@ function render(st) {
   if (st.pending_broker) { banner.style.display = "block"; banner.textContent = `${st.pending_broker} selected. Restart Edge Trader to activate this broker.`; }
   else if (st.status && st.status !== "live" && !st.booting) { banner.style.display = "block"; banner.textContent = st.status; }
   else banner.style.display = "none";
+  if (broker.key === "alpaca-paper") {
+    $("arm-chip").disabled = true;
+    $("t-go").disabled = true;
+    return;
+  }
   if (!st.summary) return;
 
   const r = st.summary.realized;
@@ -1368,6 +1378,14 @@ function render(st) {
   $("age-orders").innerHTML = ageLabel(st.freshness.orders_today);
   $("age-tx").innerHTML = ageLabel(st.freshness.transactions);
   renderTrading(st);
+  if (!broker.workflows?.includes("schwab-ticket")) {
+    $("t-go").disabled = true;
+    $("arm-chip").disabled = true;
+    document.querySelectorAll("button.cx, button.spx").forEach(b => {
+      b.disabled = true;
+      b.title = broker.help || "This broker workflow is unavailable";
+    });
+  } else $("arm-chip").disabled = false;
 }
 
 // ---- New trade ticket -----------------------------------------------------------------------
@@ -1421,9 +1439,12 @@ function paperValues() {
 }
 function paperMessage(message) { $("paper-msg").textContent = message; }
 function renderPaperControls(st) {
-  const ready = st.broker_ready && !st.pending_broker && st.market_hours?.is_open === true;
+  const enabled = st.broker?.capabilities?.includes("equity-bracket") &&
+    st.broker?.workflows?.includes("equity-bracket");
+  const ready = enabled && st.broker_ready && !st.pending_broker && st.market_hours?.is_open === true;
   $("paper-arm").textContent = paperArmed ? "Disarm paper entries" : "Arm paper entries";
-  $("paper-arm").disabled = paperBusy || (!paperArmed && (!st.broker_ready || !!st.pending_broker));
+  $("paper-arm").disabled = paperBusy || !enabled ||
+    (!paperArmed && (!st.broker_ready || !!st.pending_broker));
   $("paper-submit").disabled = paperBusy || !ready || !paperArmed || paperOutcome === "unknown";
   $("paper-reconcile").style.display = paperOutcome === "unknown" ? "" : "none";
 }
@@ -2065,7 +2086,9 @@ async function tick() {
     updateHealth();          // health first, so the render below draws buttons with the right state
     render(lastState);
     loadFeatures(lastState);
-    try { announceTrades(lastState); } catch (e) { console.error("trade voice", e); }
+    if (lastState.broker?.key === "schwab") {
+      try { announceTrades(lastState); } catch (e) { console.error("trade voice", e); }
+    }
   } catch (e) { /* updateHealth turns the page red */ }
   TICKING = false;
   updateHealth();
@@ -2112,8 +2135,8 @@ function updateHealth() {
   if (state === "down") { document.title = "DISCONNECTED · Edge Trader"; $("status").style.display = "none"; }
   // Order buttons only work when everything is live. (Every successful refresh re-renders the
   // buttons with their normal rules first, so they come back on by themselves.)
-  if (state !== "live") {
-    document.querySelectorAll("button.cx, #t-go").forEach(b => {
+  if (state !== "live" || !broker?.workflows?.includes("schwab-ticket")) {
+    document.querySelectorAll("button.cx, button.spx, #t-go").forEach(b => {
       b.disabled = true; b.title = why || "Waiting for live data";
     });
   }
@@ -2272,6 +2295,7 @@ function updateClock() {
 // opened today is still on. The banner shows even with the voice off.
 function checkCloseAlert(now, s) {
   const banner = $("close-alert");
+  if (lastState?.broker?.key !== "schwab") { banner.style.display = "none"; return; }
   const inWindow = s && now >= s.open && s.close - now <= CLOSE_ALERT_MIN * 60 * 1000 && now < s.close;
   const rows = inWindow && HEALTH !== "down" ? dayTrades() : [];
   banner.style.display = rows.length ? "block" : "none";

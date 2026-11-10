@@ -7,7 +7,9 @@ async (page) => {
   const now = new Date();
   const nextOpen = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(),
                                      now.getUTCDate() + 1, 14, 30));
-  state.broker = {key: "alpaca-paper", name: "Alpaca Paper", mode: "paper", capabilities: []};
+  state.broker = {key: "alpaca-paper", name: "Alpaca Paper", mode: "paper",
+                  capabilities: ["equity-bracket"], workflows: ["equity-bracket"],
+                  help: "Paper equity bracket entry is available."};
   state.demo = false;
   state.pending_broker = null;
   state.broker_ready = true;
@@ -32,6 +34,9 @@ async (page) => {
   state.summary.realized.securities = {net: 45, complete: true};
   await page.route("**/api/state", route => route.fulfill({
     status: 200, contentType: "application/json", body: JSON.stringify(state),
+  }));
+  await page.route("**/api/paper/status", route => route.fulfill({
+    status: 200, contentType: "application/json", body: JSON.stringify({ok: true, armed: false, unresolved: []}),
   }));
   await page.reload();
   await page.locator("#alpaca-overview").screenshot({

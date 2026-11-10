@@ -20,6 +20,8 @@ the Paper order. The target and stop are broker-held after the entry fills. A lo
 orders until the exact client order ID is reconciled. Other Alpaca order workflows are still being
 connected. Select Schwab in the app for the existing Schwab trading workflows. Switching disarms
 entries and loads a fresh broker runtime before order controls can be used again.
+The strip below the header explains which workflows the selected broker can currently use; Demo
+shows invented data with order controls disabled.
 
 ![Alpaca Paper equity bracket form with invented demo state](docs/screenshot-paper-entry-demo.png)
 
