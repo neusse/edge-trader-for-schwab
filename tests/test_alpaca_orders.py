@@ -127,6 +127,7 @@ def test_submit_cancel_and_replace_use_opaque_ids_without_retries():
     assert adapter.execute(SubmitOrder(intent)).order_id == "uuid-order"
     assert adapter.execute(CancelOrder("uuid-order")).accepted
     assert adapter.execute(ReplaceOrder("uuid-order", limit_price=D("100"))).order_id == "uuid-replacement"
+    assert adapter.execute(ReplaceOrder("uuid-order", replacement=intent)).status == MutationStatus.REJECTED
     assert client.calls == [("submit", "stable-key"), ("cancel", "uuid-order"),
                             ("replace", "uuid-order", 100)]
 
