@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from companion.brokers.configuration import BrokerSelection
 from companion.spreads import routes
+from companion.poller import Poller
 from companion.store import Store
 from companion.trading import Trader
 
@@ -59,3 +60,26 @@ def test_old_spread_stop_callback_cannot_send_after_runtime_rebind(monkeypatch):
     new.spreads.on_fire("new-spread")
     assert ready.wait(1)
     assert sent == [(new, "new-spread")]
+
+
+def test_schwab_poller_stop_waits_for_started_auto_be(tmp_path):
+    store = Store(tmp_path / "poller.db")
+    poller = Poller(store)
+    release = threading.Event()
+    started = threading.Event()
+    stopped = threading.Event()
+    worker = threading.Thread(target=lambda: (started.set(), release.wait(1)))
+    poller._auto_threads.append(worker)
+    worker.start()
+    assert started.wait(1)
+    stopper = threading.Thread(target=lambda: (poller.stop(), stopped.set()))
+    stopper.start()
+    try:
+        assert not stopped.wait(0.05)
+        release.set()
+        assert stopped.wait(1)
+    finally:
+        release.set()
+        stopper.join(1)
+        worker.join(1)
+        store.close()
