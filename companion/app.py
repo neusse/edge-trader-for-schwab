@@ -33,7 +33,7 @@ from .brokers.models import (AccountQuery, AssetType, CancelOrder,
                              OrderClass, OrderInstruction, OrderQuery, OrderRole,
                              OrderStatus, OrderType, OrdersQuery, QuotesQuery, ReplaceOrder,
                              SubmitOrder)
-from .brokers.paper_equity import entry_plan
+from .brokers.paper_equity import entry_plan, oco_plan
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -74,12 +74,12 @@ BROKER_ACTION_LOCK = threading.RLock()
 BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
-    "alpaca-paper": ("equity-bracket",),
+    "alpaca-paper": ("equity-bracket", "equity-oco"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation, and limit repricing are available. Other equity management, options, and spreads are still being connected.",
+    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, and OCO exits for an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -420,6 +420,89 @@ def _send_paper_entry(body: dict, request_id: str):
     with BROKER_ACTION_LOCK:
         service, intent, _ = _paper_entry(body, True)
         return service.execute(SubmitOrder(intent), request_id)
+
+
+def _paper_oco(body: dict):
+    service, _ = _paper_service()
+    symbol = body.get("symbol") if isinstance(body, dict) else None
+    if not isinstance(symbol, str) or not symbol:
+        raise ValueError("an equity symbol is required")
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref or account.status.upper() != "ACTIVE":
+        raise ValueError("Alpaca Paper account changed or is inactive")
+    positions = [position for position in account.positions if position.symbol == symbol]
+    if len(positions) != 1:
+        raise ValueError("exactly one held equity position is required")
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=active))
+    if any(symbol == leg.symbol for group in groups for order in group.orders
+           if order.status in active for leg in order.legs):
+        raise ValueError("an active order already touches this symbol; attach exits after resolving it")
+    quote = service.adapter.query(QuotesQuery((symbol,), AssetType.EQUITY)).get(symbol)
+    return service, oco_plan(body, positions[0], quote), quote
+
+
+@app.post("/api/paper/oco/preview")
+async def paper_oco_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, quote = await run_in_threadpool(_paper_oco, await request.json())
+        return {"ok": True, "symbol": intent.leg.symbol,
+                "side": intent.leg.instruction.value,
+                "quantity": str(intent.leg.quantity),
+                "quote": str(quote.mark or quote.last), "quote_source": quote.source,
+                "target": str(intent.take_profit_price), "stop": str(intent.stop_loss.stop_price),
+                "protection": "Broker-held OCO target and stop after Alpaca accepts the order"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper position, order, or quote verification failed; no order was sent"}
+
+
+@app.post("/api/paper/oco/submit")
+async def paper_oco_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_oco, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper OCO preflight failed; no order was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_oco(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, intent, _ = _paper_oco(body)
+        symbol, quantity, instruction = (intent.leg.symbol, intent.leg.quantity,
+                                         intent.leg.instruction)
+        def preflight(account):
+            positions = [position for position in account.positions if position.symbol == symbol]
+            if (account.status.upper() != "ACTIVE" or len(positions) != 1 or
+                    positions[0].asset_type != AssetType.EQUITY or
+                    positions[0].quantity != quantity or
+                    (positions[0].side.value == "long") !=
+                    (instruction == OrderInstruction.SELL)):
+                raise ValueError("position changed before OCO submission; no order was sent")
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED))
+            groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                       statuses=active))
+            if any(symbol == leg.symbol for group in groups for order in group.orders
+                   if order.status in active for leg in order.legs):
+                raise ValueError("another order appeared for this symbol; no OCO was sent")
+        return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 
 @app.post("/api/paper/entry/cancel")
