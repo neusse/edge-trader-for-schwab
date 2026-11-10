@@ -29,7 +29,9 @@ from email.utils import parsedate_to_datetime
 
 from . import schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
-from .pnl import ET, fills_from_transactions, session_day
+from .pnl import ET, Fill, session_day
+from .brokers.canonical_view import _ledger_fills
+from .brokers.schwab_adapter import normalize_fills
 from .store import Store, now_iso
 from .view import build_state, ticket_pnl
 
@@ -390,8 +392,9 @@ class Poller:
         since = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
         day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()
         txns = self.store.transactions_since(since)
+        fills = _ledger_fills(normalize_fills(txns))
         st = build_state(account=self.account, orders=self._merged_orders(),
-                         txns=txns, quotes=self.quotes,
+                         fills=fills, quotes=self.quotes,
                          prev_session=self.store.load_prev_session(day),
                          freshness=self.fresh, history_complete=self.history_complete,
                          orders_fresh=self._orders_fresh(), auth_hours_left=schwab.auth_hours_left(),
@@ -431,7 +434,7 @@ class Poller:
                 today, pending_orders(self._merged_orders(), self.terminal), positions,
                 self._orders_fresh() and self._fresh("account"))
             ticket_pnl(st["brackets"], st.get("positions") or [], st.get("closed") or [])
-            self._add_r_and_log(st, today, txns)
+            self._add_r_and_log(st, today, fills)
             self._auto_be(st)
         self._trail_estimates(st)
         with self._lock:
@@ -527,7 +530,7 @@ class Poller:
             self._auto_threads.append(worker)
             worker.start()
 
-    def _add_r_and_log(self, st: dict, orders_today: list[dict], txns: list[dict]) -> None:
+    def _add_r_and_log(self, st: dict, orders_today: list[dict], fills: list[Fill]) -> None:
         """Live R on each position (frozen basis from the companion ticket) and a per-symbol
         action log: tickets sent, cancels/closes requested and confirmed, and fills."""
         basis = self.trader.r_basis(orders_today)
@@ -577,7 +580,7 @@ class Poller:
                 add(a["symbol"], a["created"], f"{kind} "
                     f"{a['order_id'] or ''}: {a['status']} {a['detail'] or ''}".strip(), "action")
         today = session_day(datetime.now(timezone.utc), "EQUITY")
-        for f in fills_from_transactions(txns):
+        for f in fills:
             if f.asset_type != "FUTURE" and f.day == today:
                 add(f.symbol, f.time.isoformat(), f"Fill {'bought' if f.qty > 0 else 'sold'} "
                     f"{abs(f.qty):g} @ {f.price:g}", "fill")
