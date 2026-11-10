@@ -27,12 +27,13 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from . import schwab
-from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, Fill, session_day
 from .brokers.canonical_view import _ledger_fills, _pending
 from .brokers.models import AccountSnapshot, Quote
-from .brokers.schwab_adapter import (normalize_account, normalize_fills, normalize_market_session,
-                                     normalize_order, normalize_quotes)
+from .brokers.schwab_adapter import (canonical_terminal_ids, index_schwab_orders,
+                                     linked_account_ref, normalize_account, normalize_fills,
+                                     normalize_market_session, normalize_order, normalize_quotes)
+from .brokers.models import OrderStatus
 from .brokers.schwab_policy import SchwabReadPolicy
 from .store import Store, now_iso
 from .view import build_state, ticket_pnl
@@ -57,7 +58,8 @@ class Poller:
         self.trader = None   # set by the app; the poller never sends orders (Auto B/E hands its one move to it)
         # Every order id ever seen finished. Schwab's WORKING sweep can return a frozen
         # stand-alone copy of an order that actually filled inside an OCO.
-        self.terminal: set[int] = terminal_ids(self.store.all_orders())
+        self.terminal: set[int] = canonical_terminal_ids(
+            tuple(normalize_order(row) for row in self.store.all_orders()))
         self.history_complete = False
         self.fresh: dict[str, dict] = {k: {"ok_at": None, "error": None, "interval": v}
                                        for k, v in self.policy.intervals.items()}
@@ -160,11 +162,12 @@ class Poller:
         accts = self._call("account", lambda: client.linked_accounts())
         if isinstance(accts, list) and len(accts) > 1:
             log.warning("%d linked accounts: the companion uses the first one", len(accts))
-        if not accts or not isinstance(accts, list) or "hashValue" not in accts[0]:
+        try:
+            account_hash = linked_account_ref(accts)
+        except ValueError:
             self.client = None   # retry discovery next time; never poll without an account
             self.status = "could not list linked accounts"
             return False
-        account_hash = accts[0]["hashValue"]
         try:
             self.store.bind_scope("schwab", account_hash)
         except ValueError as exc:
@@ -210,9 +213,13 @@ class Poller:
         now = datetime.now(timezone.utc)
         if name == "account":
             data = self._call(name, lambda: self.client.account_details(h, fields="positions"))
-            if not isinstance(data, dict) or "securitiesAccount" not in data:
+            if not isinstance(data, dict):
                 return False
-            canonical = normalize_account(data, h)
+            try:
+                canonical = normalize_account(data, h)
+            except (KeyError, TypeError, ValueError):
+                self.fresh[name]["error"] = "account normalization incomplete"
+                return False
             self.account = data
             self.store.save_positions(data)
             self._record_prev_session(canonical)
@@ -220,9 +227,14 @@ class Poller:
             data = self._call(name, lambda: self.client.account_orders(h, self._session_start_utc(), now))
             if not isinstance(data, list):
                 return False
+            try:
+                indexed, groups = index_schwab_orders(data)
+            except (KeyError, TypeError, ValueError):
+                self.fresh[name]["error"] = "order normalization incomplete"
+                return False
             self.store.save_orders(data)
-            self.terminal |= terminal_ids(data)
-            self.orders_today = {o["orderId"]: o for o in data}
+            self.terminal |= canonical_terminal_ids(groups)
+            self.orders_today = indexed
         elif name == "orders_sweep":
             found: dict[int, dict] = {}
             for status in self.policy.sweep_statuses:
@@ -230,9 +242,14 @@ class Poller:
                     h, now - timedelta(days=self.policy.order_sweep_days), now, status=st))
                 if not isinstance(data, list):
                     return False
-                found.update({o["orderId"]: o for o in data})
+                try:
+                    indexed, groups = index_schwab_orders(data)
+                except (KeyError, TypeError, ValueError):
+                    self.fresh[name]["error"] = "order normalization incomplete"
+                    return False
+                found.update(indexed)
+                self.terminal |= canonical_terminal_ids(groups)
             self.store.save_orders(list(found.values()))
-            self.terminal |= terminal_ids(list(found.values()))
             vanished = [oid for oid in self.orders_sweep
                         if oid not in found and oid not in self.orders_today]
             self.orders_sweep = found
@@ -268,10 +285,20 @@ class Poller:
         for oid in order_ids:
             self.followed_at[oid] = time.monotonic()
             data = self._call("order_details", lambda o=oid: self.client.order_details(self.account_hash, o))
-            if isinstance(data, dict) and data.get("orderId"):
+            if isinstance(data, dict):
+                try:
+                    group = normalize_order(data)
+                except (KeyError, TypeError, ValueError):
+                    self.fresh["order_details"]["error"] = "order normalization incomplete"
+                    continue
+                if group.group_id != str(oid):
+                    self.fresh["order_details"]["error"] = "order lookup returned another ID"
+                    continue
                 self.store.save_orders([data])
-                self.terminal |= terminal_ids([data])
-                if data.get("status") not in TERMINAL:
+                self.terminal |= canonical_terminal_ids((group,))
+                if group.status not in (OrderStatus.FILLED, OrderStatus.CANCELED,
+                                        OrderStatus.REJECTED, OrderStatus.EXPIRED,
+                                        OrderStatus.REPLACED):
                     self.orders_followed[oid] = data
                 else:
                     self.orders_followed.pop(oid, None)

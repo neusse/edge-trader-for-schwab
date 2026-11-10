@@ -53,6 +53,15 @@ _ORDER_TYPE = {"MARKET": OrderType.MARKET, "LIMIT": OrderType.LIMIT,
                "NET_ZERO": OrderType.LIMIT}
 
 
+def linked_account_ref(raw: list[dict]) -> str:
+    if not isinstance(raw, list) or not raw or not isinstance(raw[0], dict):
+        raise ValueError("could not list linked Schwab accounts")
+    account_ref = raw[0].get("hashValue")
+    if not account_ref:
+        raise ValueError("Schwab linked account has no account reference")
+    return str(account_ref)
+
+
 def normalize_account(raw: dict, account_ref: str) -> AccountSnapshot:
     account = raw["securitiesAccount"]
     balances = account.get("currentBalances") or {}
@@ -204,6 +213,31 @@ def normalize_order(raw: dict) -> OrderGroup:
                       strategy_detail=strategy or "SINGLE")
 
 
+_TERMINAL_STATUSES = {OrderStatus.FILLED, OrderStatus.CANCELED,
+                      OrderStatus.REJECTED, OrderStatus.EXPIRED, OrderStatus.REPLACED}
+
+
+def index_schwab_orders(rows: list[dict]) -> tuple[dict[int, dict], tuple[OrderGroup, ...]]:
+    """Keep legacy raw records indexed while exposing canonical groups to the poller."""
+    indexed = {}
+    groups = []
+    for row in rows:
+        group = normalize_order(row)
+        indexed[int(group.group_id)] = row
+        groups.append(group)
+    return indexed, tuple(groups)
+
+
+def canonical_terminal_ids(groups: tuple[OrderGroup, ...]) -> set[int]:
+    terminal = set()
+    for group in groups:
+        if group.status in _TERMINAL_STATUSES:
+            terminal.add(int(group.group_id))
+        terminal.update(int(order.order_id) for order in group.orders
+                        if order.status in _TERMINAL_STATUSES)
+    return terminal
+
+
 def normalize_quotes(raw: dict, symbols: tuple[str, ...],
                      asset_type: AssetType = AssetType.EQUITY) -> dict[str, Quote]:
     out = {}
@@ -330,9 +364,7 @@ class SchwabAdapter(BrokerAdapter):
             self._client = schwab.make_client()
         if self._account_hash is None:
             accounts = _response(self._client.linked_accounts())
-            if not accounts or "hashValue" not in accounts[0]:
-                raise RuntimeError("Schwab account discovery failed")
-            self._account_hash = accounts[0]["hashValue"]
+            self._account_hash = linked_account_ref(accounts)
         return self._client, self._account_hash
 
     def _query(self, query: BrokerQuery) -> BrokerQueryResult:

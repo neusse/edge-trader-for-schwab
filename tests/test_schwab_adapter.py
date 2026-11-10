@@ -6,7 +6,8 @@ from companion.brokers.models import (
     OrderStatus, OrdersQuery, PositionSide, QuotesQuery,
 )
 from companion.brokers.schwab_adapter import (
-    SchwabAdapter, normalize_account, normalize_fills, normalize_order, normalize_quotes,
+    SchwabAdapter, canonical_terminal_ids, index_schwab_orders, linked_account_ref,
+    normalize_account, normalize_fills, normalize_order, normalize_quotes,
 )
 from companion.brokers.canonical_view import _ledger_fills, _pending, build_canonical_state
 from companion.orders import pending_orders
@@ -25,6 +26,21 @@ class Response:
 
     def json(self):
         return self.body
+
+
+def test_schwab_poll_index_and_terminal_ids_use_canonical_order_status():
+    leg = {"instruction": "SELL", "quantity": 1,
+           "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}
+    frozen = {"orderId": 11, "status": "WORKING", "orderType": "STOP",
+              "quantity": 1, "orderLegCollection": [leg]}
+    finished = {"orderId": 10, "status": "WORKING", "orderStrategyType": "OCO",
+                "childOrderStrategies": [{**frozen, "status": "FILLED"}]}
+    indexed, groups = index_schwab_orders([frozen, finished])
+    terminal = canonical_terminal_ids(groups)
+    assert set(indexed) == {10, 11}
+    assert terminal == {11}
+    assert _pending(groups, terminal) == []
+    assert linked_account_ref([{"hashValue": "opaque-hash"}]) == "opaque-hash"
 
 
 def test_schwab_account_keeps_unknown_basis_and_short_direction():
