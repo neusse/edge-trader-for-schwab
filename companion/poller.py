@@ -14,7 +14,7 @@ using the same Schwab login):
                                      ~54
     ticket quotes (outside this limiter) every 5 s while a ticket window has focus, else every
     30 s: up to ~12 more. Order actions are on top, at most one at a time.
-Enforced, not just scheduled: every request goes through one limiter (MAX_PER_MIN),
+Enforced, not just scheduled: every request goes through the Schwab read policy limiter,
 schwabdev's internal retries are disabled (companion/schwab.py), and a 429 pauses
 ALL companion requests. Each endpoint keeps its own last-success time.
 """
@@ -25,45 +25,24 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 
 from . import schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, Fill, session_day
 from .brokers.canonical_view import _ledger_fills, _pending
 from .brokers.models import AccountSnapshot, Quote
-from .brokers.schwab_adapter import normalize_account, normalize_fills, normalize_order, normalize_quotes
+from .brokers.schwab_adapter import (normalize_account, normalize_fills, normalize_market_session,
+                                     normalize_order, normalize_quotes)
+from .brokers.schwab_policy import SchwabReadPolicy
 from .store import Store, now_iso
 from .view import build_state, ticket_pnl
 
 log = logging.getLogger("companion.poller")
 
-LOOKBACK_DAYS = 60         # transaction history for FIFO basis of carried positions
-TXN_CAP = 3000             # Schwab's max transactions per response
-ORDER_SWEEP_DAYS = 59      # orders endpoint accepts at most ~60 days
-SWEEP_STATUSES = ("WORKING", "PENDING_ACTIVATION")
-MAX_PER_MIN = 70           # hard ceiling for this app, leaves room for other apps on the same login
-DETAILS_PER_SWEEP = 3
-
-INTERVALS = {"account": 5, "orders_today": 5, "orders_sweep": 30, "transactions": 10,
-             "quotes": 3, "corrections": 600, "hours": 1800}
-
-
-def _retry_after(value: str | None) -> float:
-    if not value:
-        return 30.0
-    try:
-        return max(1.0, float(value))
-    except ValueError:
-        try:
-            return max(1.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
-        except (TypeError, ValueError):
-            return 30.0
-
-
 class Poller:
     def __init__(self, store: Store | None = None):
         self.store = store or Store()
+        self.policy = SchwabReadPolicy()
         self.client = None
         self.account_hash: str | None = None
         self.account: dict | None = None
@@ -81,12 +60,12 @@ class Poller:
         self.terminal: set[int] = terminal_ids(self.store.all_orders())
         self.history_complete = False
         self.fresh: dict[str, dict] = {k: {"ok_at": None, "error": None, "interval": v}
-                                       for k, v in INTERVALS.items()}
+                                       for k, v in self.policy.intervals.items()}
         self.fresh["backfill"] = {"ok_at": None, "error": None, "interval": None}
         self.state: dict = {"booting": True, "status": "starting"}
         self.status = "starting"
         self.last_rebuild: str | None = None
-        self._next = {k: 0.0 for k in INTERVALS}
+        self._next = {k: 0.0 for k in self.policy.intervals}
         self._sent: deque[float] = deque()
         self._cooldown_until = 0.0
         self._stop = threading.Event()
@@ -121,13 +100,10 @@ class Poller:
     # ---- requests --------------------------------------------------------
 
     def _throttle(self) -> None:
-        """Block until a request fits under MAX_PER_MIN and any 429 cooldown is over."""
+        """Wait until the selected broker policy allows another REST request."""
         while not self._stop.is_set():
             now = time.monotonic()
-            while self._sent and now - self._sent[0] > 60:
-                self._sent.popleft()
-            wait = max(self._cooldown_until - now,
-                       (self._sent[0] + 60 - now) if len(self._sent) >= MAX_PER_MIN else 0)
+            wait = self.policy.throttle_delay(self._sent, now, self._cooldown_until)
             if wait <= 0:
                 self._sent.append(now)
                 return
@@ -138,7 +114,7 @@ class Poller:
         an order), and a 429 on it pauses the poller's own requests."""
         self._sent.append(time.monotonic())
         if retry_after is not None:
-            self._cooldown_until = time.monotonic() + _retry_after(str(retry_after))
+            self._cooldown_until = time.monotonic() + self.policy.retry_after(str(retry_after))
 
     def cooldown_left(self) -> float:
         return max(0.0, self._cooldown_until - time.monotonic())
@@ -151,7 +127,7 @@ class Poller:
         try:
             r = fn()
             if r.status_code == 429:
-                wait = _retry_after(r.headers.get("Retry-After"))
+                wait = self.policy.retry_after(r.headers.get("Retry-After"))
                 self._cooldown_until = time.monotonic() + wait
                 fr["error"] = f"rate limited, all requests paused {wait:.0f}s"
                 self.store.log_request(name, started, False, 429, r.text[:300])
@@ -205,7 +181,7 @@ class Poller:
         data = self._call(name, lambda: self.client.transactions(self.account_hash, start, end, "TRADE"))
         if data is None or not isinstance(data, list):
             return False
-        if len(data) >= TXN_CAP and end - start > timedelta(hours=1):
+        if len(data) >= self.policy.transaction_cap and end - start > timedelta(hours=1):
             mid = start + (end - start) / 2
             return self._fetch_transactions(name, start, mid) and self._fetch_transactions(name, mid, end)
         self.store.save_transactions(data)
@@ -213,7 +189,7 @@ class Poller:
 
     def _backfill(self) -> bool:
         end = datetime.now(timezone.utc)
-        t0 = end - timedelta(days=LOOKBACK_DAYS)
+        t0 = end - timedelta(days=self.policy.lookback_days)
         while t0 < end and not self._stop.is_set():
             t1 = min(t0 + timedelta(days=10), end)
             if not self._fetch_transactions("backfill", t0, t1):
@@ -248,9 +224,9 @@ class Poller:
             self.orders_today = {o["orderId"]: o for o in data}
         elif name == "orders_sweep":
             found: dict[int, dict] = {}
-            for status in SWEEP_STATUSES:
+            for status in self.policy.sweep_statuses:
                 data = self._call(name, lambda st=status: self.client.account_orders(
-                    h, now - timedelta(days=ORDER_SWEEP_DAYS), now, status=st))
+                    h, now - timedelta(days=self.policy.order_sweep_days), now, status=st))
                 if not isinstance(data, list):
                     return False
                 found.update({o["orderId"]: o for o in data})
@@ -265,7 +241,7 @@ class Poller:
                            key=lambda o: self.followed_at.get(o, 0.0))      # least recently asked first
             # A companion spread's own orders come first: their final fills settle the spread.
             spread = [o for o in self.spread_follow if o not in found and o not in self.orders_today]
-            self._follow(list(dict.fromkeys(spread + vanished + stale))[:DETAILS_PER_SWEEP])
+            self._follow(list(dict.fromkeys(spread + vanished + stale))[:self.policy.details_per_sweep])
         elif name == "transactions":
             if not self._fetch_transactions(name, self._session_start_utc() - timedelta(hours=1), now):
                 return False
@@ -345,25 +321,19 @@ class Poller:
             data = self._call(name, lambda d=d: self.client.market_hours(["equity"], date=d.isoformat()))
             if not isinstance(data, dict):
                 return False
-            eq = next(iter((data.get("equity") or {}).values()), None)
-            if not isinstance(eq, dict) or not isinstance(eq.get("isOpen"), bool):
-                return False                 # an answer without isOpen is not a holiday: keep what we had
-            reg = (eq.get("sessionHours") or {}).get("regularMarket") or []
-            if eq["isOpen"] and not (reg and reg[0].get("start") and reg[-1].get("end")):
-                return False                 # open, but no session times: unreadable, not closed
-            if eq["isOpen"]:
-                try:
-                    o, c = datetime.fromisoformat(reg[0]["start"]), datetime.fromisoformat(reg[-1]["end"])
-                except (TypeError, ValueError):
-                    return False
-                if o.tzinfo is None or c.tzinfo is None:
-                    return False             # a time without its offset is unreadable
-            sess = {"date": d.isoformat(), "open": reg[0]["start"], "close": reg[-1]["end"]} if eq["isOpen"] else None
+            try:
+                session = normalize_market_session(data, d)
+            except ValueError:
+                if hasattr(self, "fresh"):
+                    self.fresh[name]["error"] = "market hours response incomplete"
+                return False
+            sess = ({"date": d.isoformat(), "open": session.opens_at.isoformat(),
+                     "close": session.closes_at.isoformat()} if session.is_open else None)
             if i == 0:
                 out["today"] = sess
                 from .trading import set_market_hours
                 set_market_hours(today.isoformat(), sess)   # the order checks get today even if the next-day read fails
-            if sess and datetime.fromisoformat(sess["close"]) > now:
+            if session.closes_at and session.closes_at > now:
                 out["next"] = sess
                 break
         self.hours = out
@@ -375,7 +345,7 @@ class Poller:
     # ---- loop ------------------------------------------------------------
 
     def _rebuild(self) -> None:
-        since = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+        since = (datetime.now(timezone.utc) - timedelta(days=self.policy.lookback_days)).strftime("%Y-%m-%dT%H:%M:%S")
         day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()
         txns = self.store.transactions_since(since)
         fills = _ledger_fills(normalize_fills(txns))
@@ -624,7 +594,7 @@ class Poller:
                     continue
 
                 changed = False
-                for name, every in INTERVALS.items():
+                for name, every in self.policy.intervals.items():
                     if time.monotonic() >= self._next[name]:
                         self._next[name] = time.monotonic() + every
                         try:

@@ -1,7 +1,7 @@
 """Schwab REST translation into canonical account and order models."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from .adapter import BrokerAdapter
@@ -295,6 +295,28 @@ def normalize_fills(transactions: list[dict]) -> tuple[Fill, ...]:
     return tuple(sorted(fills, key=lambda fill: (fill.occurred_at, sequence(fill))))
 
 
+def normalize_market_session(raw: dict, day: date) -> MarketSession:
+    """Read a Schwab equity-hours response without treating malformed data as a holiday."""
+    if not isinstance(raw, dict):
+        raise ValueError("Schwab market-hours response is incomplete")
+    equity = next(iter((raw.get("equity") or {}).values()), None)
+    if not isinstance(equity, dict) or not isinstance(equity.get("isOpen"), bool):
+        raise ValueError("Schwab market-hours response is incomplete")
+    if not equity["isOpen"]:
+        return MarketSession(day, None, None, False)
+    hours = (equity.get("sessionHours") or {}).get("regularMarket") or []
+    if not hours or not isinstance(hours[0], dict) or not isinstance(hours[-1], dict):
+        raise ValueError("Schwab open session has no regular hours")
+    try:
+        opened = datetime.fromisoformat(hours[0]["start"])
+        closed = datetime.fromisoformat(hours[-1]["end"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Schwab open session has no regular hours") from exc
+    if opened.tzinfo is None or closed.tzinfo is None or opened >= closed:
+        raise ValueError("Schwab market hours are invalid or have no timezone")
+    return MarketSession(day, opened, closed, True)
+
+
 class SchwabAdapter(BrokerAdapter):
     def __init__(self, client=None, account_hash: str | None = None):
         super().__init__(SCHWAB)
@@ -343,20 +365,7 @@ class SchwabAdapter(BrokerAdapter):
             day = query.start
             while day <= query.end:
                 raw = _response(client.market_hours(["equity"], date=day.isoformat()))
-                equity = next(iter((raw.get("equity") or {}).values()), None)
-                if not isinstance(equity, dict) or not isinstance(equity.get("isOpen"), bool):
-                    raise ValueError("Schwab market-hours response is incomplete")
-                hours = (equity.get("sessionHours") or {}).get("regularMarket") or []
-                if equity["isOpen"]:
-                    if not hours or not hours[0].get("start") or not hours[-1].get("end"):
-                        raise ValueError("Schwab open session has no regular hours")
-                    opened = datetime.fromisoformat(hours[0]["start"])
-                    closed = datetime.fromisoformat(hours[-1]["end"])
-                    if opened.tzinfo is None or closed.tzinfo is None:
-                        raise ValueError("Schwab market hours have no timezone")
-                else:
-                    opened = closed = None
-                sessions.append(MarketSession(day, opened, closed, equity["isOpen"]))
+                sessions.append(normalize_market_session(raw, day))
                 day += timedelta(days=1)
             return tuple(sessions)
         raise NotImplementedError(f"Schwab {type(query).__name__} canonical query is not connected yet")
