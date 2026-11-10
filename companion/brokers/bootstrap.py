@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import threading
+import copy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .alpaca_paper import AlpacaPaperAdapter
 from .canonical_view import build_canonical_state
-from .models import AccountQuery, AssetType, FillsQuery, OrdersQuery, OrderStatus, QuotesQuery
+from .errors import read_health
+from .models import (AccountQuery, AssetType, FillsQuery, MarketClockQuery,
+                     MarketSessionsQuery, OrdersQuery, OrderStatus, QuotesQuery)
 from .order_service import BrokerOrderService
 from .persistence import load_fills, save_fills
 from ..store import Store
@@ -29,6 +33,9 @@ class AlpacaBootstrapPoller:
         self._verified_account: str | None = None
         self.order_service: BrokerOrderService | None = None
         self._last_fill_read: datetime | None = None
+        self._sessions_date = None
+        self._sessions = ()
+        self._cooldown_until: datetime | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -43,6 +50,10 @@ class AlpacaBootstrapPoller:
             self._stop.wait(10)
 
     def poll_once(self) -> None:
+        now = datetime.now(timezone.utc)
+        if self._cooldown_until and now < self._cooldown_until:
+            return
+        stage = "account"
         try:
             if self._adapter is None:
                 self._adapter = AlpacaPaperAdapter()
@@ -60,26 +71,70 @@ class AlpacaBootstrapPoller:
                     if self.trader is not None:
                         self.trader.store = scoped
                     self._stores.append(scoped)
+                    self._state = {"status": "Alpaca Paper loading selected account",
+                                   "booting": True, "positions": [], "orders": [],
+                                   "broker_ready": False}
                 if self.trader is not None:
                     self.trader.arm(False, reason="account scope activated")
                 self._verified_account = account.account_ref
                 self._last_fill_read = None
-            now = datetime.now(timezone.utc)
+                self._sessions_date = None
+            stage = "orders_today"
             recent = self._adapter.query(OrdersQuery(now - timedelta(days=30), now))
             active = frozenset({OrderStatus.PENDING, OrderStatus.WORKING,
                                 OrderStatus.PARTIALLY_FILLED})
+            stage = "orders_sweep"
             working = self._adapter.query(OrdersQuery(now - timedelta(days=3650), now,
                                                         statuses=active))
             groups = tuple({group.group_id: group for group in (*recent, *working)}.values())
+            health_errors = []
+            stage = "market_hours"
+            try:
+                clock = self._adapter.query(MarketClockQuery())
+            except Exception as exc:
+                clock = None
+                health = read_health(exc)
+                if health["state"] == "rate-limited":
+                    raise
+                health_errors.append(health)
+            et_day = now.astimezone(ZoneInfo("America/New_York")).date()
+            if self._sessions_date != et_day:
+                try:
+                    self._sessions = self._adapter.query(MarketSessionsQuery(
+                        et_day, et_day + timedelta(days=7)))
+                    self._sessions_date = et_day
+                except Exception as exc:
+                    self._sessions = ()
+                    health = read_health(exc)
+                    if health["state"] == "rate-limited":
+                        raise
+                    health_errors.append(health)
+            today_session = next((s for s in self._sessions if s.session_date == et_day), None)
+            next_session = next((s for s in self._sessions if s.session_date > et_day), None)
+            def session_row(session):
+                return ({"date": session.session_date.isoformat(),
+                         "open": session.opens_at.isoformat(),
+                         "close": session.closes_at.isoformat()}
+                        if session and session.is_open else None)
+            market_hours = {"today": session_row(today_session),
+                            "next": session_row(next_session),
+                            "is_open": clock.is_open if clock else None,
+                            "next_open": clock.next_open.isoformat() if clock else None,
+                            "next_close": clock.next_close.isoformat() if clock else None}
             fill_error = None
             since = now - timedelta(days=60)
             if self._last_fill_read is None or (now - self._last_fill_read).total_seconds() >= 60:
+                stage = "transactions"
                 try:
                     fresh_fills = self._adapter.query(FillsQuery(since, now))
                     save_fills(self.store, fresh_fills)
                     self._last_fill_read = now
                 except Exception as exc:
-                    fill_error = f"{type(exc).__name__}; fill history is incomplete"
+                    health = read_health(exc)
+                    if health["state"] == "rate-limited":
+                        raise
+                    health_errors.append(health)
+                    fill_error = health["message"]
             fills = load_fills(self.store, since)
             symbols = [(position.symbol, position.asset_type) for position in account.positions]
             symbols.extend((leg.symbol, leg.asset_type) for group in groups
@@ -91,11 +146,23 @@ class AlpacaBootstrapPoller:
                                             if kind == asset_type))[:30]
                 if len({symbol for symbol, kind in symbols if kind == asset_type}) > 30:
                     quote_error = "Quote limit reached; some symbols are unpriced"
+                    health_errors.append({"state": "stale", "message": quote_error,
+                                          "retry_after_seconds": None})
                 if names:
+                    stage = "quotes"
                     try:
                         quotes.update(self._adapter.query(QuotesQuery(names, asset_type)))
                     except Exception as exc:
-                        quote_error = f"{type(exc).__name__}; quotes are incomplete"
+                        health = read_health(exc)
+                        if health["state"] == "rate-limited":
+                            raise
+                        health_errors.append(health)
+                        quote_error = health["message"]
+            rate_limit = next((h for h in health_errors if h["state"] == "rate-limited"), None)
+            if rate_limit:
+                self._cooldown_until = now + timedelta(seconds=rate_limit["retry_after_seconds"])
+            else:
+                self._cooldown_until = None
             freshness = {
                 "account": {"ok_at": now.isoformat(), "error": None, "interval": 10},
                 "orders_today": {"ok_at": now.isoformat(), "error": None, "interval": 10},
@@ -105,6 +172,9 @@ class AlpacaBootstrapPoller:
                                  "error": fill_error, "interval": 60},
                 "quotes": {"ok_at": now.isoformat() if not quote_error else None,
                            "error": quote_error, "interval": 10},
+                "market_hours": {"ok_at": now.isoformat() if clock else None,
+                                 "error": None if clock else "Market clock unavailable",
+                                 "interval": 10},
             }
             canonical = build_canonical_state(
                 account, groups, fills, quotes, now=now,
@@ -118,8 +188,15 @@ class AlpacaBootstrapPoller:
                        "symbols": [leg.symbol for leg in o.legs],
                        "quantities": [str(leg.quantity) for leg in o.legs]}
                       for group in groups for o in group.orders]
-            state = {**canonical, "status": "Alpaca Paper connected; trading integration in progress",
-                     "booting": False, "broker_ready": True,
+            health = health_errors[0] if health_errors else {"state": "ready", "message": "Alpaca Paper connected",
+                                                        "retry_after_seconds": None}
+            state = {**canonical, "status": health["message"],
+                     "booting": False, "broker_ready": not health_errors,
+                     "broker_health": health, "market_hours": market_hours,
+                     "fills": [{"activity_id": fill.activity_id, "symbol": fill.symbol,
+                                "instruction": fill.instruction.value, "quantity": str(fill.quantity),
+                                "price": str(fill.price), "time": fill.occurred_at.isoformat()}
+                               for fill in sorted(fills, key=lambda f: f.occurred_at, reverse=True)[:100]],
                      "alpaca": {"account_status": account.status,
                                 "equity": str(account.balances.equity) if account.balances.equity is not None else None,
                                 "cash": str(account.balances.available_funds) if account.balances.available_funds is not None else None,
@@ -127,10 +204,22 @@ class AlpacaBootstrapPoller:
                                 "positions": positions, "orders": orders,
                                 "updated_at": now.isoformat()}}
         except Exception as exc:
-            message = str(exc) if isinstance(exc, ValueError) else (
-                f"{type(exc).__name__}; check paper credentials and connection")
-            state = {"status": f"Alpaca Paper: {message}"[:200], "booting": False,
-                     "positions": [], "orders": [], "broker_ready": False}
+            health = read_health(exc)
+            if health["state"] == "rate-limited":
+                self._cooldown_until = now + timedelta(seconds=health["retry_after_seconds"])
+            with self._lock:
+                state = copy.deepcopy(self._state)
+            state.update(status=health["message"], booting=False, broker_ready=False,
+                         broker_health=health)
+            for position in state.get("positions") or ():
+                position["protection"] = "UNKNOWN"
+                position["quote_stale"] = True
+            if state.get("summary"):
+                state["summary"]["realized"]["complete"] = False
+                state["summary"]["open_pnl"]["complete"] = False
+            fresh = state.get("freshness") or {}
+            fresh.setdefault(stage, {"ok_at": None, "interval": 10})["error"] = health["message"]
+            state["freshness"] = fresh
         with self._lock:
             self._state = state
 
@@ -152,4 +241,5 @@ class AlpacaBootstrapPoller:
         pass
 
     def cooldown_left(self) -> float:
-        return 0.0
+        return max(0.0, (self._cooldown_until - datetime.now(timezone.utc)).total_seconds()) \
+            if self._cooldown_until else 0.0

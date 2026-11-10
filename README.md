@@ -12,8 +12,8 @@ want to risk) and manage it with one click: stop to break-even, move the stop, t
 target, take partials, cancel or close. It runs on your own computer, next to thinkorswim or your charts.
 
 **Alpaca Paper preview:** New installations select Alpaca Paper by default. Its account overview shows
-balances, positions, recent and working orders, stop coverage, and P&L coverage from paper fills and
-IEX/indicative quotes. Alpaca order controls are currently read-only while paper workflows are being
+balances, positions, recent and working orders, recent fills, market hours, stop coverage, and P&L
+coverage from paper fills and IEX/indicative quotes. Stale or incomplete data is labeled. Alpaca order controls are currently read-only while paper workflows are being
 connected. Select Schwab in the app and restart for the existing Schwab trading workflows.
 
 - **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks to the selected broker.

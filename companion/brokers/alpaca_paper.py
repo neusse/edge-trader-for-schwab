@@ -12,7 +12,8 @@ from .configuration import paper_credentials, paper_trading_client
 from .models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand,
     CancelOrder, ClientOrderQuery,
-    BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery, MarketSession, MarketSessionsQuery,
+    BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery, MarketClock,
+    MarketClockQuery, MarketSession, MarketSessionsQuery,
     MutationResult, MutationStatus, OptionChain, OptionChainQuery, OptionContract, OptionGreeks, OptionType,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery,
     OrderRole, OrdersQuery, OrderStatus, OrderType, Position, PositionSide, Quote,
@@ -216,15 +217,21 @@ class AlpacaPaperAdapter(BrokerAdapter):
         if isinstance(query, FillsQuery):
             params = {"after": query.start.isoformat(), "until": query.end.isoformat(),
                       "direction": "asc", "page_size": 100}
-            fills = []
-            while True:
+            fills = {}
+            tokens = set()
+            for _ in range(100):
                 page = self._client.get("/account/activities/FILL", params)
                 if not isinstance(page, list):
                     raise ValueError("unexpected Alpaca fill response")
-                fills.extend(_fill(row) for row in page)
+                fills.update((fill.activity_id, fill) for fill in (_fill(row) for row in page))
                 if len(page) < 100:
-                    return tuple(fills)
-                params["page_token"] = page[-1]["id"]
+                    return tuple(fills.values())
+                token = page[-1]["id"]
+                if token in tokens:
+                    raise ValueError("Alpaca fill pagination made no progress")
+                tokens.add(token)
+                params["page_token"] = token
+            raise ValueError("Alpaca fill history exceeded the safe page limit")
         if isinstance(query, OrdersQuery):
             from alpaca.common.enums import Sort
             from alpaca.trading.enums import QueryOrderStatus
@@ -276,6 +283,9 @@ class AlpacaPaperAdapter(BrokerAdapter):
             rows = self._client.get_calendar(GetCalendarRequest(start=query.start, end=query.end))
             return tuple(MarketSession(day.date, day.open.replace(tzinfo=et),
                                        day.close.replace(tzinfo=et), True) for day in rows)
+        if isinstance(query, MarketClockQuery):
+            raw = self._client.get_clock()
+            return MarketClock(raw.timestamp, bool(raw.is_open), raw.next_open, raw.next_close)
         if not isinstance(query, AccountQuery):
             raise NotImplementedError(f"Alpaca Paper {type(query).__name__} is not connected yet")
         account = self._client.get_account()

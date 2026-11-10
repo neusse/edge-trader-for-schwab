@@ -53,6 +53,7 @@ ALPACA_PAPER = BrokerIdentity(
         _READS
         | {
             BrokerCapability.CLIENT_ORDER_LOOKUP,
+            BrokerCapability.MARKET_CLOCK,
             BrokerCapability.EQUITY_TRADING,
             BrokerCapability.OPTION_TRADING,
             BrokerCapability.MULTI_LEG_OPTIONS,
