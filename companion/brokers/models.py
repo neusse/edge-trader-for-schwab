@@ -209,6 +209,12 @@ class OrderLeg:
 
 
 @dataclass(frozen=True)
+class OrderExecution:
+    occurred_at: datetime
+    quantity: Decimal
+
+
+@dataclass(frozen=True)
 class BrokerOrder:
     order_id: BrokerOrderId
     status: OrderStatus
@@ -231,6 +237,7 @@ class BrokerOrder:
     oco_id: BrokerOrderId | None = None
     trail_link: str | None = None
     trail_basis: str | None = None
+    executions: tuple[OrderExecution, ...] = ()
 
 
 @dataclass(frozen=True)

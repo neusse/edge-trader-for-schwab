@@ -11,7 +11,7 @@ from companion.brokers.schwab_adapter import (
 from companion.brokers.canonical_view import _ledger_fills, _pending, build_canonical_state
 from companion.orders import pending_orders
 from companion.pnl import fills_from_transactions
-from companion.view import build_state
+from companion.view import _filled_in_orders, build_state
 
 
 class Response:
@@ -57,7 +57,7 @@ def test_schwab_dashboard_reads_canonical_account_and_quote_values():
     quotes = normalize_quotes({"AAPL": {"realtime": True, "quote": {
         "lastPrice": 105, "bidPrice": 104.9, "askPrice": 105.1,
         "mark": 105, "netPercentChange": 1.2}}}, ("AAPL",))
-    state = build_state(account=normalize_account(raw, "hash"), orders=[], pending=[],
+    state = build_state(account=normalize_account(raw, "hash"), groups=(), pending=[],
                         fills=[], quotes=quotes, prev_session={}, freshness={},
                         history_complete=True, orders_fresh=True, auth_hours_left=None)
     position = state["positions"][0]
@@ -73,7 +73,7 @@ def test_reversed_position_is_not_classified_as_carried():
         {"instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
          "longQuantity": 0, "shortQuantity": 2,
          "previousSessionLongQuantity": 2, "currentDayCost": 0}]}}
-    state = build_state(account=normalize_account(raw, "hash"), orders=[], pending=[],
+    state = build_state(account=normalize_account(raw, "hash"), groups=(), pending=[],
                         fills=[], quotes={}, prev_session={}, freshness={},
                         history_complete=True, orders_fresh=True, auth_hours_left=None)
     assert state["positions"][0]["held"] == "INTRADAY"
@@ -147,6 +147,24 @@ def test_canonical_pending_does_not_claim_missing_remaining_quantity():
                {"instruction": "SELL", "quantity": 2,
                 "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]}
     assert _pending((normalize_order(raw),))[0].qty == 0
+
+
+def test_canonical_order_executions_reconcile_old_gtc_fill_on_execution_day():
+    raw = {"orderId": 24, "orderStrategyType": "TRIGGER", "status": "FILLED",
+           "orderType": "MARKET", "quantity": 2, "filledQuantity": 2,
+           "orderLegCollection": [{"instruction": "BUY", "quantity": 2,
+                                   "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}],
+           "orderActivityCollection": [{"executionType": "FILL", "executionLegs": [
+               {"time": "2026-11-09T15:00:00-05:00", "quantity": 1},
+               {"time": "2026-11-10T15:00:00-05:00", "quantity": 1}]}],
+           "childOrderStrategies": [{"orderId": 25, "status": "FILLED", "orderType": "LIMIT",
+                                    "quantity": 1, "filledQuantity": 1,
+                                    "orderLegCollection": [{"instruction": "SELL", "quantity": 1,
+                                                            "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}],
+                                    "orderActivityCollection": [{"executionType": "FILL", "executionLegs": [
+                                        {"time": "2026-11-10T16:00:00-05:00", "quantity": 1}]}]}]}
+    group = normalize_order(raw)
+    assert _filled_in_orders((group, group), date(2026, 11, 10)) == 2
 
 
 def test_schwab_standalone_exit_is_not_counted_as_an_entry():
