@@ -13,7 +13,7 @@ from .models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand,
     CancelOrder,
     BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery, MarketSession, MarketSessionsQuery,
-    MutationResult, MutationStatus, OptionChain, OptionChainQuery, OptionContract, OptionType,
+    MutationResult, MutationStatus, OptionChain, OptionChainQuery, OptionContract, OptionGreeks, OptionType,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery,
     OrderRole, OrdersQuery, OrderStatus, OrderType, Position, PositionSide, Quote,
     QuotesQuery, ReplaceOrder, SubmitOrder,
@@ -138,6 +138,8 @@ class AlpacaPaperAdapter(BrokerAdapter):
 
     def _query(self, query: BrokerQuery) -> BrokerQueryResult:
         if isinstance(query, OptionChainQuery):
+            from alpaca.data.enums import OptionsFeed
+            from alpaca.data.requests import OptionChainRequest
             from alpaca.trading.enums import ContractType
             from alpaca.trading.requests import GetOptionContractsRequest
             filters = {"underlying_symbols": [query.underlying.upper()], "limit": 1000}
@@ -148,16 +150,44 @@ class AlpacaPaperAdapter(BrokerAdapter):
                 filters["expiration_date_lte"] = date.today() + timedelta(days=30)
             if query.option_type:
                 filters["type"] = ContractType(query.option_type.value)
+            snapshots = self._market_client(AssetType.OPTION).get_option_chain(
+                OptionChainRequest(
+                    underlying_symbol=query.underlying.upper(), feed=OptionsFeed.INDICATIVE,
+                    expiration_date=query.expiration,
+                    expiration_date_gte=None if query.expiration else filters["expiration_date_gte"],
+                    expiration_date_lte=None if query.expiration else filters["expiration_date_lte"],
+                    type=filters.get("type"),
+                ))
             contracts = []
             while True:
                 page = self._client.get_option_contracts(GetOptionContractsRequest(**filters))
                 for raw in page.option_contracts or ():
+                    snapshot = snapshots.get(raw.symbol)
+                    latest_quote = snapshot.latest_quote if snapshot else None
+                    latest_trade = snapshot.latest_trade if snapshot else None
+                    greeks = snapshot.greeks if snapshot else None
+                    bid = _decimal(latest_quote.bid_price) if latest_quote else None
+                    ask = _decimal(latest_quote.ask_price) if latest_quote else None
+                    quote = Quote(
+                        symbol=raw.symbol, bid=bid, ask=ask,
+                        last=_decimal(latest_trade.price) if latest_trade else None,
+                        mark=(bid + ask) / 2 if bid is not None and ask is not None else None,
+                        observed_at=(latest_quote.timestamp if latest_quote else
+                                     latest_trade.timestamp if latest_trade else datetime.now(timezone.utc)),
+                        realtime=False, source="Alpaca indicative options",
+                        greeks=OptionGreeks(
+                            delta=_decimal(greeks.delta), gamma=_decimal(greeks.gamma),
+                            theta=_decimal(greeks.theta), vega=_decimal(greeks.vega),
+                            rho=_decimal(greeks.rho)) if greeks else None,
+                    ) if snapshot else None
                     contracts.append(OptionContract(
                         symbol=raw.symbol, underlying=raw.underlying_symbol,
                         expiration=raw.expiration_date, strike=Decimal(str(raw.strike_price)),
                         option_type=OptionType(_enum_value(raw.type)),
                         multiplier=Decimal(str(raw.multiplier or 100)),
                         tradable=bool(raw.tradable), open_interest=_decimal(raw.open_interest),
+                        implied_volatility=_decimal(snapshot.implied_volatility) if snapshot else None,
+                        quote=quote,
                     ))
                 if not page.next_page_token:
                     return OptionChain(query.underlying.upper(), tuple(contracts),

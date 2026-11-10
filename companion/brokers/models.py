@@ -273,6 +273,7 @@ class OptionContract:
     tradable: bool = True
     quote: Quote | None = None
     open_interest: Decimal | None = None
+    implied_volatility: Decimal | None = None
 
 
 @dataclass(frozen=True)

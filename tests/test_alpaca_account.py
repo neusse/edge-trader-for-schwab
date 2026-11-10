@@ -146,7 +146,8 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
 
 
 def test_option_contract_query_paginates_and_normalizes():
-    from datetime import date
+    from datetime import date, datetime, timezone
+    from decimal import Decimal as D
     from alpaca.trading.models import OptionContract as RawContract
     from companion.brokers.models import OptionChainQuery, OptionType
 
@@ -160,7 +161,20 @@ def test_option_contract_query_paginates_and_normalizes():
             return SimpleNamespace(option_contracts=[raw],
                                    next_page_token=None if number == 2 else "next")
 
-    chain = AlpacaPaperAdapter(Client()).query(
+    def snapshots(request):
+        assert request.feed.value == "indicative"
+        symbol = "AAPL261113C001000000"
+        return {symbol: SimpleNamespace(
+            latest_quote=SimpleNamespace(bid_price=1.0, ask_price=1.2,
+                                         timestamp=datetime.now(timezone.utc)),
+            latest_trade=None, implied_volatility=0.3,
+            greeks=SimpleNamespace(delta=0.5, gamma=0.1, theta=-0.2, vega=0.4, rho=0.01))}
+
+    chain = AlpacaPaperAdapter(Client(), option_data=SimpleNamespace(
+        get_option_chain=snapshots)).query(
         OptionChainQuery("AAPL", date(2026, 11, 13), OptionType.CALL))
     assert len(chain.contracts) == 2
     assert all(contract.option_type == OptionType.CALL for contract in chain.contracts)
+    assert chain.contracts[0].quote.mark == D("1.1")
+    assert chain.contracts[0].quote.greeks.delta == D("0.5")
+    assert chain.contracts[0].implied_volatility == D("0.3")
