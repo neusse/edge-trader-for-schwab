@@ -518,6 +518,7 @@ class ReplaceOrder:
     limit_price: Decimal | None = None
     stop_price: Decimal | None = None
     trail: Decimal | None = None
+    client_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.replacement is not None and any(

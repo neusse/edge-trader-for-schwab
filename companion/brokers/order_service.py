@@ -5,13 +5,14 @@ import json
 import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .adapter import BrokerAdapter
 from .models import (
     AccountQuery, BrokerCommand, ClientOrderQuery, MarketSessionsQuery,
-    MutationResult, MutationStatus, OrderQuery, OrderStatus, SubmitOrder,
+    MutationResult, MutationStatus, OrderQuery, OrderStatus, ReplaceOrder, SubmitOrder,
 )
 from ..store import Store
 
@@ -62,6 +63,8 @@ class BrokerOrderService:
             if isinstance(command, SubmitOrder):
                 intent = getattr(command.intent, "entry", command.intent)
                 client_order_id = intent.client_order_id
+            elif isinstance(command, ReplaceOrder):
+                client_order_id = command.client_order_id
             prior = self.store.get_mutation(request_id)
             if prior:
                 if prior["command"] != type(command).__name__ or prior["payload"] != payload:
@@ -182,6 +185,60 @@ class BrokerOrderService:
             else:
                 return MutationResult(MutationStatus.UNKNOWN,
                                       message=f"Broker order is {order.status.value}; cancel outcome remains unknown")
+            self.store.finish_mutation(request_id, result.status.value,
+                                       result.order_id, result.message)
+            return result
+        finally:
+            self._lock.release()
+
+    def reconcile_replace(self, request_id: str) -> MutationResult:
+        """Confirm an exact replacement client ID after Alpaca finishes the replace."""
+        if not self._lock.acquire(blocking=False):
+            return MutationResult(MutationStatus.UNKNOWN, message="Another order action is in progress")
+        try:
+            row = self.store.get_mutation(request_id)
+            if row is None:
+                return MutationResult(MutationStatus.REJECTED, message="Unknown request ID")
+            if row["command"] != "ReplaceOrder":
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="This request is not a replace action")
+            if row["status"] not in ("SENDING", MutationStatus.UNKNOWN.value):
+                return self._previous(row)
+            client_order_id = row["payload"].get("client_order_id")
+            if not client_order_id:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Replacement client order ID is unavailable")
+            try:
+                account = self.adapter.query(AccountQuery())
+                if account.account_ref != self.account_ref:
+                    return MutationResult(MutationStatus.UNKNOWN,
+                                          message="Active account changed; cannot reconcile")
+                group = self.adapter.query(ClientOrderQuery(client_order_id))
+            except Exception:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Broker lookup failed; replacement outcome is still unknown")
+            if group is None:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Broker has not confirmed this replacement client ID")
+            order = next((item for item in group.orders
+                          if item.client_order_id == client_order_id), None)
+            if order is None:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Broker response did not match the replacement client ID")
+            expected_limit = row["payload"].get("limit_price")
+            if expected_limit is not None and order.limit_price != Decimal(str(expected_limit)):
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Broker replacement price does not match the reviewed price")
+            if order.status == OrderStatus.REJECTED:
+                result = MutationResult(MutationStatus.REJECTED, order.order_id,
+                                        "Broker rejected the replacement; inspect the original order")
+            elif order.status in (OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED,
+                                  OrderStatus.FILLED):
+                result = MutationResult(MutationStatus.ACCEPTED, order.order_id,
+                                        f"Broker confirms replacement status {order.status.value}")
+            else:
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message=f"Replacement is {order.status.value}; check again before another action")
             self.store.finish_mutation(request_id, result.status.value,
                                        result.order_id, result.message)
             return result
