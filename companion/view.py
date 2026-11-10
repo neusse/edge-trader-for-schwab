@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from .brokers.models import AccountSnapshot, Position, Quote
+from .brokers.models import AccountSnapshot, AssetType, OrderGroup, Position, Quote
 from .orders import PendingOrder, stop_coverage
 from .pnl import (Book, Fill, build_book, opening_inventory,
                   session_day)
@@ -247,40 +247,27 @@ def ticket_pnl(brackets: list[dict], positions: list[dict], closed: list[dict]) 
             b["pnl"] = {"state": "CLOSED", "open": None, "realized": t.get("net")}
 
 
-def _filled_in_orders(orders: list[dict], day) -> float:
-    """Shares and contracts executed today across every order node (children included), dated by
-    each execution's own time."""
+def _filled_in_orders(groups: tuple[OrderGroup, ...], day) -> float:
+    """Shares and contracts executed today, dated by each broker execution."""
     from .pnl import ET as _ET
     total = 0.0
-
-    def walk(o):
-        nonlocal total
-        legs = o.get("orderLegCollection") or []
-        if legs and all((l.get("instrument") or {}).get("assetType") in ("EQUITY", "OPTION") for l in legs):
-            # Each execution carries its own time: an old GTC order that fills today counts today.
-            for act in o.get("orderActivityCollection") or []:
-                if act.get("executionType") != "FILL":
-                    continue
-                for e in act.get("executionLegs") or []:
-                    try:
-                        d = datetime.strptime(e.get("time") or "", "%Y-%m-%dT%H:%M:%S%z").astimezone(_ET).date()
-                    except ValueError:
-                        continue
-                    if d == day:
-                        total += _f(e.get("quantity"))
-        for ch in o.get("childOrderStrategies") or []:
-            walk(ch)
-
     seen = set()
-    for o in orders:
-        if o.get("orderId") in seen:
+    for group in groups:
+        if group.group_id in seen:
             continue
-        seen.add(o.get("orderId"))
-        walk(o)
+        seen.add(group.group_id)
+        for order in group.orders:
+            if not order.legs or any(leg.asset_type not in (AssetType.EQUITY, AssetType.OPTION)
+                                     for leg in order.legs):
+                continue
+            for execution in order.executions:
+                if execution.occurred_at.astimezone(_ET).date() == day:
+                    total += float(execution.quantity)
     return total
 
 
-def build_state(*, account: AccountSnapshot | None, orders: list[dict], pending: list[PendingOrder],
+def build_state(*, account: AccountSnapshot | None, groups: tuple[OrderGroup, ...],
+                pending: list[PendingOrder],
                 fills: list[Fill], quotes: dict[str, Quote],
                 prev_session: dict[str, tuple[float, float | None]], freshness: dict,
                 history_complete: bool, orders_fresh: bool, auth_hours_left: float | None,
@@ -300,7 +287,7 @@ def build_state(*, account: AccountSnapshot | None, orders: list[dict], pending:
         r["complete"] = r["lots_complete"] and history_complete
     # Stock and option shares Schwab's orders report as filled today versus the fills already in
     # /transactions: more in the orders means fills are still on their way.
-    order_filled = _filled_in_orders(orders, eq_today)
+    order_filled = _filled_in_orders(groups, eq_today)
     tx_filled = sum(abs(f.qty) for f in fills if f.asset_type in ("EQUITY", "OPTION") and f.day == eq_today)
     sec["fills_pending"] = max(0.0, order_filled - tx_filled)
     if sec["fills_pending"] > 1e-9:

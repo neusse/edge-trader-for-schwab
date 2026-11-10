@@ -13,7 +13,7 @@ from .models import (
     MarketSession, MarketSessionsQuery, MutationResult, MutationStatus,
     OptionGreeks, Quote, QuotesQuery,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery, OrderRole,
-    OrdersQuery, OrderStatus, OrderType, Position, PositionSide, ReplaceOrder, SubmitOrder,
+    OrderExecution, OrdersQuery, OrderStatus, OrderType, Position, PositionSide, ReplaceOrder, SubmitOrder,
     TimeInForce, MultiLegOrderIntent, TrailingOrderIntent,
 )
 
@@ -145,6 +145,21 @@ def normalize_order(raw: dict) -> OrderGroup:
         status = _STATUS.get(node.get("status"), OrderStatus.UNKNOWN)
         if legs:
             kind = node.get("orderType") or "LIMIT"
+            executions = []
+            for activity in node.get("orderActivityCollection") or ():
+                if activity.get("executionType") != "FILL":
+                    continue
+                for execution in activity.get("executionLegs") or ():
+                    at = execution.get("time")
+                    qty = _decimal(execution.get("quantity"))
+                    if not at or qty is None:
+                        continue
+                    try:
+                        occurred_at = datetime.fromisoformat(at.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if occurred_at.tzinfo is not None:
+                        executions.append(OrderExecution(occurred_at, qty))
             members.append(BrokerOrder(
                 order_id=node_id, status=status,
                 order_type=_ORDER_TYPE.get(kind, OrderType.LIMIT),
@@ -163,6 +178,7 @@ def normalize_order(raw: dict) -> OrderGroup:
                 duration_detail=node.get("duration"), oco_id=oco_id,
                 trail_link=node.get("stopPriceLinkType"),
                 trail_basis=node.get("stopPriceLinkBasis"),
+                executions=tuple(executions),
             ))
         child_oco = node_id if node.get("orderStrategyType") == "OCO" else oco_id
         for child in node.get("childOrderStrategies") or ():

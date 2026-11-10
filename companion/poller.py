@@ -395,10 +395,12 @@ class Poller:
         fills = _ledger_fills(normalize_fills(txns))
         merged = self._merged_orders()
         try:
-            pending = _pending(tuple(normalize_order(order) for order in merged), self.terminal)
+            groups = tuple(normalize_order(order) for order in merged)
+            pending = _pending(groups, self.terminal)
             orders_fresh = self._orders_fresh()
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("canonical Schwab order normalization failed: %r", exc)
+            groups = ()
             pending = []
             orders_fresh = False
             self.fresh["orders_sweep"]["error"] = "order normalization incomplete"
@@ -414,7 +416,7 @@ class Poller:
             log.warning("canonical Schwab quote normalization failed: %r", exc)
             quotes = {}
             self.fresh["quotes"]["error"] = "quote normalization incomplete"
-        st = build_state(account=account, orders=merged, pending=pending,
+        st = build_state(account=account, groups=groups, pending=pending,
                          fills=fills, quotes=quotes,
                          prev_session=self.store.load_prev_session(day),
                          freshness=self.fresh, history_complete=self.history_complete,
