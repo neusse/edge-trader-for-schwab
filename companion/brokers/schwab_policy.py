@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,20 @@ class SchwabReadPolicy:
     sweep_statuses: tuple[str, ...] = ("WORKING", "PENDING_ACTIVATION")
     max_requests_per_minute: int = 70
     details_per_sweep: int = 3
+
+    def complete_transactions(self, fetch: Callable[[datetime, datetime], list[dict]],
+                              start: datetime, end: datetime) -> list[dict]:
+        """Split capped Schwab reads; never mistake an unsplittable cap for complete history."""
+        rows = fetch(start, end)
+        if not isinstance(rows, list):
+            raise ValueError("Schwab transaction read is unavailable")
+        if len(rows) < self.transaction_cap:
+            return rows
+        if end - start <= timedelta(hours=1):
+            raise ValueError("Schwab transaction result reached its cap inside one hour")
+        mid = start + (end - start) / 2
+        return (self.complete_transactions(fetch, start, mid) +
+                self.complete_transactions(fetch, mid, end))
 
     def throttle_delay(self, sent: deque[float], now: float,
                        cooldown_until: float) -> float:
