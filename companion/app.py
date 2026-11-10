@@ -59,7 +59,17 @@ class DemoPoller:
     def cooldown_left(self): return 0.0
 
 
-poller = DemoPoller() if DEMO else (Poller() if BROKER_KEY == "schwab" else AlpacaBootstrapPoller())
+POLLERS = {"demo": DemoPoller, "schwab": Poller, "alpaca-paper": AlpacaBootstrapPoller}
+
+
+def make_poller(broker_key: str):
+    """Select exactly one broker runtime without falling back to another broker."""
+    if broker_key not in BROKERS:
+        raise ValueError("unknown broker runtime")
+    return POLLERS[broker_key]()
+
+
+poller = make_poller(BROKER_KEY)
 trader = Trader(poller.store)
 poller.trader = trader
 trader.on_request = poller.note_external_request
