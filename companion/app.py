@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -65,6 +66,7 @@ class DemoPoller:
 
 
 POLLERS = {"demo": DemoPoller, "schwab": Poller, "alpaca-paper": AlpacaBootstrapPoller}
+BROKER_ACTION_LOCK = threading.RLock()
 
 
 def make_poller(broker_key: str):
@@ -106,6 +108,13 @@ async def only_local_host(request: Request, call_next):
     header: refuse it, so no other site can read positions or balances."""
     if request.headers.get("host") not in HOSTS:
         return JSONResponse({"error": "unexpected host"}, status_code=403)
+    broker_mutation = request.url.path.startswith(
+        ("/api/ticket/", "/api/position/", "/api/spread/", "/api/paper/"))
+    if (request.method == "POST" and broker_mutation and not DEMO_OVERRIDE and
+            BrokerSelection().get() != BROKER_KEY):
+        return JSONResponse({"ok": False,
+                             "error": "Broker selection changed; restart before any order action"},
+                            status_code=409)
     demo_mutation = DEMO and (request.url.path.startswith("/api/position/") or
                               request.url.path in ("/api/ticket/submit", "/api/ticket/cancel",
                                                        "/api/ticket/cancel_entries", "/api/ticket/arm",
@@ -224,16 +233,21 @@ async def broker_select(request: Request):
     key = (await request.json()).get("broker")
     if not isinstance(key, str) or key not in BROKERS:
         raise HTTPException(400, "unknown broker selection")
-    trader.arm(False, reason="broker selection")
-    if isinstance(poller, AlpacaBootstrapPoller) and poller.order_service is not None:
-        poller.order_service.arm(False)
-    UI["sel"] = None
-    UI["sel_seq"] += 1
-    BrokerSelection().set(key)
+    await run_in_threadpool(_save_broker_selection, key)
     # The current runtime and its cached state stay bound to their original account. A
     # process restart activates the persisted choice with a fresh poller and disarmed trader.
     return {"ok": True, "active": BROKER_KEY, "selected": key,
             "restart_required": key != BROKER_KEY}
+
+
+def _save_broker_selection(key: str) -> None:
+    with BROKER_ACTION_LOCK:
+        trader.arm(False, reason="broker selection")
+        if isinstance(poller, AlpacaBootstrapPoller) and poller.order_service is not None:
+            poller.order_service.arm(False)
+        UI["sel"] = None
+        UI["sel_seq"] += 1
+        BrokerSelection().set(key)
 
 
 def _paper_service():
@@ -294,12 +308,14 @@ async def paper_arm(request: Request):
     body = await request.json()
     if not isinstance(body, dict) or type(body.get("armed")) is not bool:
         raise HTTPException(400, "armed must be true or false")
-    service, _ = _paper_service()
-    service.arm(body["armed"])
-    if BrokerSelection().get() != BROKER_KEY:
-        service.arm(False)
-        raise HTTPException(409, "Broker selection changed; paper entries are disarmed")
-    return {"ok": True, "armed": service.armed}
+    return await run_in_threadpool(_set_paper_arming, body["armed"])
+
+
+def _set_paper_arming(enabled: bool) -> dict:
+    with BROKER_ACTION_LOCK:
+        service, _ = _paper_service()
+        service.arm(enabled)
+        return {"ok": True, "armed": service.armed}
 
 
 @app.post("/api/paper/entry/preview")
@@ -331,17 +347,23 @@ async def paper_entry_submit(request: Request):
         if not isinstance(body, dict):
             raise ValueError("entry request must be an object")
         request_id = str(UUID(str(body.get("request_id"))))
-        service, intent, _ = await run_in_threadpool(_paper_entry, body, True)
+        result = await run_in_threadpool(_send_paper_entry, body, request_id)
     except (ValueError, TypeError, AttributeError) as exc:
         return {"ok": False, "error": str(exc)}
     except HTTPException:
         raise
     except Exception:
         return {"ok": False, "error": "Alpaca Paper preflight failed; no order was sent"}
-    result = await run_in_threadpool(service.execute, SubmitOrder(intent), request_id)
     return {"ok": result.accepted, "status": result.status.value,
             "order_id": result.order_id, "message": result.message,
             "request_id": request_id}
+
+
+def _send_paper_entry(body: dict, request_id: str):
+    # Selection and arming cannot change between the fresh preflight and mutation.
+    with BROKER_ACTION_LOCK:
+        service, intent, _ = _paper_entry(body, True)
+        return service.execute(SubmitOrder(intent), request_id)
 
 
 @app.post("/api/paper/entry/reconcile")
