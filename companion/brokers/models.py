@@ -178,12 +178,20 @@ class Position:
 
 
 @dataclass(frozen=True)
+class PreviousSessionPosition:
+    symbol: str
+    quantity: Decimal  # signed; yesterday's inventory can be flat today
+    average_price: Decimal | None = None
+
+
+@dataclass(frozen=True)
 class AccountSnapshot:
     account_ref: str
     status: str
     balances: BalanceSnapshot
     positions: tuple[Position, ...] = ()
     observed_at: datetime | None = None
+    previous_session_positions: tuple[PreviousSessionPosition, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -286,6 +294,9 @@ class Quote:
     volume: Decimal | None = None
     greeks: OptionGreeks | None = None
     change_percent: Decimal | None = None
+    timestamp_verified: bool = False
+    last_observed_at: datetime | None = None
+    penny_pilot: bool | None = None
 
 
 @dataclass(frozen=True)

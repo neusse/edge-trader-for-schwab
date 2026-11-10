@@ -13,7 +13,8 @@ from .models import (
     MarketSession, MarketSessionsQuery, MutationResult, MutationStatus,
     OptionGreeks, Quote, QuotesQuery,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery, OrderRole,
-    OrderExecution, OrdersQuery, OrderStatus, OrderType, Position, PositionSide, ReplaceOrder, SubmitOrder,
+    OrderExecution, OrdersQuery, OrderStatus, OrderType, Position, PositionSide,
+    PreviousSessionPosition, ReplaceOrder, SubmitOrder,
     TimeInForce, MultiLegOrderIntent, TrailingOrderIntent,
 )
 
@@ -55,11 +56,19 @@ def normalize_account(raw: dict, account_ref: str) -> AccountSnapshot:
     account = raw["securitiesAccount"]
     balances = account.get("currentBalances") or {}
     positions = []
+    previous = []
     for row in account.get("positions") or ():
         instrument = row.get("instrument") or {}
         asset = _ASSET.get(instrument.get("assetType"))
         symbol = instrument.get("symbol")
         qty = Decimal(str(row.get("longQuantity") or 0)) - Decimal(str(row.get("shortQuantity") or 0))
+        prior_qty = (Decimal(str(row.get("previousSessionLongQuantity") or 0)) -
+                     Decimal(str(row.get("previousSessionShortQuantity") or 0)))
+        if symbol and prior_qty:
+            untouched = qty == prior_qty and not _decimal(row.get("currentDayCost"))
+            previous.append(PreviousSessionPosition(
+                symbol, prior_qty,
+                _decimal(row.get("averagePrice")) if untouched else None))
         if not asset or not symbol or not qty:
             continue
         positions.append(Position(
@@ -67,8 +76,7 @@ def normalize_account(raw: dict, account_ref: str) -> AccountSnapshot:
             side=PositionSide.LONG if qty > 0 else PositionSide.SHORT,
             quantity=abs(qty), average_price=_decimal(row.get("averagePrice")),
             underlying=instrument.get("underlyingSymbol") or instrument.get("rootSymbol") or symbol,
-            previous_session_quantity=(Decimal(str(row.get("previousSessionLongQuantity") or 0)) -
-                                       Decimal(str(row.get("previousSessionShortQuantity") or 0))),
+            previous_session_quantity=prior_qty,
             current_day_cost=_decimal(row.get("currentDayCost")),
             market_value=_decimal(row.get("marketValue")),
             open_profit_loss=_decimal(row.get("longOpenProfitLoss") if qty > 0 else
@@ -86,6 +94,7 @@ def normalize_account(raw: dict, account_ref: str) -> AccountSnapshot:
             maintenance_requirement=_decimal(balances.get("maintenanceRequirement")),
         ),
         positions=tuple(positions), observed_at=datetime.now(timezone.utc),
+        previous_session_positions=tuple(previous),
     )
 
 
@@ -209,6 +218,10 @@ def normalize_quotes(raw: dict, symbols: tuple[str, ...],
         at = quote.get("quoteTime")
         observed = (datetime.fromtimestamp(at / 1000, timezone.utc)
                     if isinstance(at, (int, float)) else datetime.now(timezone.utc))
+        trade_at = quote.get("tradeTime")
+        last_observed = (datetime.fromtimestamp(trade_at / 1000, timezone.utc)
+                         if isinstance(trade_at, (int, float)) else None)
+        penny = (item.get("reference") or {}).get("isPennyPilot")
         greeks = OptionGreeks(
             delta=_decimal(quote.get("delta")), gamma=_decimal(quote.get("gamma")),
             theta=_decimal(quote.get("theta")), vega=_decimal(quote.get("vega")),
@@ -218,6 +231,9 @@ def normalize_quotes(raw: dict, symbols: tuple[str, ...],
             mark=mark, observed_at=observed, realtime=bool(item.get("realtime")),
             source="Schwab", volume=_decimal(quote.get("totalVolume")), greeks=greeks,
             change_percent=_decimal(quote.get("netPercentChange")),
+            timestamp_verified=isinstance(at, (int, float)),
+            last_observed_at=last_observed,
+            penny_pilot=penny if isinstance(penny, bool) else None,
         )
     return out
 
