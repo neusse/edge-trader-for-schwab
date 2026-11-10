@@ -31,7 +31,7 @@ from . import schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, Fill, session_day
 from .brokers.canonical_view import _ledger_fills, _pending
-from .brokers.schwab_adapter import normalize_fills, normalize_order
+from .brokers.schwab_adapter import normalize_account, normalize_fills, normalize_order, normalize_quotes
 from .store import Store, now_iso
 from .view import build_state, ticket_pnl
 
@@ -402,8 +402,20 @@ class Poller:
             pending = []
             orders_fresh = False
             self.fresh["orders_sweep"]["error"] = "order normalization incomplete"
-        st = build_state(account=self.account, orders=merged, pending=pending,
-                         fills=fills, quotes=self.quotes,
+        try:
+            account = normalize_account(self.account, self.account_hash) if self.account else None
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("canonical Schwab account normalization failed: %r", exc)
+            account = None
+            self.fresh["account"]["error"] = "account normalization incomplete"
+        try:
+            quotes = normalize_quotes(self.quotes, tuple(self.quotes))
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("canonical Schwab quote normalization failed: %r", exc)
+            quotes = {}
+            self.fresh["quotes"]["error"] = "quote normalization incomplete"
+        st = build_state(account=account, orders=merged, pending=pending,
+                         fills=fills, quotes=quotes,
                          prev_session=self.store.load_prev_session(day),
                          freshness=self.fresh, history_complete=self.history_complete,
                          orders_fresh=orders_fresh, auth_hours_left=schwab.auth_hours_left())

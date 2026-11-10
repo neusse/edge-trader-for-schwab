@@ -5,10 +5,13 @@ from companion.brokers.models import (
     AccountQuery, AssetType, FillsQuery, MarketSessionsQuery, OrderClass, OrderInstruction, OrderRole,
     OrderStatus, OrdersQuery, PositionSide, QuotesQuery,
 )
-from companion.brokers.schwab_adapter import SchwabAdapter, normalize_account, normalize_fills, normalize_order
+from companion.brokers.schwab_adapter import (
+    SchwabAdapter, normalize_account, normalize_fills, normalize_order, normalize_quotes,
+)
 from companion.brokers.canonical_view import _ledger_fills, _pending, build_canonical_state
 from companion.orders import pending_orders
 from companion.pnl import fills_from_transactions
+from companion.view import build_state
 
 
 class Response:
@@ -41,6 +44,39 @@ def test_schwab_account_keeps_unknown_basis_and_short_direction():
     assert account.positions[1].average_price == Decimal(100)
     assert account.positions[1].previous_session_quantity == Decimal(2)
     assert account.positions[1].current_day_cost == Decimal(0)
+
+
+def test_schwab_dashboard_reads_canonical_account_and_quote_values():
+    raw = {"securitiesAccount": {
+        "currentBalances": {"equity": 10000, "buyingPower": 20000},
+        "positions": [{"instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
+                       "longQuantity": 2, "shortQuantity": 0, "averagePrice": 100,
+                       "previousSessionLongQuantity": 2, "currentDayCost": 0,
+                       "marketValue": 210, "longOpenProfitLoss": 10,
+                       "currentDayProfitLoss": 4}]}}
+    quotes = normalize_quotes({"AAPL": {"realtime": True, "quote": {
+        "lastPrice": 105, "bidPrice": 104.9, "askPrice": 105.1,
+        "mark": 105, "netPercentChange": 1.2}}}, ("AAPL",))
+    state = build_state(account=normalize_account(raw, "hash"), orders=[], pending=[],
+                        fills=[], quotes=quotes, prev_session={}, freshness={},
+                        history_complete=True, orders_fresh=True, auth_hours_left=None)
+    position = state["positions"][0]
+    assert (position["held"], position["last"], position["market_value"],
+            position["open_pnl"], position["day_pnl"]) == ("CARRIED", 105, 210, 10, 4)
+    assert position["quote"]["change_pct"] == 1.2
+    assert state["balances"]["equity"] == 10000
+    assert state["balances"]["buyingPower"] == 20000
+
+
+def test_reversed_position_is_not_classified_as_carried():
+    raw = {"securitiesAccount": {"currentBalances": {}, "positions": [
+        {"instrument": {"symbol": "AAPL", "assetType": "EQUITY"},
+         "longQuantity": 0, "shortQuantity": 2,
+         "previousSessionLongQuantity": 2, "currentDayCost": 0}]}}
+    state = build_state(account=normalize_account(raw, "hash"), orders=[], pending=[],
+                        fills=[], quotes={}, prev_session={}, freshness={},
+                        history_complete=True, orders_fresh=True, auth_hours_left=None)
+    assert state["positions"][0]["held"] == "INTRADAY"
 
 
 def test_schwab_bracket_tree_maps_entry_and_exit_roles():

@@ -70,6 +70,10 @@ def normalize_account(raw: dict, account_ref: str) -> AccountSnapshot:
             previous_session_quantity=(Decimal(str(row.get("previousSessionLongQuantity") or 0)) -
                                        Decimal(str(row.get("previousSessionShortQuantity") or 0))),
             current_day_cost=_decimal(row.get("currentDayCost")),
+            market_value=_decimal(row.get("marketValue")),
+            open_profit_loss=_decimal(row.get("longOpenProfitLoss") if qty > 0 else
+                                      row.get("shortOpenProfitLoss")),
+            current_day_profit_loss=_decimal(row.get("currentDayProfitLoss")),
         ))
     return AccountSnapshot(
         account_ref=account_ref, status="CONNECTED",
@@ -174,6 +178,34 @@ def normalize_order(raw: dict) -> OrderGroup:
                       strategy_detail=strategy or "SINGLE")
 
 
+def normalize_quotes(raw: dict, symbols: tuple[str, ...],
+                     asset_type: AssetType = AssetType.EQUITY) -> dict[str, Quote]:
+    out = {}
+    for symbol in symbols:
+        item = raw.get(symbol) or {}
+        quote = item.get("quote") or {}
+        if not quote:
+            continue
+        bid, ask = _decimal(quote.get("bidPrice")), _decimal(quote.get("askPrice"))
+        mark = _decimal(quote.get("mark"))
+        if mark is None and bid is not None and ask is not None:
+            mark = (bid + ask) / 2
+        at = quote.get("quoteTime")
+        observed = (datetime.fromtimestamp(at / 1000, timezone.utc)
+                    if isinstance(at, (int, float)) else datetime.now(timezone.utc))
+        greeks = OptionGreeks(
+            delta=_decimal(quote.get("delta")), gamma=_decimal(quote.get("gamma")),
+            theta=_decimal(quote.get("theta")), vega=_decimal(quote.get("vega")),
+            rho=_decimal(quote.get("rho"))) if asset_type == AssetType.OPTION else None
+        out[symbol] = Quote(
+            symbol=symbol, bid=bid, ask=ask, last=_decimal(quote.get("lastPrice")),
+            mark=mark, observed_at=observed, realtime=bool(item.get("realtime")),
+            source="Schwab", volume=_decimal(quote.get("totalVolume")), greeks=greeks,
+            change_percent=_decimal(quote.get("netPercentChange")),
+        )
+    return out
+
+
 def normalize_fills(transactions: list[dict]) -> tuple[Fill, ...]:
     fills = []
     seen = set()
@@ -273,30 +305,7 @@ class SchwabAdapter(BrokerAdapter):
             return normalize_fills(collect(query.start, query.end))
         if isinstance(query, QuotesQuery):
             raw = _response(client.quotes(list(query.symbols)))
-            out = {}
-            for symbol in query.symbols:
-                item = raw.get(symbol) or {}
-                quote = item.get("quote") or {}
-                if not quote:
-                    continue
-                bid, ask = _decimal(quote.get("bidPrice")), _decimal(quote.get("askPrice"))
-                mark = _decimal(quote.get("mark"))
-                if mark is None and bid is not None and ask is not None:
-                    mark = (bid + ask) / 2
-                at = quote.get("quoteTime")
-                observed = (datetime.fromtimestamp(at / 1000, timezone.utc)
-                            if isinstance(at, (int, float)) else datetime.now(timezone.utc))
-                greeks = OptionGreeks(
-                    delta=_decimal(quote.get("delta")), gamma=_decimal(quote.get("gamma")),
-                    theta=_decimal(quote.get("theta")), vega=_decimal(quote.get("vega")),
-                    rho=_decimal(quote.get("rho"))) if query.asset_type == AssetType.OPTION else None
-                out[symbol] = Quote(
-                    symbol=symbol, bid=bid, ask=ask, last=_decimal(quote.get("lastPrice")),
-                    mark=mark,
-                    observed_at=observed, realtime=bool(item.get("realtime")), source="Schwab",
-                    volume=_decimal(quote.get("totalVolume")), greeks=greeks,
-                )
-            return out
+            return normalize_quotes(raw, query.symbols, query.asset_type)
         if isinstance(query, MarketSessionsQuery):
             sessions = []
             day = query.start
