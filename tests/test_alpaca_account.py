@@ -39,6 +39,24 @@ def test_paper_account_read_normalizes_positions_without_sdk_objects():
     assert snapshot.positions[0].quantity == 3
 
 
+def test_paper_clock_is_canonical_and_account_bound():
+    from datetime import datetime, timedelta, timezone
+    from companion.brokers.models import MarketClockQuery
+
+    now = datetime(2026, 11, 10, 16, tzinfo=timezone.utc)
+
+    class Client:
+        def get_clock(self):
+            return SimpleNamespace(timestamp=now, is_open=True,
+                                   next_open=now + timedelta(days=1),
+                                   next_close=now + timedelta(hours=5))
+
+    clock = AlpacaPaperAdapter(Client()).query(MarketClockQuery())
+    assert clock.is_open is True
+    assert clock.observed_at == now
+    assert clock.next_close == now + timedelta(hours=5)
+
+
 def test_default_paper_runtime_never_routes_a_trade_to_schwab(monkeypatch):
     from fastapi.testclient import TestClient
     from companion import app as appmod
@@ -153,6 +171,34 @@ def test_fill_read_normalizes_opaque_ids_and_option_side():
     assert fills[0].instruction == OrderInstruction.BUY_TO_OPEN
 
 
+def test_fill_read_paginates_without_losing_opaque_activities():
+    from datetime import datetime, timezone
+    from companion.brokers.models import FillsQuery
+
+    rows = [{"id": f"activity::{i}", "order_id": "order-uuid", "symbol": "AAPL",
+             "side": "buy", "qty": "1", "price": "100",
+             "transaction_time": "2026-11-10T12:00:00Z"} for i in range(101)]
+
+    class Client:
+        calls = 0
+
+        def get(self, path, params):
+            self.calls += 1
+            assert path == "/account/activities/FILL"
+            if self.calls == 1:
+                assert "page_token" not in params
+                return rows[:100]
+            assert params["page_token"] == "activity::99"
+            return rows[100:]
+
+    client = Client()
+    now = datetime(2026, 11, 10, tzinfo=timezone.utc)
+    fills = AlpacaPaperAdapter(client).query(FillsQuery(now, now))
+    assert client.calls == 2
+    assert len(fills) == 101
+    assert len({fill.activity_id for fill in fills}) == 101
+
+
 def test_broker_selection_persists_without_reusing_current_runtime(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
     from companion import app as appmod
@@ -199,7 +245,7 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
     from companion.brokers.models import (
         AccountSnapshot, BalanceSnapshot, BrokerOrder, OrderClass, OrderGroup, OrderLeg,
         OrderRole, OrderStatus, OrderType, OrdersQuery, OrderInstruction, Position,
-        FillsQuery, QuotesQuery,
+        FillsQuery, MarketClock, MarketClockQuery, MarketSessionsQuery, QuotesQuery,
         TimeInForce,
     )
     from companion.store import Store
@@ -227,6 +273,13 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
                                    OrderStatus.WORKING, (order,)),)
             if isinstance(query, FillsQuery):
                 return ()
+            if isinstance(query, MarketClockQuery):
+                from datetime import datetime, timedelta, timezone
+                now = datetime.now(timezone.utc)
+                return MarketClock(now, False, now + timedelta(days=1),
+                                   now + timedelta(days=1, hours=6))
+            if isinstance(query, MarketSessionsQuery):
+                return ()
             if isinstance(query, QuotesQuery):
                 return {}
             raise AssertionError(type(query))
@@ -245,6 +298,72 @@ def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch,
         assert poller.store.scope == ("alpaca-paper", "paper-account")
         assert poller.trader.store is poller.store
         assert poller.trader.status()["armed"] is False
+    finally:
+        poller.stop()
+
+
+def test_paper_read_rate_limit_keeps_snapshot_but_marks_it_stale(monkeypatch, tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
+    from companion.brokers.bootstrap import AlpacaBootstrapPoller
+    from companion.brokers.capabilities import ALPACA_PAPER
+    from companion.brokers.models import (
+        AccountSnapshot, BalanceSnapshot, FillsQuery, MarketClock, MarketClockQuery,
+        MarketSessionsQuery, OrdersQuery, Position, Quote, QuotesQuery,
+    )
+    from companion.store import Store
+
+    original = Store.for_broker
+    monkeypatch.setattr(Store, "for_broker", classmethod(
+        lambda cls, broker, account: original(broker, account, tmp_path)))
+    now = datetime.now(timezone.utc)
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(),
+                              (Position("AAPL", AssetType.EQUITY, PositionSide.LONG,
+                                        Decimal("1"), Decimal("100")),))
+
+    class RateLimit(Exception):
+        status_code = 429
+
+    class Adapter:
+        identity = ALPACA_PAPER
+        fail = False
+        calls = 0
+
+        def query(self, query):
+            self.calls += 1
+            if isinstance(query, AccountQuery):
+                if self.fail:
+                    raise RateLimit()
+                return account
+            if isinstance(query, OrdersQuery):
+                return ()
+            if isinstance(query, MarketClockQuery):
+                return MarketClock(now, True, now + timedelta(days=1), now + timedelta(hours=5))
+            if isinstance(query, MarketSessionsQuery):
+                return ()
+            if isinstance(query, FillsQuery):
+                return ()
+            if isinstance(query, QuotesQuery):
+                return {"AAPL": Quote("AAPL", Decimal("100"), Decimal("101"), None,
+                                       Decimal("100.5"), now, True, "Alpaca IEX")}
+            raise AssertionError(type(query))
+
+    adapter = Adapter()
+    poller = AlpacaBootstrapPoller(adapter)
+    try:
+        poller.poll_once()
+        assert poller.snapshot()["broker_ready"] is True
+        adapter.fail = True
+        poller.poll_once()
+        stale = poller.snapshot()
+        assert stale["broker_ready"] is False
+        assert stale["broker_health"]["state"] == "rate-limited"
+        assert stale["positions"][0]["protection"] == "UNKNOWN"
+        assert stale["summary"]["open_pnl"]["complete"] is False
+        calls = adapter.calls
+        poller.poll_once()
+        assert adapter.calls == calls
+        assert poller.cooldown_left() > 0
     finally:
         poller.stop()
 

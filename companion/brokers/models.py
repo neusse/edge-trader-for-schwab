@@ -27,6 +27,7 @@ class BrokerCapability(str, Enum):
     EQUITY_MARKET_DATA = "equity-market-data"
     OPTION_MARKET_DATA = "option-market-data"
     MARKET_CALENDAR = "market-calendar"
+    MARKET_CLOCK = "market-clock"
     EQUITY_TRADING = "equity-trading"
     OPTION_TRADING = "option-trading"
     MULTI_LEG_OPTIONS = "multi-leg-options"
@@ -296,6 +297,14 @@ class MarketSession:
             raise ValueError("an open session requires open and close timestamps")
 
 
+@dataclass(frozen=True)
+class MarketClock:
+    observed_at: datetime
+    is_open: bool
+    next_open: datetime
+    next_close: datetime
+
+
 # Read queries. Adapters translate these requests and return the corresponding canonical model.
 @dataclass(frozen=True)
 class AccountQuery:
@@ -342,6 +351,11 @@ class MarketSessionsQuery:
 
 
 @dataclass(frozen=True)
+class MarketClockQuery:
+    pass
+
+
+@dataclass(frozen=True)
 class OptionChainQuery:
     underlying: str
     expiration: date | None = None
@@ -356,6 +370,7 @@ BrokerQuery: TypeAlias = (
     | FillsQuery
     | QuotesQuery
     | MarketSessionsQuery
+    | MarketClockQuery
     | OptionChainQuery
 )
 BrokerQueryResult: TypeAlias = (
@@ -366,6 +381,7 @@ BrokerQueryResult: TypeAlias = (
     | tuple[Fill, ...]
     | Mapping[str, Quote]
     | tuple[MarketSession, ...]
+    | MarketClock
     | OptionChain
 )
 

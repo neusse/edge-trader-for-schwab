@@ -1222,23 +1222,30 @@ function renderAlpacaOverview(st) {
     return;
   }
   const positions = st.positions || [], working = st.orders || [], recent = a.orders || [];
+  const fills = (st.fills || []).slice(0, 25);
+  const hours = st.market_hours || {};
+  const market = hours.is_open == null ? "Market hours unavailable" : hours.is_open
+    ? `Market open · next close ${esc(new Date(hours.next_close).toLocaleString())}`
+    : `Market closed · next open ${esc(new Date(hours.next_open).toLocaleString())}`;
   const realized = st.summary?.realized?.securities;
   const open = st.summary?.open_pnl;
-  const rows = positions.map(p => `<tr><td>${esc(p.display)}</td><td>${esc(p.side)}</td><td>${esc(p.qty)}</td><td>${p.avg_price == null ? "—" : money(p.avg_price)}</td>
-    <td>${p.last == null ? "—" : money(p.last)}${p.quote_stale ? " <small>(stale)</small>" : ""}<br><small>${esc(p.quote_source || "No quote")}</small></td>
+  const rows = positions.map(p => `<tr><td>${esc(p.display)}</td><td>${esc(p.side)}</td><td>${esc(p.qty)}</td><td>${p.avg_price == null ? "—" : money(p.avg_price, false)}</td>
+    <td>${p.last == null ? "—" : money(p.last, false)}${p.quote_stale ? " <small>(stale)</small>" : ""}<br><small>${esc(p.quote_source || "No quote")}</small></td>
     <td>${p.open_pnl == null ? "—" : money(p.open_pnl)}</td><td>${esc(p.protection)}${p.stop_qty ? ` (${esc(p.stop_qty)}/${esc(p.qty)})` : ""}</td></tr>`).join("");
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td></tr>`).join("");
   const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
+  const fillRows = fills.map(f => `<tr><td>${esc(new Date(f.time).toLocaleString())}</td><td>${esc(f.symbol)}</td><td>${esc(f.instruction)}</td><td>${esc(f.quantity)}</td><td>${money(Number(f.price), false)}</td></tr>`).join("");
   panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
-    <p class="mut">Read-only account view while paper trading workflows are being connected. Updated ${esc(new Date(a.updated_at).toLocaleTimeString())}.</p>
-    <div class="alpaca-metrics"><div>Equity<strong>${a.equity == null ? "—" : money(Number(a.equity))}</strong></div>
-      <div>Cash<strong>${a.cash == null ? "—" : money(Number(a.cash))}</strong></div>
-      <div>Buying power<strong>${a.buying_power == null ? "—" : money(Number(a.buying_power))}</strong></div>
+    <p class="mut">Read-only account view while paper trading workflows are being connected. ${esc(st.broker_health?.message || "")}. Updated ${esc(new Date(a.updated_at).toLocaleTimeString())}. ${market}.</p>
+    <div class="alpaca-metrics"><div>Equity<strong>${a.equity == null ? "—" : money(Number(a.equity), false)}</strong></div>
+      <div>Cash<strong>${a.cash == null ? "—" : money(Number(a.cash), false)}</strong></div>
+      <div>Buying power<strong>${a.buying_power == null ? "—" : money(Number(a.buying_power), false)}</strong></div>
       <div>Open P&amp;L<strong>${open?.complete ? money(open.intraday + open.mixed + open.carried) : "Incomplete"}</strong></div>
       <div>Realized today<strong>${realized?.complete ? money(realized.net) : "Incomplete"}</strong></div></div>
     <div class="alpaca-list"><h2>Positions (${positions.length})</h2>${positions.length ? `<table><thead><tr><th>Symbol</th><th>Side</th><th>Quantity</th><th>Average</th><th>Mark / source</th><th>Open P&amp;L</th><th>Stop coverage</th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="mut">No open positions.</p>`}</div>
     <div class="alpaca-list"><h2>Working orders (${working.length})</h2>${working.length ? `<table><thead><tr><th>Symbol</th><th>Role</th><th>Status</th><th>Type</th><th>Remaining</th></tr></thead><tbody>${workingRows}</tbody></table>` : `<p class="mut">No working orders.</p>`}</div>
-    <div class="alpaca-list"><h2>Orders, last 30 days (${recent.length})</h2>${recent.length ? `<table><thead><tr><th>Symbol</th><th>Status</th><th>Type</th><th>Quantity</th></tr></thead><tbody>${orderRows}</tbody></table>` : `<p class="mut">No recent orders.</p>`}</div>`;
+    <div class="alpaca-list"><h2>Orders, last 30 days (${recent.length})</h2>${recent.length ? `<table><thead><tr><th>Symbol</th><th>Status</th><th>Type</th><th>Quantity</th></tr></thead><tbody>${orderRows}</tbody></table>` : `<p class="mut">No recent orders.</p>`}</div>
+    <div class="alpaca-list"><h2>Recent fills (${fills.length}${(st.fills || []).length > fills.length ? "+" : ""})</h2>${fills.length ? `<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Quantity</th><th>Price</th></tr></thead><tbody>${fillRows}</tbody></table>` : `<p class="mut">No fills in the loaded history.</p>`}</div>`;
 }
 function render(st) {
   const broker = st.broker || {key: "schwab", name: "Schwab", mode: "live"};
