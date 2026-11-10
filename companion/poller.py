@@ -89,6 +89,7 @@ class Poller:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._auto_threads: list[threading.Thread] = []
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -100,10 +101,15 @@ class Poller:
 
     def stop(self) -> None:
         self._stop.set()
+        deadline = time.monotonic() + 20
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=20)
+            self._thread.join(timeout=max(0, deadline - time.monotonic()))
             if self._thread.is_alive():
                 raise RuntimeError("Schwab polling did not stop; restart before switching brokers")
+        for worker in self._auto_threads:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+            if worker.is_alive():
+                raise RuntimeError("Schwab Auto B/E is still sending; restart before switching brokers")
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -508,13 +514,18 @@ class Poller:
                 continue
             if mark < trigger - 1e-9 if long else mark > trigger + 1e-9:
                 continue
+            if self._stop.is_set():
+                return
             if not self.trader.store.set_auto_be(r["ticket_id"], "SENDING", f"mark {mark:g} touched +1R {trigger:g}",
                                                  only_from="PENDING"):
                 continue
             p["auto_be"]["state"] = "SENDING"
-            threading.Thread(target=self.trader.auto_breakeven, name=f"auto-be-{p['symbol']}", daemon=True,
-                             args=(r["ticket_id"], p["symbol"], p["side"], r["entry"],
-                                   self._merged_orders(), set(self.terminal))).start()
+            worker = threading.Thread(target=self.trader.auto_breakeven,
+                                      name=f"auto-be-{p['symbol']}", daemon=True,
+                                      args=(r["ticket_id"], p["symbol"], p["side"], r["entry"],
+                                            self._merged_orders(), set(self.terminal)))
+            self._auto_threads.append(worker)
+            worker.start()
 
     def _add_r_and_log(self, st: dict, orders_today: list[dict], txns: list[dict]) -> None:
         """Live R on each position (frozen basis from the companion ticket) and a per-symbol
