@@ -6,13 +6,15 @@ from decimal import Decimal
 
 from .adapter import BrokerAdapter
 from .capabilities import SCHWAB
+from .schwab_orders import build_schwab_order
 from .models import (
-    AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand,
+    AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand, CancelOrder,
     BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery,
-    MarketSession, MarketSessionsQuery, MutationResult,
+    MarketSession, MarketSessionsQuery, MutationResult, MutationStatus,
     OptionGreeks, Quote, QuotesQuery,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery, OrderRole,
-    OrdersQuery, OrderStatus, OrderType, Position, PositionSide, TimeInForce,
+    OrdersQuery, OrderStatus, OrderType, Position, PositionSide, ReplaceOrder, SubmitOrder,
+    TimeInForce, MultiLegOrderIntent, TrailingOrderIntent,
 )
 
 
@@ -264,4 +266,87 @@ class SchwabAdapter(BrokerAdapter):
         raise NotImplementedError(f"Schwab {type(query).__name__} canonical query is not connected yet")
 
     def _execute(self, command: BrokerCommand) -> MutationResult:
-        raise NotImplementedError("Schwab canonical execution is not connected yet")
+        if isinstance(command, ReplaceOrder) and command.replacement is None:
+            return MutationResult(MutationStatus.REJECTED,
+                                  message="Schwab replace needs a complete reviewed order plan")
+        if isinstance(command, (CancelOrder, ReplaceOrder)) and not str(command.order_id).isdigit():
+            return MutationResult(MutationStatus.REJECTED,
+                                  message="Schwab order ID must be numeric; nothing was sent")
+        intent = (command.intent if isinstance(command, SubmitOrder) else
+                  command.replacement if isinstance(command, ReplaceOrder) else None)
+        if intent is not None:
+            try:
+                body = build_schwab_order(intent)
+            except (TypeError, ValueError) as exc:
+                return MutationResult(MutationStatus.REJECTED, message=str(exc))
+        elif not isinstance(command, CancelOrder):
+            raise TypeError(f"unknown Schwab command: {type(command).__name__}")
+        try:
+            client, account_hash = self._ready()
+        except Exception:
+            return MutationResult(MutationStatus.REJECTED,
+                                  message="Schwab account is unavailable; no action was sent")
+        if intent is not None and (
+                isinstance(intent, MultiLegOrderIntent) or
+                isinstance(intent, TrailingOrderIntent) and
+                intent.leg.asset_type == AssetType.OPTION):
+            try:
+                preview = client.preview_order(account_hash, body)
+                if preview.status_code == 429:
+                    return MutationResult(MutationStatus.RATE_LIMITED,
+                                          message="Schwab rate limited the order preview; nothing was sent")
+                if preview.status_code not in (200, 201):
+                    return MutationResult(MutationStatus.REJECTED,
+                                          message="Schwab did not confirm the order preview; nothing was sent")
+                answer = preview.json()
+                if not isinstance(answer, dict):
+                    raise ValueError("unreadable preview")
+                validation = answer.get("orderValidationResult")
+                if not isinstance(validation, dict) and not isinstance(answer.get("orderStrategy"), dict):
+                    raise ValueError("unreadable preview")
+                rejects = validation.get("rejects", []) if isinstance(validation, dict) else []
+                if not isinstance(rejects, list):
+                    raise ValueError("unreadable preview")
+                if rejects:
+                    return MutationResult(MutationStatus.REJECTED,
+                                          message="Schwab preview rejected the order; nothing was sent")
+            except Exception:
+                return MutationResult(MutationStatus.REJECTED,
+                                      message="Schwab preview could not be verified; nothing was sent")
+        try:
+            if isinstance(command, SubmitOrder):
+                response = client.place_order(account_hash, body)
+            elif isinstance(command, ReplaceOrder):
+                response = client.replace_order(account_hash, int(command.order_id), body)
+            else:
+                response = client.cancel_order(account_hash, int(command.order_id))
+        except Exception:
+            return MutationResult(MutationStatus.UNKNOWN,
+                                  message="Schwab order outcome unknown; reconcile before another action")
+        code = response.status_code
+        if code in (200, 201, 202, 204):
+            if isinstance(command, CancelOrder):
+                return MutationResult(MutationStatus.ACCEPTED, str(command.order_id))
+            location = (getattr(response, "headers", {}) or {}).get("Location", "")
+            tail = location.rstrip("/").split("/")[-1]
+            if tail.isdigit():
+                return MutationResult(MutationStatus.ACCEPTED, tail)
+            return MutationResult(MutationStatus.UNKNOWN,
+                                  message="Schwab accepted the order without a trackable ID")
+        if code == 429:
+            raw = (getattr(response, "headers", {}) or {}).get("Retry-After")
+            try:
+                retry = float(raw) if raw is not None else None
+            except ValueError:
+                retry = None
+            return MutationResult(MutationStatus.RATE_LIMITED,
+                                  message="Schwab rate limited the order action",
+                                  retry_after_seconds=retry)
+        if code == 408 or code >= 500:
+            return MutationResult(MutationStatus.UNKNOWN,
+                                  message="Schwab order outcome unknown; reconcile before another action")
+        if 400 <= code < 500:
+            return MutationResult(MutationStatus.REJECTED,
+                                  message=f"Schwab rejected the order action (HTTP {code})")
+        return MutationResult(MutationStatus.UNKNOWN,
+                              message=f"Schwab order response was unclear (HTTP {code})")

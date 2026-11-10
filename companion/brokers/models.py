@@ -489,13 +489,18 @@ class CancelOrder:
 @dataclass(frozen=True)
 class ReplaceOrder:
     order_id: BrokerOrderId
+    replacement: OrderIntent | None = None
     quantity: Decimal | None = None
     limit_price: Decimal | None = None
     stop_price: Decimal | None = None
     trail: Decimal | None = None
 
     def __post_init__(self) -> None:
-        if all(v is None for v in (self.quantity, self.limit_price, self.stop_price, self.trail)):
+        if self.replacement is not None and any(
+                v is not None for v in (self.quantity, self.limit_price, self.stop_price, self.trail)):
+            raise ValueError("replace order cannot mix a complete plan with partial fields")
+        if self.replacement is None and all(
+                v is None for v in (self.quantity, self.limit_price, self.stop_price, self.trail)):
             raise ValueError("replace order requires at least one change")
 
 

@@ -323,6 +323,8 @@ class AlpacaPaperAdapter(BrokerAdapter):
             if isinstance(command, SubmitOrder):
                 request = build_order_request(command.intent)
             elif isinstance(command, ReplaceOrder):
+                if command.replacement is not None:
+                    raise ValueError("Alpaca Paper replace accepts changed fields, not a full order plan")
                 request = ReplaceOrderRequest(
                     qty=float(command.quantity) if command.quantity is not None else None,
                     limit_price=float(command.limit_price) if command.limit_price is not None else None,
