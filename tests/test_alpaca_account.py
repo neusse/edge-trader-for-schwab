@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from companion.brokers.alpaca_paper import AlpacaPaperAdapter
-from companion.brokers.models import AccountQuery, AssetType, ClientOrderQuery, PositionSide
+from companion.brokers.models import AccountQuery, AssetType, ClientOrderQuery, OrderRole, PositionSide
 
 
 def test_runtime_factory_selects_exact_broker_without_fallback(monkeypatch):
@@ -119,6 +119,28 @@ def test_client_order_lookup_fetches_nested_group():
     group = AlpacaPaperAdapter(Client()).query(ClientOrderQuery("stable-client-id"))
     assert group.orders[0].order_id == "paper-order-uuid"
     assert group.orders[0].client_order_id == "stable-client-id"
+
+
+def test_oco_root_without_group_role_is_still_a_target():
+    from alpaca.trading.models import Order
+    from companion.brokers.alpaca_paper import _order_group
+
+    stop = Order.model_construct(
+        id="stop-id", group_id="oco-id", order_class="oco", group_role="stop_loss",
+        status="new", type="stop", time_in_force="gtc", legs=[],
+        symbol="AAPL", asset_class="us_equity", qty="2", filled_qty="0",
+        side="sell", position_intent=None, limit_price=None, stop_price="95",
+        trail_price=None, trail_percent=None, submitted_at=None, updated_at=None,
+        client_order_id="stop-client")
+    target = Order.model_construct(
+        id="target-id", group_id="oco-id", order_class="oco", group_role=None,
+        status="new", type="limit", time_in_force="gtc", legs=[stop],
+        symbol="AAPL", asset_class="us_equity", qty="2", filled_qty="0",
+        side="sell", position_intent=None, limit_price="110", stop_price=None,
+        trail_price=None, trail_percent=None, submitted_at=None, updated_at=None,
+        client_order_id="oco-client")
+    group = _order_group(target)
+    assert [order.role for order in group.orders] == [OrderRole.TARGET, OrderRole.STOP]
 
 
 def test_order_history_pages_with_boundary_overlap_and_uuid_deduplication():
@@ -250,7 +272,7 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
 
     paper = broker_info("alpaca-paper")
     assert "option-trading" in paper["capabilities"]
-    assert paper["workflows"] == ("equity-bracket",)
+    assert paper["workflows"] == ("equity-bracket", "equity-oco")
     assert "option-bracket" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")

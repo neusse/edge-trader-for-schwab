@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from .adapter import BrokerAdapter
 from .models import (
-    AccountQuery, BrokerCommand, ClientOrderQuery, MarketSessionsQuery,
+    AccountQuery, AccountSnapshot, BrokerCommand, ClientOrderQuery, MarketSessionsQuery,
     MutationResult, MutationStatus, OrderQuery, OrderStatus, ReplaceOrder, SubmitOrder,
 )
 from ..store import Store
@@ -54,7 +54,8 @@ class BrokerOrderService:
         return MutationResult(MutationStatus(status), row["order_id"],
                               row["message"] or "This request was already sent; reconcile its outcome")
 
-    def execute(self, command: BrokerCommand, request_id: str) -> MutationResult:
+    def execute(self, command: BrokerCommand, request_id: str,
+                preflight: Callable[[AccountSnapshot], None] | None = None) -> MutationResult:
         if not self._lock.acquire(blocking=False):
             return MutationResult(MutationStatus.UNKNOWN, message="Another order action is in progress")
         try:
@@ -82,6 +83,8 @@ class BrokerOrderService:
                 if account.account_ref != self.account_ref:
                     return MutationResult(MutationStatus.REJECTED,
                                           message="Active account changed; no order was sent")
+                if preflight is not None:
+                    preflight(account)
                 if isinstance(command, SubmitOrder):
                     if not self.armed:
                         return MutationResult(MutationStatus.REJECTED,
@@ -89,6 +92,8 @@ class BrokerOrderService:
                     if not self._market_open(self.clock()):
                         return MutationResult(MutationStatus.REJECTED,
                                               message="Regular market session is closed")
+            except ValueError as exc:
+                return MutationResult(MutationStatus.REJECTED, message=str(exc))
             except Exception:
                 return MutationResult(MutationStatus.REJECTED,
                                       message="Account or market verification failed; no order was sent")

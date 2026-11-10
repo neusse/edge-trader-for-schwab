@@ -361,7 +361,7 @@
 <section class="panel" id="alpaca-overview" aria-label="Alpaca Paper account overview"></section>
 <section class="panel" id="paper-entry" aria-label="Alpaca Paper equity bracket entry">
   <h2>Paper equity bracket entry</h2>
-  <p class="mut">One target and one fixed stop are held by Alpaca after entry fills. Existing positions, active orders, options, trailing stops, and two targets are unavailable in this form.</p>
+  <p class="mut">One target and one fixed stop are held by Alpaca after entry fills. Existing positions can receive one OCO exit from the Positions list when no other order touches the symbol. Options, trailing stops, and two targets are unavailable in this form.</p>
   <form id="paper-form">
     <div class="paper-fields">
       <label>Symbol<input class="in" name="symbol" required maxlength="10" placeholder="AAPL" autocomplete="off"></label>
@@ -372,7 +372,7 @@
       <label>Target price<input class="in" name="target_price" type="number" min="0.01" step="0.01" required></label>
       <label>Stop price<input class="in" name="stop_price" type="number" min="0.01" step="0.01" required></label>
     </div>
-    <div class="paper-actions"><button type="button" class="btn" id="paper-arm">Arm paper entries</button>
+    <div class="paper-actions"><button type="button" class="btn" id="paper-arm">Arm paper orders</button>
       <button type="submit" class="btn" id="paper-submit" disabled>Review paper order</button>
       <button type="button" class="btn" id="paper-reconcile" style="display:none">Reconcile unknown outcome</button></div>
   </form>
@@ -1259,7 +1259,9 @@ function renderAlpacaOverview(st) {
   const open = st.summary?.open_pnl;
   const rows = positions.map(p => `<tr><td>${esc(p.display)}</td><td>${esc(p.side)}</td><td>${esc(p.qty)}</td><td>${p.avg_price == null ? "—" : money(p.avg_price, false)}</td>
     <td>${p.last == null ? "—" : money(p.last, false)}${p.quote_stale ? " <small>(stale)</small>" : ""}<br><small>${esc(p.quote_source || "No quote")}</small></td>
-    <td>${p.open_pnl == null ? "—" : money(p.open_pnl)}</td><td>${esc(p.protection)}${p.stop_qty ? ` (${esc(p.stop_qty)}/${esc(p.qty)})` : ""}</td></tr>`).join("");
+    <td>${p.open_pnl == null ? "—" : money(p.open_pnl)}</td><td>${esc(p.protection)}${p.stop_qty ? ` (${esc(p.stop_qty)}/${esc(p.qty)})` : ""}</td>
+    <td>${p.asset_type === "EQUITY" && p.protection === "NONE" && st.broker?.workflows?.includes("equity-oco") ?
+      `<button type="button" class="btn sm ghost" data-paper-oco="${esc(p.symbol)}" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="Arm Paper orders and wait for a fresh, order-free market session">Attach OCO</button>` : ""}</td></tr>`).join("");
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td>
     <td>${o.cancellable && o.group_type === "BRACKET" && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}</td></tr>`).join("");
   const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
@@ -1271,7 +1273,7 @@ function renderAlpacaOverview(st) {
       <div>Buying power<strong>${a.buying_power == null ? "—" : money(Number(a.buying_power), false)}</strong></div>
       <div>Open P&amp;L<strong>${open?.complete ? money(open.intraday + open.mixed + open.carried) : "Incomplete"}</strong></div>
       <div>Realized today<strong>${realized?.complete ? money(realized.net) : "Incomplete"}</strong></div></div>
-    <div class="alpaca-list"><h2>Positions (${positions.length})</h2>${positions.length ? `<table><thead><tr><th>Symbol</th><th>Side</th><th>Quantity</th><th>Average</th><th>Mark / source</th><th>Open P&amp;L</th><th>Stop coverage</th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="mut">No open positions.</p>`}</div>
+    <div class="alpaca-list"><h2>Positions (${positions.length})</h2>${positions.length ? `<table><thead><tr><th>Symbol</th><th>Side</th><th>Quantity</th><th>Average</th><th>Mark / source</th><th>Open P&amp;L</th><th>Stop coverage</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="mut">No open positions.</p>`}</div>
     <div class="alpaca-list"><h2>Working orders (${working.length})</h2>${working.length ? `<table><thead><tr><th>Symbol</th><th>Role</th><th>Status</th><th>Type</th><th>Remaining</th><th>Action</th></tr></thead><tbody>${workingRows}</tbody></table>` : `<p class="mut">No working orders.</p>`}</div>
     <div class="alpaca-list"><h2>Orders, last 30 days (${recent.length})</h2>${recent.length ? `<table><thead><tr><th>Symbol</th><th>Status</th><th>Type</th><th>Quantity</th></tr></thead><tbody>${orderRows}</tbody></table>` : `<p class="mut">No recent orders.</p>`}</div>
     <div class="alpaca-list"><h2>Recent fills (${fills.length}${(st.fills || []).length > fills.length ? "+" : ""})</h2>${fills.length ? `<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Quantity</th><th>Price</th></tr></thead><tbody>${fillRows}</tbody></table>` : `<p class="mut">No fills in the loaded history.</p>`}</div>`;
@@ -1444,7 +1446,7 @@ function renderPaperControls(st) {
   const enabled = st.broker?.capabilities?.includes("equity-bracket") &&
     st.broker?.workflows?.includes("equity-bracket");
   const ready = enabled && st.broker_ready && !st.pending_broker && st.market_hours?.is_open === true;
-  $("paper-arm").textContent = paperArmed ? "Disarm paper entries" : "Arm paper entries";
+  $("paper-arm").textContent = paperArmed ? "Disarm paper orders" : "Arm paper orders";
   $("paper-arm").disabled = paperBusy || !enabled ||
     (!paperArmed && (!st.broker_ready || !!st.pending_broker));
   $("paper-submit").disabled = paperBusy || !ready || !paperArmed || paperOutcome === "unknown";
@@ -1474,7 +1476,7 @@ $("paper-arm").addEventListener("click", async () => {
     const result = await post("/api/paper/arm", {armed: !paperArmed});
     if (!result.ok) throw new Error(result.detail || result.error || "Could not change paper arming");
     paperArmed = result.armed;
-    paperMessage(paperArmed ? "Paper entries armed for this market day." : "Paper entries disarmed.");
+    paperMessage(paperArmed ? "Paper orders armed for this market day." : "Paper orders disarmed.");
   } catch (err) { paperMessage(String(err.message || err)); }
   finally { paperBusy = false; renderPaperControls(lastState); }
 });
@@ -1618,6 +1620,55 @@ $("alpaca-overview").addEventListener("click", async e => {
     if (sent) {
       paperOutcome = "unknown";
       paperMessage(`Replacement may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(String(err.message || err));
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
+$("alpaca-overview").addEventListener("click", async e => {
+  const button = e.target.closest("[data-paper-oco]");
+  if (!button || paperBusy || paperOutcome === "unknown" || !paperArmed ||
+      lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready ||
+      lastState.market_hours?.is_open !== true) return;
+  const symbol = button.dataset.paperOco;
+  const position = (lastState.positions || []).find(p => p.symbol === symbol && p.asset_type === "EQUITY" &&
+    p.protection === "NONE" && Number.isInteger(Number(p.qty)) && Number(p.qty) > 0);
+  if (!position || (lastState.orders || []).some(o => o.symbol === symbol)) return;
+  const target = window.prompt(`Target price for ${position.qty} ${symbol} ${position.side} shares`, "");
+  if (target === null) return;
+  const stop = window.prompt(`Fixed stop price for ${symbol}`, "");
+  if (stop === null) return;
+  if (![target, stop].every(value => Number.isFinite(Number(value)) && Number(value) > 0)) {
+    paperMessage("Enter positive target and stop prices."); return;
+  }
+  const requestId = crypto.randomUUID();
+  paperBusy = true; paperRequestId = requestId; paperCommand = "SubmitOrder"; paperIntentKey = null;
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const payload = {symbol, target_price: target, stop_price: stop, request_id: requestId};
+    const preview = await post("/api/paper/oco/preview", payload);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "OCO preview refused");
+    if (!window.confirm(`Attach Alpaca Paper OCO exits for ${preview.quantity} ${preview.symbol} shares ` +
+        `(${preview.side})? IEX mark ${preview.quote}; target ${preview.target}, fixed stop ${preview.stop}. ` +
+        `${preview.protection}.`)) { paperMessage("Paper OCO review canceled."); return; }
+    paperMessage("Sending paper OCO once…");
+    sent = true;
+    const result = await post("/api/paper/oco/submit", payload);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown";
+      paperMessage(`${result.message || "OCO outcome unknown"}. Reconcile before another order action.`);
+    } else {
+      paperRequestId = null;
+      paperOutcome = null;
+      paperMessage(result.ok ? `Alpaca Paper accepted OCO ${result.order_id}. Verify both exits in the order list.` :
+        result.message || result.error || result.detail || "OCO refused");
+    }
+  } catch (err) {
+    if (sent) {
+      paperOutcome = "unknown";
+      paperMessage(`OCO may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
     } else {
       paperRequestId = null;
       paperMessage(String(err.message || err));

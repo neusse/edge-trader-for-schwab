@@ -109,7 +109,8 @@ def _order_group(raw) -> OrderGroup:
             add(child, child_role, str(member.id))
 
     root_role = {"take_profit": OrderRole.TARGET, "stop_loss": OrderRole.STOP}.get(
-        _enum_value(raw.group_role), OrderRole.ENTRY)
+        _enum_value(raw.group_role),
+        OrderRole.TARGET if group_class == OrderClass.OCO else OrderRole.ENTRY)
     add(raw, root_role)
     return OrderGroup(group_id=group_id, order_class=group_class,
                       status=_ORDER_STATUS.get(_enum_value(raw.status), OrderStatus.UNKNOWN),
