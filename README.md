@@ -13,8 +13,14 @@ target, take partials, cancel or close. It runs on your own computer, next to th
 
 **Alpaca Paper preview:** New installations select Alpaca Paper by default. Its account overview shows
 balances, positions, recent and working orders, recent fills, market hours, stop coverage, and P&L
-coverage from paper fills and IEX/indicative quotes. Stale or incomplete data is labeled. Alpaca order controls are currently read-only while paper workflows are being
+coverage from paper fills and IEX/indicative quotes. Stale or incomplete data is labeled. The Paper
+equity bracket form accepts a flat symbol with no active order, whole-share long or short market/limit
+entry, one target, and one fixed stop. Arm entries for the market day, review the plan, then confirm
+the Paper order. The target and stop are broker-held after the entry fills. A lost response blocks new
+orders until the exact client order ID is reconciled. Other Alpaca order workflows are still being
 connected. Select Schwab in the app and restart for the existing Schwab trading workflows.
+
+![Alpaca Paper equity bracket form with invented demo state](docs/screenshot-paper-entry-demo.png)
 
 - **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks to the selected broker.
 - **Every order is your click.** No signals, no auto-trading. Two exceptions, both opt-in per trade: pick "Auto B/E 1R" on the ticket and the app moves that trade's stop to break-even once, when price reaches +1R; tick "Send when hit" on a spread's stop and the app sends that spread's close once, when the stop is reached.
@@ -53,7 +59,7 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads. Stock quotes use Alpaca IEX data and option quotes use indicative data. Paper order controls remain disabled in this preview.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, and a confirmed equity bracket order from the Paper form. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
