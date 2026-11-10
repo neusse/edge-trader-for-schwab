@@ -1,7 +1,23 @@
 from types import SimpleNamespace
 
+import pytest
+
 from companion.brokers.alpaca_paper import AlpacaPaperAdapter
 from companion.brokers.models import AccountQuery, AssetType, ClientOrderQuery, PositionSide
+
+
+def test_runtime_factory_selects_exact_broker_without_fallback(monkeypatch):
+    from companion import app as appmod
+
+    assert set(appmod.POLLERS) == set(appmod.BROKERS)
+    created = []
+    for key in ("alpaca-paper", "schwab", "demo"):
+        monkeypatch.setitem(appmod.POLLERS, key,
+                            lambda key=key: created.append(key) or object())
+        appmod.make_poller(key)
+    assert created == ["alpaca-paper", "schwab", "demo"]
+    with pytest.raises(ValueError, match="unknown broker runtime"):
+        appmod.make_poller("alpaca-live")
 
 
 def test_paper_account_read_normalizes_positions_without_sdk_objects():
