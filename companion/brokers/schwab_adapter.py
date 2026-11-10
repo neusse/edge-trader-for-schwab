@@ -7,6 +7,7 @@ from decimal import Decimal
 from .adapter import BrokerAdapter
 from .capabilities import SCHWAB
 from .schwab_orders import build_schwab_order
+from .schwab_policy import SchwabReadPolicy
 from .models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand, CancelOrder,
     BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery,
@@ -347,16 +348,10 @@ class SchwabAdapter(BrokerAdapter):
         if isinstance(query, OrderQuery):
             return normalize_order(_response(client.order_details(account_hash, query.order_id)))
         if isinstance(query, FillsQuery):
-            def collect(start, end):
-                rows = _response(client.transactions(account_hash, start, end, "TRADE"))
-                if len(rows) < 3000:
-                    return rows
-                if end - start <= timedelta(hours=1):
-                    raise ValueError("Schwab transaction result reached its cap inside one hour")
-                mid = start + (end - start) / 2
-                return collect(start, mid) + collect(mid, end)
-
-            return normalize_fills(collect(query.start, query.end))
+            rows = SchwabReadPolicy().complete_transactions(
+                lambda start, end: _response(client.transactions(account_hash, start, end, "TRADE")),
+                query.start, query.end)
+            return normalize_fills(rows)
         if isinstance(query, QuotesQuery):
             raw = _response(client.quotes(list(query.symbols)))
             return normalize_quotes(raw, query.symbols, query.asset_type)

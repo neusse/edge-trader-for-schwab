@@ -177,13 +177,14 @@ class Poller:
         return True
 
     def _fetch_transactions(self, name: str, start: datetime, end: datetime) -> bool:
-        """Store all TRADE transactions in [start, end); halve a range that hits the cap."""
-        data = self._call(name, lambda: self.client.transactions(self.account_hash, start, end, "TRADE"))
-        if data is None or not isinstance(data, list):
+        """Store complete TRADE history or leave freshness stale when a response hits its cap."""
+        try:
+            data = self.policy.complete_transactions(
+                lambda a, b: self._call(name, lambda: self.client.transactions(self.account_hash, a, b, "TRADE")),
+                start, end)
+        except ValueError as exc:
+            self.fresh[name]["error"] = str(exc)
             return False
-        if len(data) >= self.policy.transaction_cap and end - start > timedelta(hours=1):
-            mid = start + (end - start) / 2
-            return self._fetch_transactions(name, start, mid) and self._fetch_transactions(name, mid, end)
         self.store.save_transactions(data)
         return True
 
