@@ -21,6 +21,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import __version__
+from .brokers.capabilities import BROKERS
+from .brokers.configuration import BrokerSelection
+from .brokers.bootstrap import AlpacaBootstrapPoller
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -28,7 +31,8 @@ from .view import private_view
 STATIC = Path(__file__).resolve().parent / "static"
 PORT = int(os.environ.get("COMPANION_PORT", "8770"))
 ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
-DEMO = os.environ.get("EDGE_TRADER_DEMO") == "1"     # synthetic data, no Schwab, no orders
+BROKER_KEY = "demo" if os.environ.get("EDGE_TRADER_DEMO") == "1" else BrokerSelection().get()
+DEMO = BROKER_KEY == "demo"     # synthetic data, no broker calls or orders
 PRIVATE = os.environ.get("EDGE_TRADER_PRIVATE") == "1"   # hide carried positions and account value
 
 
@@ -54,7 +58,7 @@ class DemoPoller:
     def cooldown_left(self): return 0.0
 
 
-poller = DemoPoller() if DEMO else Poller()
+poller = DemoPoller() if DEMO else (Poller() if BROKER_KEY == "schwab" else AlpacaBootstrapPoller())
 trader = Trader(poller.store)
 poller.trader = trader
 trader.on_request = poller.note_external_request
@@ -76,7 +80,7 @@ async def lifespan(_app: FastAPI):
     poller.stop()
 
 
-app = FastAPI(title="Edge Trader for Schwab", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="Edge Trader", lifespan=lifespan, docs_url=None, redoc_url=None)
 HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 
 
@@ -86,11 +90,16 @@ async def only_local_host(request: Request, call_next):
     header: refuse it, so no other site can read positions or balances."""
     if request.headers.get("host") not in HOSTS:
         return JSONResponse({"error": "unexpected host"}, status_code=403)
-    if DEMO and request.method == "POST" and (request.url.path.startswith("/api/position/")
-                                              or request.url.path in ("/api/ticket/submit", "/api/ticket/cancel",
-                                                                      "/api/ticket/cancel_entries", "/api/ticket/arm",
-                                                                      "/api/ticket/preview")):
-        return JSONResponse({"ok": False, "error": "Demo mode: no orders and no Schwab calls."})
+    demo_mutation = DEMO and (request.url.path.startswith("/api/position/") or
+                              request.url.path in ("/api/ticket/submit", "/api/ticket/cancel",
+                                                       "/api/ticket/cancel_entries", "/api/ticket/arm",
+                                                       "/api/ticket/preview"))
+    alpaca_unavailable = BROKER_KEY == "alpaca-paper" and request.url.path.startswith(
+        ("/api/position/", "/api/ticket/", "/api/spread/"))
+    if request.method == "POST" and (demo_mutation or alpaca_unavailable):
+        reason = ("Demo mode: no orders and no Schwab calls." if DEMO else
+                  "Alpaca Paper order and ticket integration is not ready yet; no order was sent.")
+        return JSONResponse({"ok": False, "error": reason})
     return await call_next(request)
 
 
@@ -117,6 +126,8 @@ def auth_login(request: Request):
     which the running poller and the Scanner both read. Never opens a streamer."""
     global LOGIN_PROC
     _guard(request)
+    if BROKER_KEY == "alpaca-paper":
+        return {"ok": False, "error": "Alpaca Paper uses environment credentials; no browser login is needed."}
     if DEMO:
         return {"ok": False, "error": "Demo mode: no Schwab sign-in."}
     if LOGIN_PROC is not None and LOGIN_PROC.poll() is None:
@@ -172,8 +183,37 @@ def state():
     snap = poller.snapshot()
     if PRIVATE:
         snap = private_view(snap)
+    broker = BROKERS[BROKER_KEY]
+    selected_broker = BrokerSelection().get()
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO,
+                         "broker": {"key": broker.key, "name": broker.display_name, "mode": broker.mode.value,
+                                    "capabilities": sorted(c.value for c in broker.capabilities.supported)},
+                         "pending_broker": selected_broker if selected_broker != BROKER_KEY else None,
                          "version": __version__, "features": FEATURES}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/brokers")
+def brokers():
+    return {"active": BROKER_KEY, "selected": BrokerSelection().get(),
+            "brokers": [{"key": b.key, "name": b.display_name, "mode": b.mode.value,
+                         "capabilities": sorted(c.value for c in b.capabilities.supported)}
+                        for b in BROKERS.values()]}
+
+
+@app.post("/api/brokers/select")
+async def broker_select(request: Request):
+    _guard(request)
+    key = (await request.json()).get("broker")
+    if not isinstance(key, str) or key not in BROKERS:
+        raise HTTPException(400, "unknown broker selection")
+    trader.arm(False, reason="broker selection")
+    UI["sel"] = None
+    UI["sel_seq"] += 1
+    BrokerSelection().set(key)
+    # The current runtime and its cached state stay bound to their original account. A
+    # process restart activates the persisted choice with a fresh poller and disarmed trader.
+    return {"ok": True, "active": BROKER_KEY, "selected": key,
+            "restart_required": key != BROKER_KEY}
 
 
 @app.post("/api/ui/select")

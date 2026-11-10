@@ -33,8 +33,8 @@ def paper_credentials(env: Mapping[str, str] | None = None) -> AlpacaPaperCreden
     endpoint = _first(env, "alpaca_paper_endpoint", "ALPACA_PAPER_ENDPOINT")
     if endpoint and endpoint.rstrip("/") != PAPER_ENDPOINT:
         raise ValueError("Alpaca Paper endpoint must be https://paper-api.alpaca.markets")
-    key = _first(env, "alpaca_paper_api_key", "ALPACA_PAPER_API_KEY", "APCA_API_KEY_ID", "ALPACA_API_KEY")
-    secret = _first(env, "alpaca_paper_secret", "ALPACA_PAPER_SECRET", "APCA_API_SECRET_KEY", "ALPACA_SECRET_KEY")
+    key = _first(env, "alpaca_paper_api_key", "ALPACA_PAPER_API_KEY")
+    secret = _first(env, "alpaca_paper_secret", "ALPACA_PAPER_SECRET")
     if not key or not secret:
         raise ValueError("Alpaca Paper credentials are missing: set alpaca_paper_api_key and alpaca_paper_secret")
     return AlpacaPaperCredentials(key, secret)

@@ -114,12 +114,17 @@ class OrderClass(str, Enum):
     SIMPLE = "simple"
     BRACKET = "bracket"
     OCO = "oco"
+    OTO = "oto"
     MULTI_LEG = "multi-leg"
 
 
 class TimeInForce(str, Enum):
     DAY = "day"
     GTC = "gtc"
+    OPG = "opg"
+    CLS = "cls"
+    IOC = "ioc"
+    FOK = "fok"
 
 
 class OrderStatus(str, Enum):

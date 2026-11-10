@@ -28,6 +28,8 @@ def test_paper_credentials_prefer_mode_specific_values_and_reject_live_endpoint(
         paper_credentials({**env, "alpaca_paper_endpoint": "https://api.alpaca.markets"})
     with pytest.raises(ValueError, match="credentials are missing"):
         paper_credentials({})
+    with pytest.raises(ValueError, match="credentials are missing"):
+        paper_credentials({"ALPACA_API_KEY": "live-key", "ALPACA_SECRET_KEY": "live-secret"})
 
 
 def test_client_constructor_is_fixed_to_paper(monkeypatch):

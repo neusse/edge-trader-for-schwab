@@ -2331,6 +2331,8 @@ def test_login_button_opens_one_fixed_sign_in_window(monkeypatch):
         def poll(self): return self.done
     monkeypatch.setattr(subprocess, "Popen", FakeProc)
     monkeypatch.setattr(appmod, "LOGIN_PROC", None)
+    monkeypatch.setattr(appmod, "BROKER_KEY", "schwab")
+    monkeypatch.setattr(appmod, "DEMO", False)
     c = TestClient(appmod.app, base_url="http://127.0.0.1:8770")
     assert c.post("/api/auth/login", json={}).status_code == 403             # no X-Companion header
     h = {"X-Companion": "1", "Origin": "http://127.0.0.1:8770"}
