@@ -100,3 +100,41 @@ def test_broker_selection_persists_without_reusing_current_runtime(monkeypatch, 
     assert state["broker"]["key"] == "alpaca-paper"
     assert state["pending_broker"] == "schwab"
     assert appmod.trader.status()["armed"] is False
+
+
+def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch, tmp_path):
+    from decimal import Decimal
+    from companion.brokers.bootstrap import AlpacaBootstrapPoller
+    from companion.brokers.models import (
+        AccountSnapshot, BalanceSnapshot, BrokerOrder, OrderClass, OrderGroup, OrderLeg,
+        OrderRole, OrderStatus, OrderType, OrdersQuery, OrderInstruction, Position,
+        TimeInForce,
+    )
+    from companion.store import Store
+
+    original = Store.for_broker
+    monkeypatch.setattr(Store, "for_broker", classmethod(
+        lambda cls, broker, account: original(broker, account, tmp_path)))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(
+        equity=Decimal("10000"), available_funds=Decimal("5000"), buying_power=Decimal("20000")),
+        (Position("AAPL", AssetType.EQUITY, PositionSide.LONG,
+                  Decimal("2"), Decimal("150")),))
+    leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY, Decimal("1"))
+    order = BrokerOrder("order-uuid", OrderStatus.WORKING, OrderType.LIMIT,
+                        TimeInForce.DAY, (leg,), OrderRole.ENTRY)
+
+    class Adapter:
+        def query(self, query):
+            return account if isinstance(query, AccountQuery) else (
+                OrderGroup("order-uuid", OrderClass.SIMPLE, OrderStatus.WORKING, (order,)),)
+
+    poller = AlpacaBootstrapPoller(Adapter())
+    try:
+        poller.poll_once()
+        state = poller.snapshot()
+        assert state["broker_ready"] is True
+        assert state["alpaca"]["positions"][0]["symbol"] == "AAPL"
+        assert state["alpaca"]["orders"][0]["id"] == "order-uuid"
+        assert state["orders"] == []  # legacy trading controls receive no actionable order
+    finally:
+        poller.stop()

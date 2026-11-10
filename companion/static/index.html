@@ -308,6 +308,17 @@
   @media (max-width: 1299px) { main { grid-template-columns: 300px minmax(0, 1fr); } main > #ticket { grid-column: 1 / -1; } main > #ticket .tk { max-width: 760px; } }
   @media (max-width: 1150px) { main { grid-template-columns: 1fr; } .bottom { grid-template-columns: 1fr; } #daylist { flex: none; max-height: 300px; } .stats { grid-template-columns: 1fr 1fr; }
     header { flex-wrap: wrap; height: auto; padding: 6px 12px; row-gap: 6px; } .metrics { grid-template-columns: 1fr 1fr; } }
+  body.alpaca-readonly .stats, body.alpaca-readonly main, body.alpaca-readonly .bottom { display: none; }
+  body.alpaca-readonly #fresh, body.alpaca-readonly #mkt-state,
+  body.alpaca-readonly #voice, body.alpaca-readonly #arm-chip,
+  body.alpaca-readonly .only-main { display: none; }
+  #alpaca-overview { display: none; margin: 18px; padding: 20px; }
+  #alpaca-overview h2 { margin: 0 0 12px; font-size: 18px; }
+  .alpaca-metrics { display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 20px; }
+  .alpaca-metrics strong { display: block; font-size: 20px; }
+  .alpaca-list { margin-bottom: 18px; overflow-x: auto; }
+  .alpaca-list table { width: 100%; border-collapse: collapse; text-align: left; }
+  .alpaca-list th, .alpaca-list td { padding: 6px 10px; border-bottom: 1px solid var(--line); }
 </style>
 <link rel="stylesheet" href="/cockpit.css">
 </head>
@@ -339,6 +350,7 @@
 <div class="banner" id="banner"></div>
 <div class="banner conn" id="conn-banner"></div>
 <div class="attn" id="attn"></div>
+<section class="panel" id="alpaca-overview" aria-label="Alpaca Paper account overview"></section>
 <div class="stats">
   <div class="stat"><div class="k" id="k-real-l">Realized today · net</div><div class="v" id="k-real">-</div><div class="s" id="k-real-s"></div></div>
   <div class="stat"><div class="k">Open P&amp;L · day trades</div><div class="v" id="k-open">-</div><div class="s" id="k-open-s"></div></div>
@@ -1200,8 +1212,30 @@ function renderUpdate(st) {
     <button type="button" class="btn sm ghost" id="update-hide">Hide</button>`;
   $("update-hide").onclick = () => { UPDATE_HIDDEN = u.version; try { localStorage.setItem("updateHidden", u.version); } catch (e) {} b.style.display = "none"; };
 }
+function renderAlpacaOverview(st) {
+  const panel = $("alpaca-overview");
+  if (st.broker?.key !== "alpaca-paper") { panel.style.display = "none"; return; }
+  panel.style.display = "block";
+  const a = st.alpaca;
+  if (!a) {
+    panel.innerHTML = `<h2>Alpaca Paper</h2><p class="mut">${esc(st.status || "Connecting")}</p>`;
+    return;
+  }
+  const positions = a.positions || [], orders = a.orders || [];
+  const rows = positions.map(p => `<tr><td>${esc(p.symbol)}</td><td>${esc(p.side)}</td><td>${esc(p.quantity)}</td><td>${esc(p.average_price)}</td></tr>`).join("");
+  const orderRows = orders.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
+  panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
+    <p class="mut">Read-only account view while paper trading workflows are being connected. Updated ${esc(new Date(a.updated_at).toLocaleTimeString())}.</p>
+    <div class="alpaca-metrics"><div>Equity<strong>${a.equity == null ? "—" : money(Number(a.equity))}</strong></div>
+      <div>Cash<strong>${a.cash == null ? "—" : money(Number(a.cash))}</strong></div>
+      <div>Buying power<strong>${a.buying_power == null ? "—" : money(Number(a.buying_power))}</strong></div></div>
+    <div class="alpaca-list"><h2>Positions (${positions.length})</h2>${positions.length ? `<table><thead><tr><th>Symbol</th><th>Side</th><th>Quantity</th><th>Average price</th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="mut">No open positions.</p>`}</div>
+    <div class="alpaca-list"><h2>Orders, last 30 days (${orders.length})</h2>${orders.length ? `<table><thead><tr><th>Symbol</th><th>Status</th><th>Type</th><th>Quantity</th></tr></thead><tbody>${orderRows}</tbody></table>` : `<p class="mut">No recent orders.</p>`}</div>`;
+}
 function render(st) {
   const broker = st.broker || {key: "schwab", name: "Schwab", mode: "live"};
+  document.body.classList.toggle("alpaca-readonly", broker.key === "alpaca-paper");
+  renderAlpacaOverview(st);
   $("broker-name").textContent = `· ${broker.name}`;
   const selector = $("broker-select");
   if (document.activeElement !== selector) selector.value = st.pending_broker || broker.key;

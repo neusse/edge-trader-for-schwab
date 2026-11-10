@@ -1,45 +1,79 @@
-"""Read-only Alpaca startup while the full polling and order paths are being migrated."""
+"""Read-only Alpaca paper polling while order workflows are migrated."""
 from __future__ import annotations
 
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .alpaca_paper import AlpacaPaperAdapter
-from .models import AccountQuery
+from .models import AccountQuery, OrdersQuery
 from ..store import Store
 
 
 class AlpacaBootstrapPoller:
-    def __init__(self):
+    def __init__(self, adapter: AlpacaPaperAdapter | None = None):
         self.store = Store(Path(":memory:"))
         self.trader = None
         self.terminal: set[str] = set()
         self.orders_today: dict[str, dict] = {}
+        self._adapter = adapter
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._state = {"status": "Alpaca Paper connecting", "booting": True,
-                       "positions": [], "orders": []}
+                       "positions": [], "orders": [], "broker_ready": False}
         self._thread: threading.Thread | None = None
+        self._verified_account: str | None = None
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._read_account, name="alpaca-paper-bootstrap", daemon=True)
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="alpaca-paper-poller", daemon=True)
         self._thread.start()
 
-    def _read_account(self) -> None:
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.poll_once()
+            self._stop.wait(10)
+
+    def poll_once(self) -> None:
         try:
-            account = AlpacaPaperAdapter().query(AccountQuery())
-            # The account identity is discovered before touching any persistent paper state.
-            scoped = Store.for_broker("alpaca-paper", account.account_ref)
-            scoped.close()
-            status = "Alpaca Paper connected; dashboard and trading integration in progress"
-            state = {"status": status, "booting": False, "positions": [], "orders": [],
-                     "account_status": account.status, "broker_ready": True}
+            if self._adapter is None:
+                self._adapter = AlpacaPaperAdapter()
+            account = self._adapter.query(AccountQuery())
+            if self._verified_account != account.account_ref:
+                # Verify ownership before presenting any data from this account.
+                scoped = Store.for_broker("alpaca-paper", account.account_ref)
+                scoped.close()
+                self._verified_account = account.account_ref
+            now = datetime.now(timezone.utc)
+            groups = self._adapter.query(OrdersQuery(now - timedelta(days=30), now))
+            positions = [{"symbol": p.symbol, "asset_type": p.asset_type.value,
+                          "side": p.side.value, "quantity": str(p.quantity),
+                          "average_price": str(p.average_price)} for p in account.positions]
+            orders = [{"id": o.order_id, "status": o.status.value,
+                       "type": o.order_type.value, "role": o.role.value,
+                       "symbols": [leg.symbol for leg in o.legs],
+                       "quantities": [str(leg.quantity) for leg in o.legs]}
+                      for group in groups for o in group.orders]
+            state = {"status": "Alpaca Paper connected; trading integration in progress",
+                     "booting": False, "positions": [], "orders": [], "broker_ready": True,
+                     "alpaca": {"account_status": account.status,
+                                "equity": str(account.balances.equity) if account.balances.equity is not None else None,
+                                "cash": str(account.balances.available_funds) if account.balances.available_funds is not None else None,
+                                "buying_power": str(account.balances.buying_power) if account.balances.buying_power is not None else None,
+                                "positions": positions, "orders": orders,
+                                "updated_at": now.isoformat()}}
         except Exception as exc:
-            state = {"status": f"Alpaca Paper: {exc}"[:200], "booting": False,
+            message = str(exc) if isinstance(exc, ValueError) else (
+                f"{type(exc).__name__}; check paper credentials and connection")
+            state = {"status": f"Alpaca Paper: {message}"[:200], "booting": False,
                      "positions": [], "orders": [], "broker_ready": False}
         with self._lock:
             self._state = state
 
     def stop(self) -> None:
+        self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
         self.store.close()
