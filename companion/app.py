@@ -69,6 +69,26 @@ class DemoPoller:
 POLLERS = {"demo": DemoPoller, "schwab": Poller, "alpaca-paper": AlpacaBootstrapPoller}
 BROKER_ACTION_LOCK = threading.RLock()
 BROKER_REQUEST_LOCK = asyncio.Lock()
+APP_WORKFLOWS = {
+    "schwab": ("schwab-ticket", "schwab-spreads"),
+    "alpaca-paper": ("equity-bracket",),
+    "demo": (),
+}
+BROKER_HELP = {
+    "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
+    "alpaca-paper": "Paper equity bracket entry is available. Equity management, options, and spreads are still being connected.",
+    "demo": "Invented demo data only. No broker orders can be sent or changed.",
+}
+
+
+def broker_info(key: str) -> dict:
+    broker = BROKERS[key]
+    workflows = tuple(workflow for workflow in APP_WORKFLOWS[key]
+                      if workflow != "schwab-spreads" or globals().get("_feature_routes"))
+    return {"key": broker.key, "name": broker.display_name, "mode": broker.mode.value,
+            "capabilities": sorted(c.value for c in broker.capabilities.supported),
+            "unsupported": {c.value: reason for c, reason in broker.capabilities.unsupported.items()},
+            "workflows": workflows, "help": BROKER_HELP[key]}
 
 
 def make_poller(broker_key: str):
@@ -217,11 +237,9 @@ def state():
     snap = poller.snapshot()
     if PRIVATE:
         snap = private_view(snap)
-    broker = BROKERS[BROKER_KEY]
     selected_broker = BROKER_KEY if DEMO_OVERRIDE else BrokerSelection().get()
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO,
-                         "broker": {"key": broker.key, "name": broker.display_name, "mode": broker.mode.value,
-                                    "capabilities": sorted(c.value for c in broker.capabilities.supported)},
+                         "broker": broker_info(BROKER_KEY),
                          "pending_broker": selected_broker if selected_broker != BROKER_KEY else None,
                          "version": __version__, "features": FEATURES}, headers={"Cache-Control": "no-store"})
 
@@ -229,9 +247,7 @@ def state():
 @app.get("/api/brokers")
 def brokers():
     return {"active": BROKER_KEY, "selected": BROKER_KEY if DEMO_OVERRIDE else BrokerSelection().get(),
-            "brokers": [{"key": b.key, "name": b.display_name, "mode": b.mode.value,
-                         "capabilities": sorted(c.value for c in b.capabilities.supported)}
-                        for b in BROKERS.values()]}
+            "brokers": [broker_info(key) for key in BROKERS]}
 
 
 @app.post("/api/brokers/select")
