@@ -91,8 +91,8 @@ class BrokerOrderService:
                                       message="Account or market verification failed; no order was sent")
             if not self.store.record_mutation(request_id, type(command).__name__, payload,
                                               client_order_id=client_order_id):
-                return MutationResult(MutationStatus.REJECTED,
-                                      message="Request or client order ID was already used")
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Another order action or request ID reserved this account")
             try:
                 result = self.adapter.execute(command)
             except Exception:

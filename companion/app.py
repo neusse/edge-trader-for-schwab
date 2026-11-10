@@ -31,7 +31,8 @@ from .view import private_view
 STATIC = Path(__file__).resolve().parent / "static"
 PORT = int(os.environ.get("COMPANION_PORT", "8770"))
 ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
-BROKER_KEY = "demo" if os.environ.get("EDGE_TRADER_DEMO") == "1" else BrokerSelection().get()
+DEMO_OVERRIDE = os.environ.get("EDGE_TRADER_DEMO") == "1"
+BROKER_KEY = "demo" if DEMO_OVERRIDE else BrokerSelection().get()
 DEMO = BROKER_KEY == "demo"     # synthetic data, no broker calls or orders
 PRIVATE = os.environ.get("EDGE_TRADER_PRIVATE") == "1"   # hide carried positions and account value
 
@@ -184,7 +185,7 @@ def state():
     if PRIVATE:
         snap = private_view(snap)
     broker = BROKERS[BROKER_KEY]
-    selected_broker = BrokerSelection().get()
+    selected_broker = BROKER_KEY if DEMO_OVERRIDE else BrokerSelection().get()
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO,
                          "broker": {"key": broker.key, "name": broker.display_name, "mode": broker.mode.value,
                                     "capabilities": sorted(c.value for c in broker.capabilities.supported)},
@@ -194,7 +195,7 @@ def state():
 
 @app.get("/api/brokers")
 def brokers():
-    return {"active": BROKER_KEY, "selected": BrokerSelection().get(),
+    return {"active": BROKER_KEY, "selected": BROKER_KEY if DEMO_OVERRIDE else BrokerSelection().get(),
             "brokers": [{"key": b.key, "name": b.display_name, "mode": b.mode.value,
                          "capabilities": sorted(c.value for c in b.capabilities.supported)}
                         for b in BROKERS.values()]}
@@ -203,6 +204,8 @@ def brokers():
 @app.post("/api/brokers/select")
 async def broker_select(request: Request):
     _guard(request)
+    if DEMO_OVERRIDE:
+        return {"ok": False, "error": "Demo mode is fixed for this run; restart without --demo to switch brokers."}
     key = (await request.json()).get("broker")
     if not isinstance(key, str) or key not in BROKERS:
         raise HTTPException(400, "unknown broker selection")

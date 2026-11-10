@@ -270,18 +270,31 @@ class Store:
 
     def record_mutation(self, request_id: str, command: str, payload: dict,
                         client_order_id: str | None = None) -> bool:
-        """Record a unique order action before it can reach the broker."""
+        """Reserve one account action atomically across store handles and processes."""
         if not request_id or len(request_id) > 128:
             raise ValueError("mutation request ID must contain 1 to 128 characters")
         ts = now_iso()
-        try:
-            with self._lock, self._con:
+        with self._lock:
+            try:
+                self._con.execute("begin immediate")
+                unresolved = self._con.execute(
+                    "select 1 from broker_mutations where status in ('SENDING', 'unknown') "
+                    "union all select 1 from tickets where status in "
+                    "('SENDING', 'UNKNOWN', 'ACCEPTED_UNTRACKED') limit 1").fetchone()
+                if unresolved:
+                    self._con.rollback()
+                    return False
                 self._con.execute(
                     "insert into broker_mutations values (?,?,?,?,?,?,?,?,?)",
                     (request_id, ts, ts, command, None, "SENDING", json.dumps(payload), None,
                      client_order_id))
-        except sqlite3.IntegrityError:
-            return False
+                self._con.commit()
+            except sqlite3.IntegrityError:
+                self._con.rollback()
+                return False
+            except Exception:
+                self._con.rollback()
+                raise
         return True
 
     def finish_mutation(self, request_id: str, status: str, order_id: str | None,

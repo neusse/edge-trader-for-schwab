@@ -72,3 +72,21 @@ def test_existing_schwab_store_binds_after_account_discovery(tmp_path):
     store.close()
     with pytest.raises(ValueError, match="different broker or account"):
         Store(path, scope=("schwab", "account-b"))
+
+
+def test_mutation_reservation_is_account_atomic_across_store_handles(tmp_path):
+    first = Store.for_broker("alpaca-paper", "account-a", tmp_path)
+    second = Store.for_broker("alpaca-paper", "account-a", tmp_path)
+    other = Store.for_broker("alpaca-paper", "account-b", tmp_path)
+    try:
+        assert first.record_mutation("request-a", "SubmitOrder", {}, "client-a")
+        assert not second.record_mutation("request-b", "CancelOrder", {})
+        assert other.record_mutation("request-b", "CancelOrder", {})
+        first.finish_mutation("request-a", "unknown", None)
+        assert not second.record_mutation("request-c", "SubmitOrder", {}, "client-c")
+        first.finish_mutation("request-a", "accepted", "order-a")
+        assert second.record_mutation("request-c", "SubmitOrder", {}, "client-c")
+    finally:
+        first.close()
+        second.close()
+        other.close()

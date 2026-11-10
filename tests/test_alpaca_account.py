@@ -158,6 +158,25 @@ def test_broker_selection_persists_without_reusing_current_runtime(monkeypatch, 
     assert appmod.trader.status()["armed"] is False
 
 
+def test_demo_override_never_shows_or_persists_another_broker(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    from companion import app as appmod
+    from companion.brokers.configuration import BrokerSelection
+
+    selection = BrokerSelection(tmp_path / "broker-selection.json")
+    monkeypatch.setattr(appmod, "BrokerSelection", lambda: selection)
+    monkeypatch.setattr(appmod, "DEMO_OVERRIDE", True)
+    monkeypatch.setattr(appmod, "BROKER_KEY", "demo")
+    monkeypatch.setattr(appmod, "DEMO", True)
+    client = TestClient(appmod.app, base_url="http://127.0.0.1:8770")
+    assert client.get("/api/state").json()["pending_broker"] is None
+    assert client.get("/api/brokers").json()["selected"] == "demo"
+    result = client.post("/api/brokers/select", json={"broker": "alpaca-paper"},
+                         headers={"X-Companion": "1"}).json()
+    assert result["ok"] is False
+    assert not selection.path.exists()
+
+
 def test_paper_poller_builds_read_only_snapshot_from_canonical_data(monkeypatch, tmp_path):
     from decimal import Decimal
     from companion.brokers.bootstrap import AlpacaBootstrapPoller

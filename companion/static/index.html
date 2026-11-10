@@ -1247,6 +1247,8 @@ function render(st) {
   $("broker-name").textContent = `· ${broker.name}`;
   const selector = $("broker-select");
   if (document.activeElement !== selector) selector.value = st.pending_broker || broker.key;
+  selector.disabled = !!st.demo;
+  selector.title = st.demo ? "Restart without --demo to switch brokers" : "Choose a broker; restart Edge Trader to activate it";
   const mode = $("broker-mode");
   mode.style.display = broker.mode === "paper" ? "" : "none";
   mode.textContent = broker.mode === "paper" ? "PAPER" : "";
