@@ -162,7 +162,7 @@ class Position:
     asset_type: AssetType
     side: PositionSide
     quantity: Decimal
-    average_price: Decimal
+    average_price: Decimal | None
     underlying: str | None = None
     previous_session_quantity: Decimal | None = None
     current_day_cost: Decimal | None = None
@@ -229,7 +229,7 @@ class OrderGroup:
 @dataclass(frozen=True)
 class Fill:
     activity_id: BrokerActivityId
-    order_id: BrokerOrderId
+    order_id: BrokerOrderId | None
     symbol: str
     asset_type: AssetType
     instruction: OrderInstruction
