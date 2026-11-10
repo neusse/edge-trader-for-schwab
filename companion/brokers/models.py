@@ -22,6 +22,7 @@ class BrokerMode(str, Enum):
 class BrokerCapability(str, Enum):
     ACCOUNT_READ = "account-read"
     ORDER_READ = "order-read"
+    CLIENT_ORDER_LOOKUP = "client-order-lookup"
     FILL_READ = "fill-read"
     EQUITY_MARKET_DATA = "equity-market-data"
     OPTION_MARKET_DATA = "option-market-data"
@@ -114,12 +115,17 @@ class OrderClass(str, Enum):
     SIMPLE = "simple"
     BRACKET = "bracket"
     OCO = "oco"
+    OTO = "oto"
     MULTI_LEG = "multi-leg"
 
 
 class TimeInForce(str, Enum):
     DAY = "day"
     GTC = "gtc"
+    OPG = "opg"
+    CLS = "cls"
+    IOC = "ioc"
+    FOK = "fok"
 
 
 class OrderStatus(str, Enum):
@@ -157,7 +163,7 @@ class Position:
     asset_type: AssetType
     side: PositionSide
     quantity: Decimal
-    average_price: Decimal
+    average_price: Decimal | None
     underlying: str | None = None
     previous_session_quantity: Decimal | None = None
     current_day_cost: Decimal | None = None
@@ -224,7 +230,7 @@ class OrderGroup:
 @dataclass(frozen=True)
 class Fill:
     activity_id: BrokerActivityId
-    order_id: BrokerOrderId
+    order_id: BrokerOrderId | None
     symbol: str
     asset_type: AssetType
     instruction: OrderInstruction
@@ -268,6 +274,7 @@ class OptionContract:
     tradable: bool = True
     quote: Quote | None = None
     open_interest: Decimal | None = None
+    implied_volatility: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +315,11 @@ class OrderQuery:
 
 
 @dataclass(frozen=True)
+class ClientOrderQuery:
+    client_order_id: str
+
+
+@dataclass(frozen=True)
 class FillsQuery:
     start: datetime
     end: datetime
@@ -340,6 +352,7 @@ BrokerQuery: TypeAlias = (
     AccountQuery
     | OrdersQuery
     | OrderQuery
+    | ClientOrderQuery
     | FillsQuery
     | QuotesQuery
     | MarketSessionsQuery

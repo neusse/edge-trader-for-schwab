@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Edge Trader for Schwab</title>
+<title>Edge Trader</title>
 <link rel="icon" type="image/png" sizes="64x64" href="/icon.png?v=2">
 <link rel="icon" href="/favicon.ico?v=2" sizes="any">
 <!-- Inter (text) and JetBrains Mono (numbers). Offline, the page falls back to Segoe UI / Consolas. -->
@@ -308,13 +308,30 @@
   @media (max-width: 1299px) { main { grid-template-columns: 300px minmax(0, 1fr); } main > #ticket { grid-column: 1 / -1; } main > #ticket .tk { max-width: 760px; } }
   @media (max-width: 1150px) { main { grid-template-columns: 1fr; } .bottom { grid-template-columns: 1fr; } #daylist { flex: none; max-height: 300px; } .stats { grid-template-columns: 1fr 1fr; }
     header { flex-wrap: wrap; height: auto; padding: 6px 12px; row-gap: 6px; } .metrics { grid-template-columns: 1fr 1fr; } }
+  body.alpaca-readonly .stats, body.alpaca-readonly main, body.alpaca-readonly .bottom { display: none; }
+  body.alpaca-readonly #fresh, body.alpaca-readonly #mkt-state,
+  body.alpaca-readonly #voice, body.alpaca-readonly #arm-chip,
+  body.alpaca-readonly .only-main { display: none; }
+  #alpaca-overview { display: none; margin: 18px; padding: 20px; }
+  #alpaca-overview h2 { margin: 0 0 12px; font-size: 18px; }
+  .alpaca-metrics { display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 20px; }
+  .alpaca-metrics strong { display: block; font-size: 20px; }
+  .alpaca-list { margin-bottom: 18px; overflow-x: auto; }
+  .alpaca-list table { width: 100%; border-collapse: collapse; text-align: left; }
+  .alpaca-list th, .alpaca-list td { padding: 6px 10px; border-bottom: 1px solid var(--line); }
 </style>
 <link rel="stylesheet" href="/cockpit.css">
 </head>
 <body>
 <header>
-  <h1>Edge Trader <span style="font-weight:500;color:var(--muted)">for Schwab</span></h1>
-  <span class="health" id="health" title="Connection: browser to companion server to Schwab">CONNECTING</span>
+  <h1>Edge Trader <span id="broker-name" style="font-weight:500;color:var(--muted)"></span></h1>
+  <select id="broker-select" class="pill" aria-label="Select broker" title="Choose a broker; restart Edge Trader to activate it">
+    <option value="alpaca-paper">Alpaca Paper</option>
+    <option value="schwab">Schwab</option>
+    <option value="demo">Demo</option>
+  </select>
+  <span class="pill warn" id="broker-mode" style="display:none"></span>
+  <span class="health" id="health" title="Connection: browser to companion server to selected broker">CONNECTING</span>
   <div class="fresh" id="fresh"></div>
   <span class="pill" id="status">starting</span>
   <span class="sp"></span>
@@ -333,6 +350,7 @@
 <div class="banner" id="banner"></div>
 <div class="banner conn" id="conn-banner"></div>
 <div class="attn" id="attn"></div>
+<section class="panel" id="alpaca-overview" aria-label="Alpaca Paper account overview"></section>
 <div class="stats">
   <div class="stat"><div class="k" id="k-real-l">Realized today · net</div><div class="v" id="k-real">-</div><div class="s" id="k-real-s"></div></div>
   <div class="stat"><div class="k">Open P&amp;L · day trades</div><div class="v" id="k-open">-</div><div class="s" id="k-open-s"></div></div>
@@ -1194,7 +1212,47 @@ function renderUpdate(st) {
     <button type="button" class="btn sm ghost" id="update-hide">Hide</button>`;
   $("update-hide").onclick = () => { UPDATE_HIDDEN = u.version; try { localStorage.setItem("updateHidden", u.version); } catch (e) {} b.style.display = "none"; };
 }
+function renderAlpacaOverview(st) {
+  const panel = $("alpaca-overview");
+  if (st.broker?.key !== "alpaca-paper") { panel.style.display = "none"; return; }
+  panel.style.display = "block";
+  const a = st.alpaca;
+  if (!a) {
+    panel.innerHTML = `<h2>Alpaca Paper</h2><p class="mut">${esc(st.status || "Connecting")}</p>`;
+    return;
+  }
+  const positions = st.positions || [], working = st.orders || [], recent = a.orders || [];
+  const realized = st.summary?.realized?.securities;
+  const open = st.summary?.open_pnl;
+  const rows = positions.map(p => `<tr><td>${esc(p.display)}</td><td>${esc(p.side)}</td><td>${esc(p.qty)}</td><td>${p.avg_price == null ? "—" : money(p.avg_price)}</td>
+    <td>${p.last == null ? "—" : money(p.last)}${p.quote_stale ? " <small>(stale)</small>" : ""}<br><small>${esc(p.quote_source || "No quote")}</small></td>
+    <td>${p.open_pnl == null ? "—" : money(p.open_pnl)}</td><td>${esc(p.protection)}${p.stop_qty ? ` (${esc(p.stop_qty)}/${esc(p.qty)})` : ""}</td></tr>`).join("");
+  const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td></tr>`).join("");
+  const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
+  panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
+    <p class="mut">Read-only account view while paper trading workflows are being connected. Updated ${esc(new Date(a.updated_at).toLocaleTimeString())}.</p>
+    <div class="alpaca-metrics"><div>Equity<strong>${a.equity == null ? "—" : money(Number(a.equity))}</strong></div>
+      <div>Cash<strong>${a.cash == null ? "—" : money(Number(a.cash))}</strong></div>
+      <div>Buying power<strong>${a.buying_power == null ? "—" : money(Number(a.buying_power))}</strong></div>
+      <div>Open P&amp;L<strong>${open?.complete ? money(open.intraday + open.mixed + open.carried) : "Incomplete"}</strong></div>
+      <div>Realized today<strong>${realized?.complete ? money(realized.net) : "Incomplete"}</strong></div></div>
+    <div class="alpaca-list"><h2>Positions (${positions.length})</h2>${positions.length ? `<table><thead><tr><th>Symbol</th><th>Side</th><th>Quantity</th><th>Average</th><th>Mark / source</th><th>Open P&amp;L</th><th>Stop coverage</th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="mut">No open positions.</p>`}</div>
+    <div class="alpaca-list"><h2>Working orders (${working.length})</h2>${working.length ? `<table><thead><tr><th>Symbol</th><th>Role</th><th>Status</th><th>Type</th><th>Remaining</th></tr></thead><tbody>${workingRows}</tbody></table>` : `<p class="mut">No working orders.</p>`}</div>
+    <div class="alpaca-list"><h2>Orders, last 30 days (${recent.length})</h2>${recent.length ? `<table><thead><tr><th>Symbol</th><th>Status</th><th>Type</th><th>Quantity</th></tr></thead><tbody>${orderRows}</tbody></table>` : `<p class="mut">No recent orders.</p>`}</div>`;
+}
 function render(st) {
+  const broker = st.broker || {key: "schwab", name: "Schwab", mode: "live"};
+  document.body.classList.toggle("alpaca-readonly", broker.key === "alpaca-paper");
+  renderAlpacaOverview(st);
+  $("broker-name").textContent = `· ${broker.name}`;
+  const selector = $("broker-select");
+  if (document.activeElement !== selector) selector.value = st.pending_broker || broker.key;
+  selector.disabled = !!st.demo;
+  selector.title = st.demo ? "Restart without --demo to switch brokers" : "Choose a broker; restart Edge Trader to activate it";
+  const mode = $("broker-mode");
+  mode.style.display = broker.mode === "paper" ? "" : "none";
+  mode.textContent = broker.mode === "paper" ? "PAPER" : "";
+  $("auth").style.display = broker.key === "schwab" ? "" : "none";
   renderUpdate(st);
   $("status").textContent = st.demo ? "DEMO: invented data, no orders" : (st.status || "starting");
   $("status").className = "pill" + (st.status === "live" && !st.demo ? "" : " warn");
@@ -1204,7 +1262,8 @@ function render(st) {
   $("auth").textContent = hl == null ? "login ?" : hl > 48 ? `Login ${Math.floor(hl / 24)}d left` : `Login ${Math.floor(hl)}h left`;
   $("auth").className = "pill" + (hl == null || hl < 4 ? " bad" : hl < 24 ? " warn" : "");
   const banner = $("banner");
-  if (st.status && st.status !== "live" && !st.booting) { banner.style.display = "block"; banner.textContent = st.status; }
+  if (st.pending_broker) { banner.style.display = "block"; banner.textContent = `${st.pending_broker} selected. Restart Edge Trader to activate this broker.`; }
+  else if (st.status && st.status !== "live" && !st.booting) { banner.style.display = "block"; banner.textContent = st.status; }
   else banner.style.display = "none";
   if (!st.summary) return;
 
@@ -1304,6 +1363,25 @@ const post = (url, body, ms = 25000) => {
     body: JSON.stringify(body || {}), signal: ctl.signal})
     .then(r => r.json()).finally(() => clearTimeout(timer));
 };
+$("broker-select").addEventListener("change", async e => {
+  const selector = e.currentTarget;
+  selector.disabled = true;
+  try {
+    const result = await post("/api/brokers/select", {broker: selector.value});
+    if (!result.ok) throw new Error(result.detail || result.error || "Could not save broker selection");
+    if (result.restart_required) {
+      const banner = $("banner");
+      banner.style.display = "block";
+      banner.textContent = `${selector.options[selector.selectedIndex].text} selected. Restart Edge Trader to activate it.`;
+    }
+    await tick();
+  } catch (err) {
+    selector.value = lastState?.broker?.key || "alpaca-paper";
+    const banner = $("banner");
+    banner.style.display = "block";
+    banner.textContent = String(err.message || err);
+  } finally { selector.disabled = false; }
+});
 function riskValue() {
   const c = parseFloat($("t-risk-custom").value);
   return c > 0 ? c : T.risk;
@@ -1840,13 +1918,18 @@ const ageS = iso => iso ? (Date.now() - new Date(iso).getTime()) / 1000 : Infini
 let HEALTH = "connecting";
 function updateHealth() {
   const el = $("health"), banner = $("conn-banner");
+  const broker = lastState?.broker;
+  const brokerName = broker?.name || "broker";
   const browserAge = lastOk ? (Date.now() - lastOk) / 1000 : Infinity;
   let state, text, why = "";
   if (browserAge > 7) {
     state = "down";
     text = lastOk ? `DISCONNECTED · ${Math.round(browserAge)}s` : "DISCONNECTED";
-    why = "Companion server not responding. Restart it from the desktop shortcut. "
-        + "Your orders at Schwab are not affected; manage them in thinkorswim meanwhile.";
+    why = `Companion server not responding. Restart it from the desktop shortcut. Check open orders directly with ${brokerName}.`;
+  } else if (broker?.key === "alpaca-paper") {
+    state = "stale";
+    text = lastState?.broker_ready ? "PAPER · READ ONLY" : "PAPER · CONNECTING";
+    why = lastState?.status || "Connecting to Alpaca Paper";
   } else {
     const f = lastState?.freshness || {};
     const schwabAge = Math.max(ageS(f.account?.ok_at), ageS(f.orders_today?.ok_at));
@@ -1854,8 +1937,8 @@ function updateHealth() {
     const pollerAge = ageS(lastState?.last_rebuild);
     if (err || schwabAge > 20 || pollerAge > 20 || (lastState?.status && lastState.status !== "live")) {
       state = "stale";
-      text = err ? "SCHWAB ERROR" : `STALE · ${Math.round(Math.min(Math.max(schwabAge, pollerAge), 999))}s`;
-      why = err ? `Schwab: ${err}` : `Data from Schwab is ${Math.round(schwabAge)}s old (${lastState?.status || ""}).`;
+      text = err ? `${brokerName.toUpperCase()} ERROR` : `STALE · ${Math.round(Math.min(Math.max(schwabAge, pollerAge), 999))}s`;
+      why = err ? `${brokerName}: ${err}` : `Data from ${brokerName} is ${Math.round(schwabAge)}s old (${lastState?.status || ""}).`;
     } else {
       state = "live";
       text = `LIVE · ${Math.round(Math.max(browserAge, schwabAge))}s`;
@@ -1864,7 +1947,7 @@ function updateHealth() {
   HEALTH = state;
   el.className = `health ${state}`;
   el.textContent = text;
-  el.title = why || "Browser, companion server and Schwab data are all current.";
+  el.title = why || `Browser, companion server and ${brokerName} data are all current.`;
   banner.style.display = state === "down" ? "block" : "none";
   banner.textContent = state === "down" ? why : "";
   if (state === "down") { document.title = "DISCONNECTED · Edge Trader"; $("status").style.display = "none"; }
@@ -2004,6 +2087,7 @@ $("voice").addEventListener("click", e => {
   try { localStorage.setItem("voiceAlert", VOICE_ON ? "on" : "off"); } catch (err) {}
   updateVoiceBtn();
   if (VOICE_ON) speak("Voice on.");
+  else if ("speechSynthesis" in window) speechSynthesis.cancel();
 });
 function updateClock() {
   const now = new Date();

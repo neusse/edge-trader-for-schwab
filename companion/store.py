@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -46,6 +47,10 @@ create table if not exists tickets (
 create table if not exists settings (key text primary key, value text);
 create table if not exists actions (
     created text, kind text, symbol text, order_id integer, status text, detail text);
+create table if not exists broker_mutations (
+    request_id text primary key, created text not null, updated text not null,
+    command text not null, order_id text, status text not null,
+    payload text not null, message text, client_order_id text);
 create table if not exists auto_be (
     ticket_id text primary key, symbol text, state text, created text, updated text, detail text);
 create table if not exists auto_be_orders (
@@ -57,6 +62,13 @@ create index if not exists ix_tx_time on transactions(time);
 create index if not exists ix_quotes on quotes(symbol, seen_at);
 """
 
+# New broker-scoped databases accept opaque UUID identifiers. The existing Schwab database
+# keeps its original integer-primary-key schema and is never rewritten in place.
+SCOPED_SCHEMA = SCHEMA.replace("activity_id integer", "activity_id text").replace(
+    "order_id integer", "order_id text"
+)
+_SCOPE_KEY = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -67,12 +79,56 @@ def _hash(obj) -> str:
 
 
 class Store:
-    def __init__(self, path: Path = DB):
+    def __init__(self, path: Path = DB, *, scope: tuple[str, str] | None = None):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._con = sqlite3.connect(path, check_same_thread=False)
-        self._con.executescript(SCHEMA)
+        self._con.executescript(SCOPED_SCHEMA if scope and scope[0] != "schwab" else SCHEMA)
+        columns = {row[1] for row in self._con.execute("pragma table_info(broker_mutations)")}
+        if "client_order_id" not in columns:
+            self._con.execute("alter table broker_mutations add column client_order_id text")
+        self._con.execute("create unique index if not exists ix_mutation_client_id "
+                          "on broker_mutations(client_order_id)")
+        self._con.commit()
         self._lock = threading.Lock()
+        self.scope = None
+        if scope:
+            try:
+                self.bind_scope(*scope)
+            except Exception:
+                self._con.close()
+                raise
         self._last_positions_hash: str | None = None
+
+    def bind_scope(self, broker: str, account: str) -> None:
+        """Pin an existing database to the account discovered at broker connection."""
+        if not _SCOPE_KEY.fullmatch(broker) or not account:
+            raise ValueError("invalid broker or account scope")
+        with self._lock, self._con:
+            self._con.execute("create table if not exists store_scope (broker text not null, account text not null)")
+            rows = self._con.execute("select broker, account from store_scope").fetchall()
+            if rows and rows != [(broker, account)]:
+                raise ValueError("database belongs to a different broker or account")
+            if not rows:
+                self._con.execute("insert into store_scope values (?,?)", (broker, account))
+        self.scope = (broker, account)
+
+    @classmethod
+    def for_broker(cls, broker: str, account: str, root: Path = DB.parent) -> Store:
+        """Open isolated state for one broker/account without putting account IDs in filenames.
+
+        Schwab's legacy database remains at its original location. Its first scoped open
+        binds it to the selected account, preventing accidental reuse for another account.
+        """
+        if not _SCOPE_KEY.fullmatch(broker) or not account:
+            raise ValueError("invalid broker or account scope")
+        if broker == "schwab":
+            return cls(root / "companion.db", scope=(broker, account))
+        digest = hashlib.sha256(account.encode("utf-8")).hexdigest()[:24]
+        return cls(root / f"{broker}-{digest}.db", scope=(broker, account))
+
+    def close(self) -> None:
+        with self._lock:
+            self._con.close()
 
     def _upsert(self, table: str, vtable: str, key: str, key_val, extra: dict, payload) -> None:
         h = _hash(payload)
@@ -137,7 +193,7 @@ class Store:
 
     # ---- order tickets (the only records of what the companion sent) ----
 
-    def log_action(self, kind: str, symbol: str | None, order_id: int | None, status: str,
+    def log_action(self, kind: str, symbol: str | None, order_id: str | int | None, status: str,
                    detail: str | None = None) -> None:
         with self._lock, self._con:
             self._con.execute("insert into actions values (?,?,?,?,?,?)",
@@ -172,7 +228,7 @@ class Store:
             return False
         return True
 
-    def update_ticket(self, ticket_id: str, status: str, order_id: int | None = None,
+    def update_ticket(self, ticket_id: str, status: str, order_id: str | int | None = None,
                       detail: str | None = None) -> None:
         with self._lock, self._con:
             self._con.execute(
@@ -212,6 +268,72 @@ class Store:
             row = cur.fetchone()
         return dict(zip(cols, row)) if row else None
 
+    def record_mutation(self, request_id: str, command: str, payload: dict,
+                        client_order_id: str | None = None) -> bool:
+        """Reserve one account action atomically across store handles and processes."""
+        if not request_id or len(request_id) > 128:
+            raise ValueError("mutation request ID must contain 1 to 128 characters")
+        ts = now_iso()
+        with self._lock:
+            try:
+                self._con.execute("begin immediate")
+                unresolved = self._con.execute(
+                    "select 1 from broker_mutations where status in ('SENDING', 'unknown') "
+                    "union all select 1 from tickets where status in "
+                    "('SENDING', 'UNKNOWN', 'ACCEPTED_UNTRACKED') limit 1").fetchone()
+                if unresolved:
+                    self._con.rollback()
+                    return False
+                self._con.execute(
+                    "insert into broker_mutations values (?,?,?,?,?,?,?,?,?)",
+                    (request_id, ts, ts, command, None, "SENDING", json.dumps(payload), None,
+                     client_order_id))
+                self._con.commit()
+            except sqlite3.IntegrityError:
+                self._con.rollback()
+                return False
+            except Exception:
+                self._con.rollback()
+                raise
+        return True
+
+    def finish_mutation(self, request_id: str, status: str, order_id: str | None,
+                        message: str | None = None) -> None:
+        with self._lock, self._con:
+            cur = self._con.execute(
+                "update broker_mutations set updated=?, status=?, order_id=coalesce(?, order_id), "
+                "message=? where request_id=?",
+                (now_iso(), status, order_id, message, request_id))
+            if cur.rowcount != 1:
+                raise KeyError("mutation request ID does not exist")
+
+    def get_mutation(self, request_id: str) -> dict | None:
+        with self._lock:
+            cur = self._con.execute(
+                "select request_id, command, order_id, status, payload, message "
+                "from broker_mutations where request_id=?", (request_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        names = ("request_id", "command", "order_id", "status", "payload", "message")
+        result = dict(zip(names, row))
+        result["payload"] = json.loads(result["payload"])
+        return result
+
+    def get_mutation_by_client_id(self, client_order_id: str) -> dict | None:
+        with self._lock:
+            row = self._con.execute(
+                "select request_id from broker_mutations where client_order_id=?",
+                (client_order_id,)).fetchone()
+        return self.get_mutation(row[0]) if row else None
+
+    def open_mutations(self) -> list[dict]:
+        with self._lock:
+            rows = self._con.execute(
+                "select request_id, command, order_id, status from broker_mutations "
+                "where status in ('SENDING', 'unknown') order by created").fetchall()
+        return [dict(zip(("request_id", "command", "order_id", "status"), row)) for row in rows]
+
     # ---- auto B/E: one stop move per ticket, PENDING -> SENDING -> DONE | FAILED | SKIPPED ----
 
     def add_auto_be(self, ticket_id: str, symbol: str) -> None:
@@ -238,7 +360,7 @@ class Store:
                 (state, (detail or "")[:1000] or None, now_iso(), ticket_id) + ((only_from,) if only_from else ()))
         return cur.rowcount == 1
 
-    def link_auto_be(self, symbol: str, order_id: int, since: str) -> list[str]:
+    def link_auto_be(self, symbol: str, order_id: str | int, since: str) -> list[str]:
         """An exit order the companion itself rebuilt (new target, partial, set stop) carries on
         the stop of every Auto B/E ticket on the symbol since `since` that has not moved yet
         (PENDING, or SENDING: claimed and waiting for the rebuild to release the order lock).
@@ -253,7 +375,7 @@ class Store:
                                   [(t, order_id, ts) for t in ids])
         return ids
 
-    def record_stop(self, symbol: str, stop, order_id: int) -> None:
+    def record_stop(self, symbol: str, stop, order_id: str | int) -> None:
         """A fixed stop Schwab accepted from the companion (order_id: the stop, or the OCO it went
         in). The first one after a stopless ticket's fill that worked gives that ticket its frozen
         R (Trader.r_basis)."""
@@ -261,7 +383,7 @@ class Store:
             self._con.execute("insert into companion_stops values (?,?,?,?)",
                               (symbol, str(stop), order_id, now_iso()))
 
-    def stops_since(self, symbol: str, since: str) -> list[tuple[str, int]]:
+    def stops_since(self, symbol: str, since: str) -> list[tuple[str, str | int]]:
         """(stop, order_id) of the companion's stops on `symbol` recorded after `since`, oldest first."""
         with self._lock:
             rows = self._con.execute("select stop, order_id from companion_stops where symbol=? and created>? "
@@ -302,17 +424,17 @@ class Store:
                                   "and state in ('PENDING', 'SENDING')", [(detail, now_iso(), t) for t in ids])
         return ids
 
-    def auto_be_orders(self, ticket_id: str) -> list[int]:
+    def auto_be_orders(self, ticket_id: str) -> list[str | int]:
         with self._lock:
             rows = self._con.execute("select order_id from auto_be_orders where ticket_id=?", (ticket_id,)).fetchall()
         return [r[0] for r in rows]
 
-    def claimed_order_ids(self) -> set[int]:
+    def claimed_order_ids(self) -> set[str | int]:
         with self._lock:
             rows = self._con.execute("select order_id from tickets where order_id is not null").fetchall()
         return {r[0] for r in rows}
 
-    def get_order(self, order_id: int) -> dict | None:
+    def get_order(self, order_id: str | int) -> dict | None:
         """The latest saved version of one top-level order, or None."""
         with self._lock:
             row = self._con.execute("select payload from orders where order_id = ?", (order_id,)).fetchone()

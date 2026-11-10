@@ -175,7 +175,14 @@ class Poller:
             self.client = None   # retry discovery next time; never poll without an account
             self.status = "could not list linked accounts"
             return False
-        self.account_hash = accts[0]["hashValue"]
+        account_hash = accts[0]["hashValue"]
+        try:
+            self.store.bind_scope("schwab", account_hash)
+        except ValueError as exc:
+            self.client = None
+            self.status = f"account storage: {exc}"
+            return False
+        self.account_hash = account_hash
         if self.trader is not None:
             self.trader.expected_hash = self.account_hash      # orders only to the account shown
         return True
