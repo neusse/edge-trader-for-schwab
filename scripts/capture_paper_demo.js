@@ -37,4 +37,8 @@ async (page) => {
   await page.locator("#alpaca-overview").screenshot({
     path: "docs/screenshot-alpaca-paper-demo.png", scale: "css",
   });
+  await page.locator("#paper-entry").screenshot({
+    path: "docs/screenshot-paper-entry-demo.png", scale: "css",
+  });
+  if (!(await page.locator("#paper-entry").isVisible())) throw new Error("Paper entry form is hidden");
 }

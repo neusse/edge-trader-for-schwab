@@ -13,8 +13,10 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -24,6 +26,9 @@ from . import __version__
 from .brokers.capabilities import BROKERS
 from .brokers.configuration import BrokerSelection
 from .brokers.bootstrap import AlpacaBootstrapPoller
+from .brokers.models import (AccountQuery, AssetType, OrderStatus, OrdersQuery,
+                             QuotesQuery, SubmitOrder)
+from .brokers.paper_equity import entry_plan
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -220,6 +225,8 @@ async def broker_select(request: Request):
     if not isinstance(key, str) or key not in BROKERS:
         raise HTTPException(400, "unknown broker selection")
     trader.arm(False, reason="broker selection")
+    if isinstance(poller, AlpacaBootstrapPoller) and poller.order_service is not None:
+        poller.order_service.arm(False)
     UI["sel"] = None
     UI["sel_seq"] += 1
     BrokerSelection().set(key)
@@ -227,6 +234,128 @@ async def broker_select(request: Request):
     # process restart activates the persisted choice with a fresh poller and disarmed trader.
     return {"ok": True, "active": BROKER_KEY, "selected": key,
             "restart_required": key != BROKER_KEY}
+
+
+def _paper_service():
+    if (BROKER_KEY != "alpaca-paper" or BrokerSelection().get() != BROKER_KEY or
+            not isinstance(poller, AlpacaBootstrapPoller) or poller.order_service is None):
+        raise HTTPException(409, "Alpaca Paper is not the active selected broker")
+    snap = poller.snapshot()
+    account = snap.get("alpaca") or {}
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(account["updated_at"])).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        age = float("inf")
+    if not snap.get("broker_ready") or not 0 <= age <= 30 or account.get("account_status", "").upper() != "ACTIVE":
+        raise HTTPException(409, "Alpaca Paper account data is not fresh and ready")
+    return poller.order_service, snap
+
+
+def _paper_entry(body: dict, for_submit: bool = False):
+    service, snap = _paper_service()
+    symbol = body.get("symbol") if isinstance(body, dict) else None
+    if not isinstance(symbol, str) or not symbol:
+        raise ValueError("an equity symbol is required")
+    if any(p["symbol"] == symbol for p in snap["alpaca"]["positions"]):
+        raise ValueError("bracket entry requires a flat symbol; manage the existing position first")
+    if any(symbol in o["symbols"] and o["status"] in ("pending", "working", "partially-filled")
+           for o in snap["alpaca"]["orders"]):
+        raise ValueError("an order is already active for this symbol")
+    if for_submit:
+        # The dashboard may be ten seconds behind an external account action.
+        account = service.adapter.query(AccountQuery())
+        if account.account_ref != service.account_ref or any(
+                p.symbol == symbol for p in account.positions):
+            raise ValueError("account or position changed; refresh before ordering")
+        now = datetime.now(timezone.utc)
+        active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                            OrderStatus.PARTIALLY_FILLED))
+        groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                   statuses=active))
+        if any(symbol == leg.symbol for group in groups for order in group.orders
+               if order.status in active for leg in order.legs):
+            raise ValueError("an order is already active for this symbol")
+    quote = service.adapter.query(QuotesQuery((symbol,), AssetType.EQUITY)).get(symbol)
+    intent = entry_plan(body, quote)
+    return service, intent, quote
+
+
+@app.get("/api/paper/status")
+def paper_status():
+    service, _ = _paper_service()
+    return {"ok": True, "armed": service.armed,
+            "unresolved": [{"request_id": row["request_id"], "command": row["command"]}
+                           for row in service.store.open_mutations()]}
+
+
+@app.post("/api/paper/arm")
+async def paper_arm(request: Request):
+    _guard(request)
+    body = await request.json()
+    if not isinstance(body, dict) or type(body.get("armed")) is not bool:
+        raise HTTPException(400, "armed must be true or false")
+    service, _ = _paper_service()
+    service.arm(body["armed"])
+    if BrokerSelection().get() != BROKER_KEY:
+        service.arm(False)
+        raise HTTPException(409, "Broker selection changed; paper entries are disarmed")
+    return {"ok": True, "armed": service.armed}
+
+
+@app.post("/api/paper/entry/preview")
+async def paper_entry_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, quote = await run_in_threadpool(_paper_entry, await request.json())
+        return {"ok": True, "symbol": intent.entry.leg.symbol,
+                "side": intent.entry.leg.instruction.value,
+                "quantity": str(intent.entry.leg.quantity),
+                "entry": intent.entry.order_type.value,
+                "limit_price": str(intent.entry.limit_price) if intent.entry.limit_price else None,
+                "quote": str(quote.mark or quote.last), "quote_source": quote.source,
+                "target": str(intent.take_profit_price), "stop": str(intent.stop_loss.stop_price),
+                "protection": "Broker-held bracket target and stop after entry fills"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper quote or account verification failed; no order was sent"}
+
+
+@app.post("/api/paper/entry/submit")
+async def paper_entry_submit(request: Request):
+    _guard(request)
+    body = await request.json()
+    try:
+        if not isinstance(body, dict):
+            raise ValueError("entry request must be an object")
+        request_id = str(UUID(str(body.get("request_id"))))
+        service, intent, _ = await run_in_threadpool(_paper_entry, body, True)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper preflight failed; no order was sent"}
+    result = await run_in_threadpool(service.execute, SubmitOrder(intent), request_id)
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+@app.post("/api/paper/entry/reconcile")
+async def paper_entry_reconcile(request: Request):
+    _guard(request)
+    try:
+        request_id = str(UUID(str((await request.json()).get("request_id"))))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(400, "request_id must be a UUID") from None
+    service, _ = _paper_service()
+    result = await run_in_threadpool(service.reconcile_submit, request_id)
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
 
 
 @app.post("/api/ui/select")

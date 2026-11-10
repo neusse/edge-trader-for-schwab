@@ -313,6 +313,11 @@
   body.alpaca-readonly #voice, body.alpaca-readonly #arm-chip,
   body.alpaca-readonly .only-main { display: none; }
   #alpaca-overview { display: none; margin: 18px; padding: 20px; }
+  #paper-entry { display: none; margin: 0 18px 18px; padding: 20px; }
+  #paper-entry .paper-fields { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  #paper-entry label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  #paper-entry .in { width: 115px; }
+  #paper-entry .paper-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
   #alpaca-overview h2 { margin: 0 0 12px; font-size: 18px; }
   .alpaca-metrics { display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 20px; }
   .alpaca-metrics strong { display: block; font-size: 20px; }
@@ -351,6 +356,25 @@
 <div class="banner conn" id="conn-banner"></div>
 <div class="attn" id="attn"></div>
 <section class="panel" id="alpaca-overview" aria-label="Alpaca Paper account overview"></section>
+<section class="panel" id="paper-entry" aria-label="Alpaca Paper equity bracket entry">
+  <h2>Paper equity bracket entry</h2>
+  <p class="mut">One target and one fixed stop are held by Alpaca after entry fills. Existing positions, active orders, options, trailing stops, and two targets are unavailable in this form.</p>
+  <form id="paper-form">
+    <div class="paper-fields">
+      <label>Symbol<input class="in" name="symbol" required maxlength="10" placeholder="AAPL" autocomplete="off"></label>
+      <label>Side<select class="in" name="side"><option value="long">Long</option><option value="short">Short</option></select></label>
+      <label>Shares<input class="in" name="quantity" required type="number" min="1" max="10000" step="1" value="1"></label>
+      <label>Entry<select class="in" name="order_type"><option value="limit">Limit</option><option value="market">Market</option></select></label>
+      <label>Limit price<input class="in" name="limit_price" type="number" min="0.01" step="0.01" required></label>
+      <label>Target price<input class="in" name="target_price" type="number" min="0.01" step="0.01" required></label>
+      <label>Stop price<input class="in" name="stop_price" type="number" min="0.01" step="0.01" required></label>
+    </div>
+    <div class="paper-actions"><button type="button" class="btn" id="paper-arm">Arm paper entries</button>
+      <button type="submit" class="btn" id="paper-submit" disabled>Review paper order</button>
+      <button type="button" class="btn" id="paper-reconcile" style="display:none">Reconcile unknown outcome</button></div>
+  </form>
+  <p id="paper-msg" class="mut" role="status">Paper entries are disarmed.</p>
+</section>
 <div class="stats">
   <div class="stat"><div class="k" id="k-real-l">Realized today · net</div><div class="v" id="k-real">-</div><div class="s" id="k-real-s"></div></div>
   <div class="stat"><div class="k">Open P&amp;L · day trades</div><div class="v" id="k-open">-</div><div class="s" id="k-open-s"></div></div>
@@ -1214,6 +1238,7 @@ function renderUpdate(st) {
 }
 function renderAlpacaOverview(st) {
   const panel = $("alpaca-overview");
+  $("paper-entry").style.display = st.broker?.key === "alpaca-paper" ? "block" : "none";
   if (st.broker?.key !== "alpaca-paper") { panel.style.display = "none"; return; }
   panel.style.display = "block";
   const a = st.alpaca;
@@ -1236,7 +1261,7 @@ function renderAlpacaOverview(st) {
   const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
   const fillRows = fills.map(f => `<tr><td>${esc(new Date(f.time).toLocaleString())}</td><td>${esc(f.symbol)}</td><td>${esc(f.instruction)}</td><td>${esc(f.quantity)}</td><td>${money(Number(f.price), false)}</td></tr>`).join("");
   panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
-    <p class="mut">Read-only account view while paper trading workflows are being connected. ${esc(st.broker_health?.message || "")}. Updated ${esc(new Date(a.updated_at).toLocaleTimeString())}. ${market}.</p>
+    <p class="mut">Account and order overview. ${esc(st.broker_health?.message || "")}. Updated ${esc(new Date(a.updated_at).toLocaleTimeString())}. ${market}.</p>
     <div class="alpaca-metrics"><div>Equity<strong>${a.equity == null ? "—" : money(Number(a.equity), false)}</strong></div>
       <div>Cash<strong>${a.cash == null ? "—" : money(Number(a.cash), false)}</strong></div>
       <div>Buying power<strong>${a.buying_power == null ? "—" : money(Number(a.buying_power), false)}</strong></div>
@@ -1251,6 +1276,7 @@ function render(st) {
   const broker = st.broker || {key: "schwab", name: "Schwab", mode: "live"};
   document.body.classList.toggle("alpaca-readonly", broker.key === "alpaca-paper");
   renderAlpacaOverview(st);
+  if (broker.key === "alpaca-paper") renderPaperControls(st);
   $("broker-name").textContent = `· ${broker.name}`;
   const selector = $("broker-select");
   if (document.activeElement !== selector) selector.value = st.pending_broker || broker.key;
@@ -1370,6 +1396,113 @@ const post = (url, body, ms = 25000) => {
     body: JSON.stringify(body || {}), signal: ctl.signal})
     .then(r => r.json()).finally(() => clearTimeout(timer));
 };
+let paperArmed = false, paperRequestId = null, paperIntentKey = null, paperOutcome = null, paperBusy = false;
+const paperForm = $("paper-form");
+function paperValues() {
+  const form = new FormData(paperForm);
+  return {symbol: String(form.get("symbol") || "").trim().toUpperCase(), side: form.get("side"),
+    quantity: form.get("quantity"), order_type: form.get("order_type"),
+    limit_price: form.get("order_type") === "limit" ? form.get("limit_price") : null,
+    target_price: form.get("target_price"), stop_price: form.get("stop_price")};
+}
+function paperMessage(message) { $("paper-msg").textContent = message; }
+function renderPaperControls(st) {
+  const ready = st.broker_ready && !st.pending_broker && st.market_hours?.is_open === true;
+  $("paper-arm").textContent = paperArmed ? "Disarm paper entries" : "Arm paper entries";
+  $("paper-arm").disabled = paperBusy || (!paperArmed && (!st.broker_ready || !!st.pending_broker));
+  $("paper-submit").disabled = paperBusy || !ready || !paperArmed || paperOutcome === "unknown";
+  $("paper-reconcile").style.display = paperOutcome === "unknown" ? "" : "none";
+}
+async function refreshPaperStatus() {
+  if (lastState?.broker?.key !== "alpaca-paper") return;
+  try {
+    const result = await (await fetch("/api/paper/status", {cache: "no-store"})).json();
+    if (!result.ok) return;
+    paperArmed = result.armed;
+    if (result.unresolved.length) {
+      paperRequestId = result.unresolved[0].request_id;
+      paperOutcome = "unknown";
+      paperMessage(`An earlier paper order has an unknown outcome (${paperRequestId}). Reconcile it before another order.`);
+    }
+    renderPaperControls(lastState);
+  } catch (err) { paperArmed = false; }
+}
+setInterval(refreshPaperStatus, 10000);
+setTimeout(refreshPaperStatus, 1000);
+$("paper-arm").addEventListener("click", async () => {
+  paperBusy = true;
+  renderPaperControls(lastState);
+  try {
+    const result = await post("/api/paper/arm", {armed: !paperArmed});
+    if (!result.ok) throw new Error(result.detail || result.error || "Could not change paper arming");
+    paperArmed = result.armed;
+    paperMessage(paperArmed ? "Paper entries armed for this market day." : "Paper entries disarmed.");
+  } catch (err) { paperMessage(String(err.message || err)); }
+  finally { paperBusy = false; renderPaperControls(lastState); }
+});
+paperForm.querySelector('[name="order_type"]').addEventListener("change", e => {
+  const limit = paperForm.querySelector('[name="limit_price"]');
+  limit.required = e.target.value === "limit";
+  limit.disabled = e.target.value !== "limit";
+});
+paperForm.addEventListener("input", () => {
+  if (paperOutcome === "accepted" && JSON.stringify(paperValues()) !== paperIntentKey) {
+    paperOutcome = null; paperRequestId = null;
+  }
+});
+paperForm.addEventListener("submit", async e => {
+  e.preventDefault();
+  if (paperBusy || paperOutcome === "unknown" || !paperArmed) return;
+  const values = paperValues(), key = JSON.stringify(values);
+  if (paperOutcome === "accepted" && paperIntentKey === key) {
+    paperMessage("This exact entry was already sent. Change the form to plan a new order."); return;
+  }
+  paperBusy = true; paperIntentKey = key; paperRequestId = crypto.randomUUID();
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const payload = {...values, request_id: paperRequestId};
+    const preview = await post("/api/paper/entry/preview", payload);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Preview refused");
+    const detail = `${preview.side} ${preview.quantity} ${preview.symbol}, ${preview.entry}` +
+      (preview.limit_price ? ` at ${preview.limit_price}` : ` (IEX ${preview.quote})`) +
+      `; target ${preview.target}, stop ${preview.stop}. ${preview.protection}. Send to Alpaca Paper?`;
+    if (!window.confirm(detail)) { paperMessage("Paper order review canceled."); return; }
+    paperMessage("Sending paper order once…");
+    sent = true;
+    const result = await post("/api/paper/entry/submit", payload);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown";
+      paperMessage(`${result.message || "Outcome unknown"}. Reconcile before another order.`);
+    } else if (result.ok) {
+      paperOutcome = "accepted";
+      paperMessage(`Alpaca Paper accepted order ${result.order_id}. Check its fill and attached exits in the order overview.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(result.message || result.error || result.detail || "Paper order refused");
+    }
+  } catch (err) {
+    if (sent) {
+      // A timed-out submit can have reached Alpaca. Keep its UUID and let the server decide.
+      paperOutcome = "unknown";
+      paperMessage(`Request may have been sent: ${String(err.message || err)}. Reconcile before another order.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(String(err.message || err));
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); }
+});
+$("paper-reconcile").addEventListener("click", async () => {
+  if (!paperRequestId || paperBusy) return;
+  paperBusy = true; renderPaperControls(lastState);
+  try {
+    const result = await post("/api/paper/entry/reconcile", {request_id: paperRequestId});
+    paperMessage(result.message || result.detail || "Outcome remains unknown");
+    if (result.status === "accepted") paperOutcome = "accepted";
+    if (result.status === "rejected") { paperOutcome = null; paperRequestId = null; }
+  } catch (err) { paperMessage(String(err.message || err)); }
+  finally { paperBusy = false; renderPaperControls(lastState); }
+});
 $("broker-select").addEventListener("change", async e => {
   const selector = e.currentTarget;
   selector.disabled = true;
