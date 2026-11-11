@@ -424,6 +424,14 @@
     <button class="btn ghost" type="submit" id="paper-vertical-target-submit" data-vertical-role="target" disabled>Review profit target</button>
   </form>
   <p id="paper-vertical-close-msg" class="mut" role="status">Choose two held legs during a fresh Paper session.</p>
+  <h3>App-watched spread stop</h3>
+  <p class="mut">No stop is held by Alpaca. The running app needs fresh OPRA quotes for both legs. The free indicative feed cannot trigger a stop. A send stop makes one multi-leg limit close attempt when confirmed; the order may not fill.</p>
+  <div class="paper-fields">
+    <label>Stop spread value / share<input class="in" id="paper-vertical-stop-value" type="number" min="0.01" step="0.01" placeholder="Loss threshold"></label>
+    <label><input id="paper-vertical-stop-send" type="checkbox"> Send one close when hit</label>
+    <button class="btn ghost" type="button" id="paper-vertical-stop-set" disabled>Review app-watched stop</button>
+  </div>
+  <p id="paper-vertical-stop-msg" class="mut" role="status">Choose the held legs above. Watch-only sends no order.</p>
 </section>
 <div class="stats">
   <div class="stat"><div class="k" id="k-real-l">Realized today · net</div><div class="v" id="k-real">-</div><div class="s" id="k-real-s"></div></div>
@@ -1331,6 +1339,7 @@ function renderAlpacaOverview(st) {
     ${o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.role === "TARGET" && o.tag?.startsWith("et-vertical-target-") && o.order_type === "LIMIT" && o.filled === 0 && st.broker?.workflows?.includes("vertical-target-reprice") ? `<button type="button" class="btn sm ghost" data-paper-vertical-reprice="${esc(o.order_id)}" ${!st.broker_ready || !paperArmed || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || paperVerticalRepriceSentIds.has(o.order_id) || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move spread target</button>` : ""}</td></tr>`).join("");
   const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
   const fillRows = fills.map(f => `<tr><td>${esc(new Date(f.time).toLocaleString())}</td><td>${esc(f.symbol)}</td><td>${esc(f.instruction)}</td><td>${esc(f.quantity)}</td><td>${money(Number(f.price), false)}</td></tr>`).join("");
+  const stopRows = (st.paper_spread_stops || []).map(stop => `<tr><td>${esc(stop.long_contract)} / ${esc(stop.short_contract)}</td><td>${esc(stop.kind)} ${esc(stop.stop_value)}</td><td>${stop.send ? "One send" : "Watch only"}</td><td>${esc(stop.status)}</td><td>${esc(stop.reason || "")}${stop.mid == null ? "" : ` · OPRA mid ${esc(stop.mid)}`}</td><td><button type="button" class="btn sm ghost" data-paper-spread-stop-clear="${esc(stop.stop_id)}" ${paperBusy || stop.status === "sending" ? "disabled" : ""}>${stop.status === "unknown" ? "Acknowledge after broker check" : "Clear"}</button></td></tr>`).join("");
   panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
     <p class="mut">Options trading level: ${esc(a.options_trading_level ?? "unavailable")}; approved level: ${esc(a.options_approved_level ?? "unavailable")}.</p>
     <p class="mut">Account and order overview. ${esc(st.broker_health?.message || "")}. Updated ${esc(new Date(a.updated_at).toLocaleTimeString())}. ${market}.</p>
@@ -1342,7 +1351,8 @@ function renderAlpacaOverview(st) {
     <div class="alpaca-list"><h2>Positions (${positions.length})</h2>${positions.length ? `<table><thead><tr><th>Symbol</th><th>Side</th><th>Quantity</th><th>Average</th><th>Mark / source</th><th>Open P&amp;L</th><th>Stop coverage</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="mut">No open positions.</p>`}</div>
     <div class="alpaca-list"><h2>Working orders (${working.length})</h2>${working.length ? `<table><thead><tr><th>Symbol</th><th>Role</th><th>Status</th><th>Type</th><th>Remaining</th><th>Action</th></tr></thead><tbody>${workingRows}</tbody></table>` : `<p class="mut">No working orders.</p>`}</div>
     <div class="alpaca-list"><h2>Orders, last 30 days (${recent.length})</h2>${recent.length ? `<table><thead><tr><th>Symbol</th><th>Status</th><th>Type</th><th>Quantity</th></tr></thead><tbody>${orderRows}</tbody></table>` : `<p class="mut">No recent orders.</p>`}</div>
-    <div class="alpaca-list"><h2>Recent fills (${fills.length}${(st.fills || []).length > fills.length ? "+" : ""})</h2>${fills.length ? `<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Quantity</th><th>Price</th></tr></thead><tbody>${fillRows}</tbody></table>` : `<p class="mut">No fills in the loaded history.</p>`}</div>`;
+    <div class="alpaca-list"><h2>Recent fills (${fills.length}${(st.fills || []).length > fills.length ? "+" : ""})</h2>${fills.length ? `<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Quantity</th><th>Price</th></tr></thead><tbody>${fillRows}</tbody></table>` : `<p class="mut">No fills in the loaded history.</p>`}</div>
+    <div class="alpaca-list"><h2>App-watched spread stops (${(st.paper_spread_stops || []).length})</h2><p class="mut">These are local app watches, never broker-held stops. They pause without fresh OPRA quotes, a running monitor, and regular market hours.</p>${stopRows ? `<table><thead><tr><th>Held pair</th><th>Stop</th><th>Mode</th><th>Status</th><th>Reason</th><th>Action</th></tr></thead><tbody>${stopRows}</tbody></table>` : `<p class="mut">No app-watched spread stops.</p>`}</div>`;
 }
 let renderedBroker = null;
 function render(st) {
@@ -1787,6 +1797,8 @@ function renderVerticalCloseControls(st) {
   $("paper-vertical-close-submit").disabled = blocked;
   $("paper-vertical-target-submit").disabled = blocked ||
     !st.broker.workflows?.includes("vertical-target");
+  $("paper-vertical-stop-set").disabled = blocked ||
+    !st.broker.workflows?.includes("vertical-stop");
 }
 $("paper-vertical-close-form").addEventListener("change", e => {
   if (["long_contract", "short_contract"].includes(e.target.name)) {
@@ -1846,6 +1858,56 @@ $("paper-vertical-close-form").addEventListener("submit", async e => {
       message.textContent = String(err.message || err);
     }
   } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
+$("paper-vertical-stop-set").addEventListener("click", async () => {
+  if ($("paper-vertical-stop-set").disabled || paperBusy) return;
+  const form = $("paper-vertical-close-form");
+  const value = $("paper-vertical-stop-value").value;
+  const send = $("paper-vertical-stop-send").checked;
+  const message = $("paper-vertical-stop-msg");
+  if (!Number.isFinite(Number(value)) || Number(value) <= 0) {
+    message.textContent = "Enter a positive stop spread value per share."; return;
+  }
+  const payload = {long_contract:form.elements.long_contract.value,
+    short_contract:form.elements.short_contract.value, stop_value:value,
+    send, request_id:crypto.randomUUID()};
+  paperBusy = true; renderPaperControls(lastState);
+  try {
+    const preview = await post("/api/paper/vertical/stop/preview", payload, 45000);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Spread stop preview refused");
+    payload.reviewed = {quantity:preview.quantity, basis:preview.basis,
+      width:preview.width, maximum_loss:preview.maximum_loss};
+    if (!window.confirm(`${send ? "Send one close" : "Watch only"} for ${preview.quantity} ${preview.kind} Paper verticals (${preview.long_contract} / ${preview.short_contract}) if OPRA spread value reaches ${preview.stop_value}? ` +
+        `Entry basis ${preview.basis}; estimated loss at stop ${preview.stop_loss}; maximum spread loss ${preview.maximum_loss}. ${preview.warning} ` +
+        (preview.feed_ready ? "" : `Currently suspended: ${preview.feed_reason}.`))) {
+      message.textContent = "App-watched spread stop review canceled."; return;
+    }
+    const result = await post("/api/paper/vertical/stop/set", payload, 45000);
+    if (!result.ok) throw new Error(result.error || result.detail || "Spread stop was not set");
+    message.textContent = result.message;
+    await tick();
+  } catch (err) {
+    message.textContent = String(err.message || err);
+  } finally { paperBusy = false; renderPaperControls(lastState); }
+});
+$("alpaca-overview").addEventListener("click", async e => {
+  const button = e.target.closest("[data-paper-spread-stop-clear]");
+  if (!button || paperBusy || lastState?.broker?.key !== "alpaca-paper") return;
+  const stopId = button.dataset.paperSpreadStopClear;
+  const stop = (lastState.paper_spread_stops || []).find(item => item.stop_id === stopId);
+  if (!stop || stop.status === "sending") return;
+  const acknowledged = stop.status === "unknown";
+  if (!window.confirm(acknowledged ?
+      `Only continue after checking Alpaca Paper for any live or filled close of ${stop.long_contract} / ${stop.short_contract}. Acknowledge this unknown stop and clear the local watch?` :
+      `Clear the local app-watched spread stop for ${stop.long_contract} / ${stop.short_contract}?`)) return;
+  paperBusy = true; renderPaperControls(lastState);
+  try {
+    const result = await post("/api/paper/vertical/stop/clear", {stop_id:stopId, acknowledged});
+    if (!result.ok) throw new Error(result.error || result.detail || "Stop could not be cleared");
+    $("paper-vertical-stop-msg").textContent = "App-watched spread stop cleared. No broker order was changed.";
+    await tick();
+  } catch (err) { $("paper-vertical-stop-msg").textContent = String(err.message || err); }
+  finally { paperBusy = false; renderPaperControls(lastState); }
 });
 let paperArmed = false, paperRequestId = null, paperIntentKey = null, paperOutcome = null, paperBusy = false;
 let paperCommand = "SubmitOrder";

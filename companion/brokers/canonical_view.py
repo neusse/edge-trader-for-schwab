@@ -67,7 +67,8 @@ def _pending(groups: tuple[OrderGroup, ...],
                 seen.add(key)
                 role = order.role
                 if (role == OrderRole.EXIT and not (order.client_order_id or "").startswith(
-                        ("et-close-", "et-opt-close-", "et-vertical-close-"))):
+                        ("et-close-", "et-opt-close-", "et-vertical-close-",
+                         "et-vertical-stop-"))):
                     native_type = order.order_type_detail
                     if (native_type in ("STOP", "STOP_LIMIT", "TRAILING_STOP", "TRAILING_STOP_LIMIT")
                             or (native_type is None and order.order_type in (

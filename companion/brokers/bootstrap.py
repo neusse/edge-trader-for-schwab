@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import threading
 import copy
+from dataclasses import replace
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -11,8 +13,12 @@ from .alpaca_paper import AlpacaPaperAdapter
 from .canonical_view import build_canonical_state
 from .errors import read_health
 from .models import (AccountQuery, AssetType, FillsQuery, MarketClockQuery,
-                     MarketSessionsQuery, OrdersQuery, OrderStatus, QuotesQuery)
+                     MarketSessionsQuery, OrdersQuery, OrderStatus, PositionSide,
+                     QuotesQuery, SubmitOrder)
 from .order_service import BrokerOrderService
+from .paper_spread_stop import PaperSpreadStopWatch
+from .paper_vertical import vertical_close_plan
+from .paper_options import OCC
 from .persistence import load_fills, save_fills
 from ..store import Store
 
@@ -32,10 +38,13 @@ class AlpacaBootstrapPoller:
         self._thread: threading.Thread | None = None
         self._verified_account: str | None = None
         self.order_service: BrokerOrderService | None = None
+        self.spread_stops: PaperSpreadStopWatch | None = None
+        self.action_lock = None  # injected by app; never wait for it while broker selection stops us
         self._last_fill_read: datetime | None = None
         self._sessions_date = None
         self._sessions = ()
         self._cooldown_until: datetime | None = None
+        self._opra_retry_at: datetime | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -68,6 +77,7 @@ class AlpacaBootstrapPoller:
                     self.store = scoped
                     self.order_service = BrokerOrderService(self._adapter, scoped,
                                                              account.account_ref)
+                    self.spread_stops = PaperSpreadStopWatch(scoped)
                     if self.trader is not None:
                         self.trader.store = scoped
                     self._stores.append(scoped)
@@ -79,6 +89,7 @@ class AlpacaBootstrapPoller:
                 self._verified_account = account.account_ref
                 self._last_fill_read = None
                 self._sessions_date = None
+                self._opra_retry_at = None
             stage = "orders_today"
             recent = self._adapter.query(OrdersQuery(now - timedelta(days=30), now))
             active = frozenset({OrderStatus.PENDING, OrderStatus.WORKING,
@@ -180,6 +191,8 @@ class AlpacaBootstrapPoller:
                 account, groups, fills, quotes, now=now,
                 orders_fresh=True, history_complete=fill_error is None and
                 self._last_fill_read is not None, freshness=freshness)
+            paper_spread_stops = self._spread_stop_rows(account, groups, clock,
+                                                        today_session, now)
             positions = [{"symbol": p.symbol, "asset_type": p.asset_type.value,
                           "side": p.side.value, "quantity": str(p.quantity),
                           "average_price": str(p.average_price)} for p in account.positions]
@@ -193,6 +206,7 @@ class AlpacaBootstrapPoller:
             state = {**canonical, "status": health["message"],
                      "booting": False, "broker_ready": not health_errors,
                      "broker_health": health, "market_hours": market_hours,
+                     "paper_spread_stops": paper_spread_stops,
                      "fills": [{"activity_id": fill.activity_id, "symbol": fill.symbol,
                                 "instruction": fill.instruction.value, "quantity": str(fill.quantity),
                                 "price": str(fill.price), "time": fill.occurred_at.isoformat()}
@@ -213,6 +227,9 @@ class AlpacaBootstrapPoller:
                 state = copy.deepcopy(self._state)
             state.update(status=health["message"], booting=False, broker_ready=False,
                          broker_health=health)
+            state["paper_spread_stops"] = [
+                {**row, "status": "suspended", "reason": "Paper account or poller is not ready"}
+                for row in state.get("paper_spread_stops") or ()]
             for position in state.get("positions") or ():
                 position["protection"] = "UNKNOWN"
                 position["quote_stale"] = True
@@ -224,6 +241,171 @@ class AlpacaBootstrapPoller:
             state["freshness"] = fresh
         with self._lock:
             self._state = state
+
+    @staticmethod
+    def _stop_pair_matches(account, stop: dict) -> bool:
+        match = OCC.fullmatch(stop["long_symbol"])
+        if match is None or account.status.upper() != "ACTIVE":
+            return False
+        underlying = match.group(1)
+        held = [position for position in account.positions
+                if position.asset_type == AssetType.OPTION and
+                (found := OCC.fullmatch(position.symbol.replace(" ", ""))) and
+                found.group(1) == underlying]
+        if len(held) != 2:
+            return False
+        by_symbol = {position.symbol.replace(" ", ""): position for position in held}
+        long, short = by_symbol.get(stop["long_symbol"]), by_symbol.get(stop["short_symbol"])
+        return bool(long and short and long.side == PositionSide.LONG and
+                    short.side == PositionSide.SHORT and
+                    long.quantity == short.quantity == stop["quantity"] and
+                    long.average_price == stop["long_average"] and
+                    short.average_price == stop["short_average"])
+
+    @staticmethod
+    def _stop_orders_clear(groups, stop: dict) -> bool:
+        underlying = OCC.fullmatch(stop["long_symbol"]).group(1)
+        active = {OrderStatus.PENDING, OrderStatus.WORKING,
+                  OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN}
+        return not any(order.status in active and any(
+            (match := OCC.fullmatch(leg.symbol.replace(" ", ""))) and
+            match.group(1) == underlying for leg in order.legs)
+            for group in groups for order in group.orders)
+
+    def _send_spread_stop(self, stop: dict) -> None:
+        watch = self.spread_stops
+        lock = self.action_lock
+        if lock is None or not lock.acquire(blocking=False):
+            watch.record_send(stop["stop_id"], stop["request_id"], "refused",
+                              "Another broker action was in progress; no close was sent")
+            return
+        attempted = False
+        try:
+            service = self.order_service
+            if (self._stop.is_set() or service is None or service.store is not watch.store or
+                    not service.armed):
+                raise ValueError("Paper runtime or arming changed; no close was sent")
+            account = self._adapter.query(AccountQuery())
+            if account.account_ref != service.account_ref or not self._stop_pair_matches(account, stop):
+                raise ValueError("Held vertical changed; no close was sent")
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = self._adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                     statuses=active))
+            if not self._stop_orders_clear(groups, stop):
+                raise ValueError("Another order touches the vertical; no close was sent")
+            symbols = (stop["long_symbol"], stop["short_symbol"])
+            quotes = self._adapter.query(QuotesQuery(symbols, AssetType.OPTION,
+                                                     realtime_required=True))
+            long, short = (quotes.get(symbol) for symbol in symbols)
+            if any(quote is None or quote.symbol != symbol or
+                   quote.source != "Alpaca OPRA options" or
+                   not quote.realtime or not quote.timestamp_verified or
+                   quote.observed_at.tzinfo is None or
+                   not 0 <= (now - quote.observed_at).total_seconds() <= 15 or
+                   quote.bid is None or quote.ask is None or quote.bid < 0 or
+                   quote.ask <= 0 or quote.bid > quote.ask
+                   for symbol, quote in zip(symbols, (long, short))):
+                raise ValueError("Verified fresh OPRA quotes disappeared; no close was sent")
+            if long.bid <= 0:
+                raise ValueError("Long leg has no bid; no close was sent")
+            if abs((long.observed_at - short.observed_at).total_seconds()) > 10:
+                raise ValueError("OPRA leg quotes are too far apart; no close was sent")
+            long_mid = (long.bid + long.ask) / 2
+            short_mid = (short.bid + short.ask) / 2
+            latest_mid = long_mid - short_mid if stop["kind"] == "debit" else short_mid - long_mid
+            if ((stop["kind"] == "debit" and latest_mid > stop["stop_value"]) or
+                    (stop["kind"] == "credit" and latest_mid < stop["stop_value"])):
+                raise ValueError("OPRA spread recovered above the stop; no close was sent")
+            if stop["kind"] == "debit":
+                executable = long.bid - short.ask
+                net = -executable.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            else:
+                executable = short.ask - long.bid
+                net = executable.quantize(Decimal("0.01"), rounding=ROUND_UP)
+            if executable <= 0 or abs(net) >= stop["width"] or net == 0:
+                raise ValueError("Executable net price exceeds the spread loss guard; no close was sent")
+            body = {"long_contract": symbols[0], "short_contract": symbols[1],
+                    "net_price": str(net), "role": "close",
+                    "request_id": stop["request_id"]}
+            intent = replace(vertical_close_plan(body, account, quotes, now),
+                             client_order_id=f"et-vertical-stop-{stop['request_id'].replace('-', '')}")
+            def preflight(current):
+                if current.account_ref != service.account_ref or not self._stop_pair_matches(current, stop):
+                    raise ValueError("Vertical changed immediately before close; nothing was sent")
+                later = self._adapter.query(OrdersQuery(now - timedelta(days=3650),
+                                                        datetime.now(timezone.utc), statuses=active))
+                if not self._stop_orders_clear(later, stop):
+                    raise ValueError("Another vertical order appeared; nothing was sent")
+            attempted = True
+            result = service.execute(SubmitOrder(intent), stop["request_id"], preflight=preflight)
+            status = ("sent" if result.accepted else
+                      "unknown" if result.status.value == "unknown" else "refused")
+            watch.record_send(stop["stop_id"], stop["request_id"], status,
+                              result.message or f"Paper close result {result.status.value}")
+        except Exception as exc:
+            watch.record_send(stop["stop_id"], stop["request_id"],
+                              "unknown" if attempted else "refused",
+                              (f"Stop close outcome unknown after {type(exc).__name__}; reconcile with Alpaca Paper" if attempted
+                               else f"Stop close preflight failed: {type(exc).__name__}; no close was sent"))
+        finally:
+            lock.release()
+
+    def _spread_stop_rows(self, account, groups, clock, today_session, now) -> list[dict]:
+        watch = self.spread_stops
+        if watch is None:
+            return []
+        stops = watch.list()
+        active = [stop for stop in stops if stop["status"] == "watching"]
+        symbols = tuple(dict.fromkeys(symbol for stop in active
+                                      for symbol in (stop["long_symbol"], stop["short_symbol"])))
+        quotes = {}
+        feed_error = None
+        if symbols and clock is not None and clock.is_open:
+            if self._opra_retry_at and now < self._opra_retry_at:
+                feed_error = "OPRA subscription is unavailable for Paper stop monitoring"
+            else:
+                try:
+                    quotes = self._adapter.query(QuotesQuery(symbols, AssetType.OPTION,
+                                                             realtime_required=True))
+                    self._opra_retry_at = None
+                except Exception as exc:
+                    forbidden = getattr(exc, "status_code", None) == 403
+                    if forbidden:
+                        self._opra_retry_at = now + timedelta(minutes=5)
+                    feed_error = ("OPRA subscription is unavailable for Paper stop monitoring" if
+                                  forbidden else f"OPRA quote read failed: {read_health(exc)['message']}")
+        market_open = bool(clock and clock.is_open and today_session and
+                           today_session.is_open and today_session.opens_at <= now < today_session.closes_at)
+        rows = []
+        for stop in stops:
+            if feed_error and stop["status"] == "watching":
+                watch.observe(stop["stop_id"], {}, market_open=market_open,
+                              pair_matches=True, orders_clear=True,
+                              monitoring=True, now=now)
+                observation = {"status": "suspended", "reason": feed_error, "mid": None,
+                               "fire": False}
+            else:
+                observation = watch.observe(
+                    stop["stop_id"], quotes, market_open=market_open,
+                    pair_matches=self._stop_pair_matches(account, stop),
+                    orders_clear=self._stop_orders_clear(groups, stop),
+                    monitoring=not self._stop.is_set() and
+                    (not stop["send"] or bool(self.order_service and self.order_service.armed)),
+                    now=now)
+            if observation["fire"]:
+                self._send_spread_stop(stop)
+                current = watch.get(stop["stop_id"])
+                observation["status"] = current["status"]
+                observation["reason"] = current["result"]
+            rows.append({"stop_id": stop["stop_id"], "long_contract": stop["long_symbol"],
+                         "short_contract": stop["short_symbol"],
+                         "quantity": str(stop["quantity"]), "kind": stop["kind"],
+                         "stop_value": str(stop["stop_value"]), "send": stop["send"],
+                         "status": observation["status"], "reason": observation["reason"],
+                         "mid": observation["mid"], "trigger_at": stop["trigger_at"]})
+        return rows
 
     def stop(self) -> None:
         self._stop.set()
