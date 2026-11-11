@@ -341,7 +341,7 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
 
     paper = broker_info("alpaca-paper")
     assert "option-trading" in paper["capabilities"]
-    assert paper["workflows"] == ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
+    assert paper["workflows"] == ("equity-bracket", "equity-simple", "equity-oco", "equity-close", "equity-partial",
                                   "equity-oco-adjust", "equity-add", "equity-trailing",
                                   "option-long-entry", "option-close", "option-cancel",
                                   "option-fixed-exit", "option-covered-short", "vertical-entry",

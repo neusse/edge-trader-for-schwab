@@ -113,6 +113,22 @@ def test_entry_plan_checks_bracket_direction_and_quote_freshness():
         entry_plan(entry(target_price="NaN"), quote(now), now)
 
 
+def test_simple_entry_requires_explicit_unprotected_choice():
+    now = datetime.now(timezone.utc)
+    body = entry(protection="none", target_price=None, stop_price=None)
+    plan = entry_plan(body, quote(now), now)
+    assert plan.order_type == OrderType.LIMIT and plan.limit_price == 100
+    assert plan.leg.instruction == OrderInstruction.BUY
+    market = entry_plan({**body, "side": "short", "order_type": "market",
+                         "limit_price": None}, quote(now), now)
+    assert market.order_type == OrderType.MARKET
+    assert market.leg.instruction == OrderInstruction.SELL_SHORT
+    with pytest.raises(ValueError, match="unprotected entry cannot include"):
+        entry_plan(entry(protection="none"), quote(now), now)
+    with pytest.raises(ValueError, match="protection must"):
+        entry_plan(entry(protection="unknown"), quote(now), now)
+
+
 def test_oco_plan_closes_the_exact_whole_equity_position():
     now = datetime.now(timezone.utc)
     body = {"symbol": "AAPL", "target_price": "110", "stop_price": "95",
@@ -400,7 +416,9 @@ def test_paper_close_refuses_order_that_appears_during_preflight(monkeypatch, tm
         poller.store.close()
 
 
-def test_paper_entry_route_arms_previews_sends_once_and_disarms_on_selection(monkeypatch, tmp_path):
+@pytest.mark.parametrize("protection", ["bracket", "none"])
+def test_paper_entry_route_arms_previews_sends_once_and_disarms_on_selection(monkeypatch, tmp_path,
+                                                                               protection):
     import companion.app as appmod
 
     now = datetime.now(timezone.utc)
@@ -443,14 +461,21 @@ def test_paper_entry_route_arms_previews_sends_once_and_disarms_on_selection(mon
     monkeypatch.setattr(appmod, "_feature_routes", None)
     client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
     headers = {"X-Companion": "1"}
-    body = entry()
+    body = entry() if protection == "bracket" else entry(
+        protection="none", target_price=None, stop_price=None)
     try:
-        assert client.post("/api/paper/entry/preview", json=body, headers=headers).json()["ok"]
+        preview = client.post("/api/paper/entry/preview", json=body, headers=headers).json()
+        assert preview["ok"]
+        if protection == "none":
+            assert preview["target"] is None and preview["stop"] is None
+            assert "UNPROTECTED" in preview["protection"]
         assert client.post("/api/paper/entry/submit", json=body, headers=headers).json()["status"] == "rejected"
         assert client.post("/api/paper/arm", json={"armed": True}, headers=headers).json()["armed"]
         result = client.post("/api/paper/entry/submit", json=body, headers=headers).json()
         assert result["status"] == "accepted" and result["order_id"] == "order-1"
         assert len(adapter.commands) == 1
+        assert (hasattr(adapter.commands[0].intent, "take_profit_price") ==
+                (protection == "bracket"))
         switched = client.post("/api/brokers/select", json={"broker": "schwab"}, headers=headers).json()
         assert switched == {"ok": True, "active": "schwab", "selected": "schwab", "restart_required": False}
         assert next_poller.started
@@ -462,22 +487,30 @@ def test_paper_entry_route_arms_previews_sends_once_and_disarms_on_selection(mon
         next_poller.store.close()
 
 
-def test_paper_cancel_route_rechecks_unfilled_entry_and_selected_broker(monkeypatch, tmp_path):
+@pytest.mark.parametrize("protection", ["bracket", "none"])
+def test_paper_cancel_route_rechecks_unfilled_entry_and_selected_broker(monkeypatch, tmp_path,
+                                                                          protection):
     import companion.app as appmod
 
     now = datetime.now(timezone.utc)
     order_id = str(uuid4())
+    client_id = f"et-{uuid4().hex}"
     adapter = FakeBrokerAdapter(ALPACA_PAPER)
     def group(filled, status_detail=None):
         order = BrokerOrder(order_id, OrderStatus.WORKING, OrderType.LIMIT,
                             TimeInForce.DAY, (OrderLeg("AAPL", AssetType.EQUITY,
                             OrderInstruction.BUY, Decimal(2), filled_quantity=Decimal(filled)),),
-                            OrderRole.ENTRY, status_detail=status_detail)
-        return OrderGroup(order_id, OrderClass.BRACKET, OrderStatus.WORKING, (order,))
+                            OrderRole.ENTRY, client_order_id=client_id,
+                            status_detail=status_detail)
+        kind = OrderClass.BRACKET if protection == "bracket" else OrderClass.SIMPLE
+        return OrderGroup(order_id, kind, OrderStatus.WORKING, (order,))
     adapter.given_query(OrderQuery, group(0), group(1), group(0, "PENDING_CANCEL"))
     adapter.given_query(AccountQuery, AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot()))
     adapter.given_command(CancelOrder, MutationResult(MutationStatus.ACCEPTED, order_id))
     store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    assert store.record_mutation(str(uuid4()), "SubmitOrder", {}, client_id)
+    store.finish_mutation(store.get_mutation_by_client_id(client_id)["request_id"],
+                          "accepted", order_id)
     poller = AlpacaBootstrapPoller(adapter=adapter)
     poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
     poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
@@ -511,17 +544,24 @@ def test_paper_cancel_route_rechecks_unfilled_entry_and_selected_broker(monkeypa
         poller.store.close()
 
 
-def test_paper_reprice_previews_bracket_and_reconciles_exact_replacement(monkeypatch, tmp_path):
+@pytest.mark.parametrize("protection", ["bracket", "none"])
+def test_paper_reprice_previews_bracket_and_reconciles_exact_replacement(monkeypatch, tmp_path,
+                                                                           protection):
     import companion.app as appmod
 
     now = datetime.now(timezone.utc)
     order_id, replacement_id, request_id = str(uuid4()), str(uuid4()), str(uuid4())
     adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    original_client_id = f"et-{uuid4().hex}"
     def entry_group():
         leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY, Decimal(2))
         entry_order = BrokerOrder(order_id, OrderStatus.WORKING, OrderType.LIMIT,
                                   TimeInForce.DAY, (leg,), OrderRole.ENTRY,
+                                  client_order_id=original_client_id,
                                   limit_price=Decimal(100), status_detail="NEW")
+        if protection == "none":
+            return OrderGroup(order_id, OrderClass.SIMPLE, OrderStatus.WORKING,
+                              (entry_order,))
         target = BrokerOrder(str(uuid4()), OrderStatus.PENDING, OrderType.LIMIT,
                              TimeInForce.GTC, (leg,), OrderRole.TARGET,
                              limit_price=Decimal(110))
@@ -543,6 +583,9 @@ def test_paper_reprice_previews_bracket_and_reconciles_exact_replacement(monkeyp
     adapter.given_query(ClientOrderQuery, OrderGroup(replacement_id, OrderClass.BRACKET,
                                                      OrderStatus.WORKING, (confirmed,)))
     store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    assert store.record_mutation(str(uuid4()), "SubmitOrder", {}, original_client_id)
+    store.finish_mutation(store.get_mutation_by_client_id(original_client_id)["request_id"],
+                          "accepted", order_id)
     poller = AlpacaBootstrapPoller(adapter=adapter)
     poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
     poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
@@ -556,13 +599,15 @@ def test_paper_reprice_previews_bracket_and_reconciles_exact_replacement(monkeyp
     headers = {"X-Companion": "1"}
     body = {"order_id": order_id, "request_id": request_id, "limit_price": "99"}
     try:
-        refused = client.post("/api/paper/entry/reprice/preview",
-                              json={**body, "limit_price": "111"}, headers=headers).json()
-        assert not refused["ok"] and "between" in refused["error"]
+        if protection == "bracket":
+            refused = client.post("/api/paper/entry/reprice/preview",
+                                  json={**body, "limit_price": "111"}, headers=headers).json()
+            assert not refused["ok"] and "between" in refused["error"]
         preview = client.post("/api/paper/entry/reprice/preview",
                               json=body, headers=headers).json()
-        assert preview["ok"] and preview["old_price"] == "100"
-        assert preview["stop"] == "95" and preview["target"] == "110"
+        assert preview["ok"] and preview["old_price"] == "100", preview
+        assert preview["stop"] == ("95" if protection == "bracket" else None)
+        assert preview["target"] == ("110" if protection == "bracket" else None)
         sent = client.post("/api/paper/entry/reprice", json=body, headers=headers).json()
         assert sent["status"] == "unknown" and sent["order_id"] == replacement_id
         assert len(adapter.commands) == 1

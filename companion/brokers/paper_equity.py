@@ -24,8 +24,8 @@ def _positive(value, name: str) -> Decimal:
     return number
 
 
-def entry_plan(body: dict, quote, now: datetime | None = None) -> BracketOrderIntent:
-    """Accept only a flat equity bracket with one broker-held target and stop."""
+def entry_plan(body: dict, quote, now: datetime | None = None) -> BracketOrderIntent | SimpleOrderIntent:
+    """Plan a flat equity entry, with explicit broker-held bracket or no protection."""
     if not isinstance(body, dict):
         raise ValueError("entry request must be an object")
     symbol = body.get("symbol")
@@ -51,13 +51,21 @@ def entry_plan(body: dict, quote, now: datetime | None = None) -> BracketOrderIn
     limit = _positive(body.get("limit_price"), "limit price") if kind == "limit" else None
     if kind == "market" and body.get("limit_price") not in (None, ""):
         raise ValueError("market entry cannot include a limit price")
-    target = _positive(body.get("target_price"), "target price")
-    stop = _positive(body.get("stop_price"), "stop price")
-    basis = limit if limit is not None else reference
-    if side == "long" and not stop < basis < target:
-        raise ValueError("long bracket requires stop < entry < target")
-    if side == "short" and not target < basis < stop:
-        raise ValueError("short bracket requires target < entry < stop")
+    protection = body.get("protection", "bracket")
+    if protection not in ("bracket", "none"):
+        raise ValueError("protection must be bracket or none")
+    if protection == "none":
+        if body.get("target_price") not in (None, "") or body.get("stop_price") not in (None, ""):
+            raise ValueError("unprotected entry cannot include target or stop prices")
+        target = stop = None
+    else:
+        target = _positive(body.get("target_price"), "target price")
+        stop = _positive(body.get("stop_price"), "stop price")
+        basis = limit if limit is not None else reference
+        if side == "long" and not stop < basis < target:
+            raise ValueError("long bracket requires stop < entry < target")
+        if side == "short" and not target < basis < stop:
+            raise ValueError("short bracket requires target < entry < stop")
     try:
         request_id = UUID(str(body.get("request_id")))
     except (ValueError, TypeError, AttributeError):
@@ -66,7 +74,7 @@ def entry_plan(body: dict, quote, now: datetime | None = None) -> BracketOrderIn
     entry = SimpleOrderIntent(
         OrderLegIntent(symbol, AssetType.EQUITY, instruction, quantity),
         OrderType(kind), TimeInForce.DAY, f"et-{request_id.hex}", limit_price=limit)
-    return BracketOrderIntent(entry, target, StopLossIntent(stop))
+    return BracketOrderIntent(entry, target, StopLossIntent(stop)) if protection == "bracket" else entry
 
 
 def oco_plan(body: dict, position: Position, quote,
