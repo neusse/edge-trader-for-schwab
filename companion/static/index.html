@@ -1337,7 +1337,7 @@ function renderAlpacaOverview(st) {
       `<button type="button" class="btn sm ghost" data-paper-option-exit="${esc(p.symbol)}" data-paper-option-role="stop" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="One broker-held fixed stop, with no paired target">Stop</button> <button type="button" class="btn sm ghost" data-paper-option-exit="${esc(p.symbol)}" data-paper-option-role="stop-limit" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="One broker-held stop-limit; it may not fill after triggering">Stop limit</button> <button type="button" class="btn sm ghost" data-paper-option-exit="${esc(p.symbol)}" data-paper-option-role="target" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="One broker-held target, with no paired stop">Target</button>` : ""}</td></tr>`).join("");
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td>
     <td>${o.asset_type === "EQUITY" && o.cancellable && (o.group_type === "BRACKET" || (o.group_type === "SIMPLE" && o.role === "ENTRY" && o.tag?.startsWith("et-"))) && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}
-    ${o.asset_type === "EQUITY" && o.group_type === "OCO" && ["STOP", "TARGET"].includes(o.role) && st.broker?.workflows?.includes("equity-oco-adjust") ? `<button type="button" class="btn sm ghost" data-paper-oco-adjust="${esc(o.order_id)}" data-paper-role="${o.role.toLowerCase()}" data-paper-symbol="${esc(o.symbol)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move ${esc(o.role.toLowerCase())}</button>` : ""}
+    ${o.asset_type === "EQUITY" && ["OCO", "BRACKET"].includes(o.group_type) && ["STOP", "TARGET"].includes(o.role) && st.broker?.workflows?.includes("equity-oco-adjust") ? `<button type="button" class="btn sm ghost" data-paper-oco-adjust="${esc(o.order_id)}" data-paper-role="${o.role.toLowerCase()}" data-paper-symbol="${esc(o.symbol)}" data-paper-group="${o.group_type}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move ${esc(o.role.toLowerCase())}</button>` : ""}
     ${o.asset_type === "EQUITY" && ["OCO", "BRACKET"].includes(o.group_type) && o.role === "STOP" && st.broker?.workflows?.includes("equity-auto-be") && !(st.paper_auto_be || []).some(be => be.symbol === o.symbol && ["watching", "suspended", "sending", "unknown"].includes(be.status)) ? `<button type="button" class="btn sm ghost" data-paper-auto-be="${esc(o.symbol)}" ${!st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Auto B/E +1R</button>` : ""}
     ${o.group_type === "SIMPLE" && o.asset_type === "OPTION" && o.tag?.startsWith("et-opt-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("option-cancel") ? `<button type="button" class="btn sm ghost" data-paper-option-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperOptionCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel remaining</button>` : ""}
     ${o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.asset_type === "OPTION" && o.tag?.startsWith("et-vertical-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("vertical-cancel") ? `<button type="button" class="btn sm ghost" data-paper-vertical-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperVerticalCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel spread remainder</button>` : ""}
@@ -2228,8 +2228,8 @@ $("alpaca-overview").addEventListener("click", async e => {
   const button = e.target.closest("[data-paper-oco-adjust]");
   if (!button || paperBusy || paperOutcome === "unknown" ||
       lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready) return;
-  const {paperOcoAdjust: orderId, paperRole: role, paperSymbol: symbol} = button.dataset;
-  const input = window.prompt(`New ${role} price for ${symbol} OCO`, "");
+  const {paperOcoAdjust: orderId, paperRole: role, paperSymbol: symbol, paperGroup: group} = button.dataset;
+  const input = window.prompt(`New ${role} price for ${symbol} ${group}`, "");
   if (input === null) return;
   if (!Number.isFinite(Number(input)) || Number(input) <= 0) {
     paperMessage("Enter a positive price."); return;
@@ -2240,27 +2240,27 @@ $("alpaca-overview").addEventListener("click", async e => {
   let sent = false;
   try {
     const payload = {symbol, order_id: orderId, role, price: input, request_id: requestId};
-    const preview = await post("/api/paper/oco/adjust/preview", payload);
-    if (!preview.ok) throw new Error(preview.error || preview.detail || "OCO adjustment preview refused");
+    const preview = await post("/api/paper/equity/exit/adjust/preview", payload);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Exit adjustment preview refused");
     if (!window.confirm(`Move ${preview.symbol} ${preview.role} ${preview.old_price} → ${preview.new_price} for ${preview.quantity} ${preview.side} shares? ` +
         `Paired exit remains at ${preview.other_price}; IEX mark ${preview.quote}. ${preview.protection}.`)) {
-      paperMessage("Paper OCO adjustment canceled."); return;
+      paperMessage("Paper exit adjustment canceled."); return;
     }
-    paperMessage("Sending Paper OCO replacement once…");
+    paperMessage("Sending Paper exit replacement once…");
     sent = true;
-    const result = await post("/api/paper/oco/adjust/submit", payload);
+    const result = await post("/api/paper/equity/exit/adjust/submit", payload);
     if (result.status === "unknown") {
       paperOutcome = "unknown";
       paperMessage(result.message || "Replacement pending. Reconcile before another action.");
     } else {
       paperRequestId = null;
-      paperMessage(result.ok ? `Alpaca Paper confirmed OCO replacement ${result.order_id}.` :
-        result.message || result.error || result.detail || "OCO adjustment refused");
+      paperMessage(result.ok ? `Alpaca Paper confirmed exit replacement ${result.order_id}.` :
+        result.message || result.error || result.detail || "Exit adjustment refused");
     }
   } catch (err) {
     if (sent) {
       paperOutcome = "unknown";
-      paperMessage(`OCO replacement may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
+      paperMessage(`Exit replacement may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
     } else {
       paperRequestId = null;
       paperMessage(String(err.message || err));

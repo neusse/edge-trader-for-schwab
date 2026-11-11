@@ -247,12 +247,56 @@ def verified_oco_pair(position: Position, group: OrderGroup):
     return stop, target
 
 
-def oco_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
-                     now: datetime | None = None) -> ReplaceOrder:
-    """Review one broker-held OCO leg change without canceling the paired exit."""
+def verified_bracket_pair(position: Position, group: OrderGroup):
+    """Return the two working exits of an exact, app-created, filled equity bracket."""
+    if (position.asset_type != AssetType.EQUITY or
+            group.order_class != OrderClass.BRACKET or len(group.orders) != 3):
+        raise ValueError("A filled equity bracket with two working exits is required")
+    if not SYMBOL.fullmatch(position.symbol):
+        raise ValueError("Bracket symbol must match the held position")
+    quantity = position.quantity
+    if quantity <= 0 or quantity != quantity.to_integral_value() or quantity > 10000:
+        raise ValueError("Bracket adjustment requires 1 to 10000 whole shares")
+    entries = [order for order in group.orders if order.role == OrderRole.ENTRY]
+    stops = [order for order in group.orders if order.role == OrderRole.STOP]
+    targets = [order for order in group.orders if order.role == OrderRole.TARGET]
+    if len(entries) != 1 or len(stops) != 1 or len(targets) != 1:
+        raise ValueError("Bracket must have exactly one entry, stop, and target")
+    entry, stop, target = entries[0], stops[0], targets[0]
+    entry_instruction = ((OrderInstruction.BUY,) if position.side == PositionSide.LONG
+                         else (OrderInstruction.SELL, OrderInstruction.SELL_SHORT))
+    exit_instruction = (OrderInstruction.SELL if position.side == PositionSide.LONG
+                        else OrderInstruction.BUY)
+    if (entry.status != OrderStatus.FILLED or len(entry.legs) != 1 or
+            entry.legs[0].symbol != position.symbol or
+            entry.legs[0].asset_type != AssetType.EQUITY or
+            entry.legs[0].quantity != quantity or
+            entry.legs[0].filled_quantity != quantity or
+            entry.legs[0].instruction not in entry_instruction or
+            not entry.client_order_id or not entry.client_order_id.startswith("et-") or
+            stop.time_in_force not in (TimeInForce.DAY, TimeInForce.GTC) or
+            target.time_in_force != stop.time_in_force or
+            any(order.status != OrderStatus.WORKING or len(order.legs) != 1 or
+                order.legs[0].symbol != position.symbol or
+                order.legs[0].asset_type != AssetType.EQUITY or
+                order.legs[0].quantity != quantity or
+                order.legs[0].filled_quantity != 0 or
+                order.legs[0].instruction != exit_instruction
+                for order in (stop, target)) or
+            stop.stop_price is None or target.limit_price is None):
+        raise ValueError("Bracket entry or exits changed from the exact held position")
+    return stop, target, entry.client_order_id
+
+
+def equity_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
+                        now: datetime | None = None) -> ReplaceOrder:
+    """Review a broker-held OCO or filled bracket exit leg replacement."""
     if not isinstance(body, dict) or body.get("symbol") != position.symbol:
-        raise ValueError("OCO symbol must match the held position")
-    stop, target = verified_oco_pair(position, group)
+        raise ValueError("Exit symbol must match the held position")
+    if group.order_class == OrderClass.OCO:
+        stop, target = verified_oco_pair(position, group)
+    else:
+        stop, target, _ = verified_bracket_pair(position, group)
     try:
         request_id = UUID(str(body.get("request_id")))
         order_id = str(UUID(str(body.get("order_id"))))
@@ -264,13 +308,13 @@ def oco_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
     selected = next((order for order in group.orders if order.order_id == order_id), None)
     if (selected is None or selected.role !=
             (OrderRole.STOP if role == "stop" else OrderRole.TARGET)):
-        raise ValueError("OCO exit order no longer matches the reviewed leg")
+        raise ValueError("Equity exit order no longer matches the reviewed leg")
     symbol = position.symbol
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
     if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
-        raise ValueError("Alpaca Paper quote is stale; refresh before adjusting the OCO")
+        raise ValueError("Alpaca Paper quote is stale; refresh before adjusting the exit")
     mark = quote.mark or quote.last
     if mark is None or mark <= 0:
         raise ValueError("Alpaca Paper quote has no usable price")

@@ -21,7 +21,7 @@ from companion.brokers.models import (
 )
 from companion.brokers.order_service import BrokerOrderService
 from companion.brokers.paper_equity import (add_plan, close_plan, entry_plan,
-                                             oco_exit_reprice, oco_plan, trailing_plan)
+                                             equity_exit_reprice, oco_plan, trailing_plan)
 from companion.brokers.paper_options import covered_call_reserved_shares
 from companion.store import Store
 from companion.trading import Trader
@@ -306,22 +306,79 @@ def oco_group(side=PositionSide.LONG, qty=Decimal(2), stop=Decimal(95),
                       (target_order, stop_order))
 
 
+def filled_bracket_group(side=PositionSide.LONG, qty=Decimal(2),
+                         stop=Decimal(95), target=Decimal(110)):
+    group_id, entry_id, target_id, stop_id = (str(uuid4()) for _ in range(4))
+    entry_instruction = (OrderInstruction.BUY if side == PositionSide.LONG else
+                         OrderInstruction.SELL_SHORT)
+    exit_instruction = (OrderInstruction.SELL if side == PositionSide.LONG else
+                        OrderInstruction.BUY)
+    entry_order = BrokerOrder(entry_id, OrderStatus.FILLED, OrderType.MARKET,
+                              TimeInForce.GTC,
+                              (OrderLeg("AAPL", AssetType.EQUITY, entry_instruction,
+                                        qty, filled_quantity=qty),), OrderRole.ENTRY,
+                              client_order_id=f"et-{uuid4().hex}", group_id=group_id)
+    exit_leg = OrderLeg("AAPL", AssetType.EQUITY, exit_instruction, qty)
+    target_order = BrokerOrder(target_id, OrderStatus.WORKING, OrderType.LIMIT,
+                               TimeInForce.GTC, (exit_leg,), OrderRole.TARGET,
+                               group_id=group_id, parent_id=entry_id,
+                               limit_price=target)
+    stop_order = BrokerOrder(stop_id, OrderStatus.WORKING, OrderType.STOP,
+                             TimeInForce.GTC, (exit_leg,), OrderRole.STOP,
+                             group_id=group_id, parent_id=entry_id,
+                             stop_price=stop)
+    return OrderGroup(group_id, OrderClass.BRACKET, OrderStatus.WORKING,
+                      (entry_order, target_order, stop_order))
+
+
+@pytest.mark.parametrize("side,stop,target,new_stop,new_target", [
+    (PositionSide.LONG, "95", "110", "97", "108"),
+    (PositionSide.SHORT, "105", "90", "103", "92"),
+])
+def test_filled_bracket_exit_reprice_requires_exact_held_position(
+        side, stop, target, new_stop, new_target):
+    now = datetime.now(timezone.utc)
+    position = Position("AAPL", AssetType.EQUITY, side, Decimal(2), Decimal(100))
+    group = filled_bracket_group(side, stop=Decimal(stop), target=Decimal(target))
+    body = {"symbol": "AAPL", "order_id": group.orders[2].order_id,
+            "role": "stop", "price": new_stop, "request_id": str(uuid4())}
+    command = equity_exit_reprice(body, position, group, quote(now), now)
+    assert command.order_id == group.orders[2].order_id
+    assert command.stop_price == Decimal(new_stop)
+    assert command.client_order_id.startswith("et-exit-")
+    target_command = equity_exit_reprice({**body, "order_id": group.orders[1].order_id,
+                                          "role": "target", "price": new_target},
+                                         position, group, quote(now), now)
+    assert target_command.limit_price == Decimal(new_target)
+    changed = replace(group, orders=(replace(group.orders[0], status=OrderStatus.PARTIALLY_FILLED),
+                                     *group.orders[1:]))
+    with pytest.raises(ValueError, match="Bracket entry or exits changed"):
+        equity_exit_reprice(body, position, changed, quote(now), now)
+    wrong_quantity = Position("AAPL", AssetType.EQUITY, side, Decimal(1), Decimal(100))
+    with pytest.raises(ValueError, match="Bracket entry or exits changed"):
+        equity_exit_reprice(body, wrong_quantity, group, quote(now), now)
+    external = replace(group, orders=(replace(group.orders[0], client_order_id="outside"),
+                                      *group.orders[1:]))
+    with pytest.raises(ValueError, match="Bracket entry or exits changed"):
+        equity_exit_reprice(body, position, external, quote(now), now)
+
+
 def test_oco_exit_reprice_tightens_stop_and_moves_target_with_exact_ids():
     now = datetime.now(timezone.utc)
     position = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, Decimal(2), Decimal(100))
     group = oco_group()
     body = {"symbol": "AAPL", "order_id": group.orders[1].order_id,
             "role": "stop", "price": "97", "request_id": str(uuid4())}
-    stop = oco_exit_reprice(body, position, group, quote(now), now)
+    stop = equity_exit_reprice(body, position, group, quote(now), now)
     assert stop.order_id == group.orders[1].order_id and stop.stop_price == 97
     assert stop.limit_price is None and stop.client_order_id.startswith("et-exit-")
-    target = oco_exit_reprice({**body, "order_id": group.orders[0].order_id,
+    target = equity_exit_reprice({**body, "order_id": group.orders[0].order_id,
                                "role": "target", "price": "108"}, position, group, quote(now), now)
     assert target.order_id == group.orders[0].order_id and target.limit_price == 108
     with pytest.raises(ValueError, match="only tighten"):
-        oco_exit_reprice({**body, "price": "94"}, position, group, quote(now), now)
+        equity_exit_reprice({**body, "price": "94"}, position, group, quote(now), now)
     with pytest.raises(ValueError, match="fully working"):
-        oco_exit_reprice(body, Position("AAPL", AssetType.EQUITY, PositionSide.LONG,
+        equity_exit_reprice(body, Position("AAPL", AssetType.EQUITY, PositionSide.LONG,
                                        Decimal(1), Decimal(100)), group, quote(now), now)
 
 
@@ -331,9 +388,9 @@ def test_oco_exit_reprice_short_uses_buy_side_and_rejects_looser_stop():
     group = oco_group(PositionSide.SHORT, stop=Decimal(105), target=Decimal(90))
     body = {"symbol": "AAPL", "order_id": group.orders[1].order_id,
             "role": "stop", "price": "103", "request_id": str(uuid4())}
-    assert oco_exit_reprice(body, position, group, quote(now), now).stop_price == 103
+    assert equity_exit_reprice(body, position, group, quote(now), now).stop_price == 103
     with pytest.raises(ValueError, match="only tighten"):
-        oco_exit_reprice({**body, "price": "106"}, position, group, quote(now), now)
+        equity_exit_reprice({**body, "price": "106"}, position, group, quote(now), now)
 
 
 def test_paper_close_route_requires_order_free_position_and_rechecks_before_send(monkeypatch, tmp_path):
@@ -702,13 +759,15 @@ def test_paper_oco_submit_refuses_position_change_before_mutation(monkeypatch, t
         poller.store.close()
 
 
-def test_paper_oco_adjust_previews_rechecks_and_reconciles_exact_stop(monkeypatch, tmp_path):
+@pytest.mark.parametrize("group_factory", [oco_group, filled_bracket_group])
+def test_paper_exit_adjust_previews_rechecks_and_reconciles_exact_stop(
+        monkeypatch, tmp_path, group_factory):
     import companion.app as appmod
 
     now = datetime.now(timezone.utc)
     position = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, Decimal(2), Decimal(100))
     account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (position,))
-    group = oco_group()
+    group = group_factory()
     request_id = str(uuid4())
     replacement_id = str(uuid4())
     client_id = f"et-exit-{request_id.replace('-', '')}"
@@ -722,7 +781,7 @@ def test_paper_oco_adjust_previews_rechecks_and_reconciles_exact_stop(monkeypatc
     adapter.given_query(OrdersQuery, (group,), (group,), (group,))
     adapter.given_query(QuotesQuery, {"AAPL": quote(now)}, {"AAPL": quote(now)},
                         {"AAPL": quote(now)})
-    adapter.given_query(ClientOrderQuery, OrderGroup(group.group_id, OrderClass.OCO,
+    adapter.given_query(ClientOrderQuery, OrderGroup(group.group_id, group.order_class,
                                                      OrderStatus.WORKING, (replacement,)))
     adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, replacement_id))
     store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
@@ -737,13 +796,16 @@ def test_paper_oco_adjust_previews_rechecks_and_reconciles_exact_stop(monkeypatc
     monkeypatch.setattr(appmod, "BrokerSelection", Selection)
     client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
     headers = {"X-Companion": "1"}
-    body = {"symbol": "AAPL", "order_id": group.orders[1].order_id,
+    body = {"symbol": "AAPL", "order_id": group.orders[-1].order_id,
             "role": "stop", "price": "97", "request_id": request_id}
     try:
-        preview = client.post("/api/paper/oco/adjust/preview", json=body, headers=headers).json()
+        preview = client.post("/api/paper/equity/exit/adjust/preview",
+                              json=body, headers=headers).json()
         assert preview["ok"] and preview["old_price"] == "95"
         assert preview["new_price"] == "97" and preview["other_price"] == "110"
-        sent = client.post("/api/paper/oco/adjust/submit", json=body, headers=headers).json()
+        assert preview["group_class"] == group.order_class.value
+        sent = client.post("/api/paper/equity/exit/adjust/submit",
+                           json=body, headers=headers).json()
         assert sent["status"] == "unknown" and sent["order_id"] == replacement_id
         assert len(adapter.commands) == 1
         assert adapter.commands[0].stop_price == 97
@@ -755,15 +817,20 @@ def test_paper_oco_adjust_previews_rechecks_and_reconciles_exact_stop(monkeypatc
         poller.store.close()
 
 
-def test_paper_oco_adjust_refuses_changed_pair_before_replace(monkeypatch, tmp_path):
+@pytest.mark.parametrize("group_factory", [oco_group, filled_bracket_group])
+def test_paper_exit_adjust_refuses_changed_pair_before_replace(
+        monkeypatch, tmp_path, group_factory):
     import companion.app as appmod
 
     now = datetime.now(timezone.utc)
     position = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, Decimal(2), Decimal(100))
     account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (position,))
-    group = oco_group()
-    changed = replace(group, orders=(replace(group.orders[0], limit_price=Decimal(111)),
-                                     group.orders[1]))
+    group = group_factory()
+    target_index = 0 if group.order_class == OrderClass.OCO else 1
+    changed_orders = list(group.orders)
+    changed_orders[target_index] = replace(changed_orders[target_index],
+                                           limit_price=Decimal(111))
+    changed = replace(group, orders=tuple(changed_orders))
     adapter = FakeBrokerAdapter(ALPACA_PAPER)
     adapter.given_query(AccountQuery, account, account)
     adapter.given_query(OrdersQuery, (group,), (changed,))
@@ -780,11 +847,11 @@ def test_paper_oco_adjust_refuses_changed_pair_before_replace(monkeypatch, tmp_p
     monkeypatch.setattr(appmod, "BrokerSelection", Selection)
     client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
     try:
-        result = client.post("/api/paper/oco/adjust/submit", json={
-            "symbol": "AAPL", "order_id": group.orders[1].order_id,
+        result = client.post("/api/paper/equity/exit/adjust/submit", json={
+            "symbol": "AAPL", "order_id": group.orders[-1].order_id,
             "role": "stop", "price": "97", "request_id": str(uuid4())},
             headers={"X-Companion": "1"}).json()
-        assert result["status"] == "rejected" and "OCO changed" in result["message"]
+        assert result["status"] == "rejected" and "Equity exit changed" in result["message"]
         assert adapter.commands == []
     finally:
         store.close()

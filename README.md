@@ -23,7 +23,9 @@ new order ID and reviewed price; a simple entry remains unprotected. A held whol
 one broker-held OCO target and fixed stop after a fresh position, order, and IEX quote check. The same
 OCO's working target can be moved, and its fixed stop can only be tightened, after a fresh broker
 read and an exact-price replacement confirmation. Replacement outcomes block further order actions
-until Alpaca confirms the new client order ID and price. The same
+until Alpaca confirms the new client order ID and price. The same manual controls apply to the working
+target and stop of an app-created bracket after its entry has fully filled and the held share count
+matches both exits. An external or partially filled bracket cannot be adjusted through this app. The same
 app-created, unchanged OCO or filled bracket can opt into **Paper Auto B/E +1R** from its working stop row.
 This is an app-watched move: after two distinct fresh IEX quotes at +1R, the app checks the
 held position and both OCO exits again, then attempts one tighter fixed-stop replacement at
