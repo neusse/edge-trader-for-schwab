@@ -84,7 +84,8 @@ APP_WORKFLOWS = {
                      "equity-oco-adjust", "equity-add", "equity-trailing",
                      "option-long-entry", "option-close", "option-cancel",
                      "option-fixed-exit", "option-covered-short", "vertical-entry",
-                     "vertical-close", "vertical-target", "vertical-cancel"),
+                     "vertical-close", "vertical-target", "vertical-cancel",
+                     "vertical-target-reprice"),
     "demo": (),
 }
 BROKER_HELP = {
@@ -929,6 +930,115 @@ def _cancel_paper_vertical(order_id: str, request_id: str):
     with BROKER_ACTION_LOCK:
         service, _, _ = _paper_vertical_cancel_check(order_id)
         return service.execute(CancelOrder(order_id), request_id)
+
+
+def _paper_vertical_target_reprice_check(order_id: str, price: Decimal, request_id: str):
+    service, _ = _paper_service()
+    group = service.adapter.query(OrderQuery(order_id))
+    order = next((item for item in group.orders if item.order_id == order_id), None)
+    if (order is None or group.order_class != OrderClass.MULTI_LEG or
+            len(group.orders) != 1 or len(order.legs) != 2 or
+            order.parent_id is not None or order.role != OrderRole.TARGET or
+            order.order_type != OrderType.LIMIT or order.time_in_force.value != "gtc" or
+            order.status != OrderStatus.WORKING or
+            order.status_detail not in (None, "NEW", "WORKING") or
+            not str(order.client_order_id or "").startswith("et-vertical-target-") or
+            order.limit_price is None or order.limit_price == price or
+            any(leg.asset_type != AssetType.OPTION or leg.filled_quantity != 0 or
+                (leg.remaining_quantity is not None and leg.quantity != leg.remaining_quantity)
+                for leg in order.legs)):
+        raise ValueError("Only a fully working, unfilled app-created Paper vertical target can be repriced")
+    if service.store.get_mutation_by_client_id(order.client_order_id) is None:
+        raise ValueError("Vertical target is not owned by this Paper account store")
+    long = next((leg for leg in order.legs if leg.instruction == OrderInstruction.SELL_TO_CLOSE), None)
+    short = next((leg for leg in order.legs if leg.instruction == OrderInstruction.BUY_TO_CLOSE), None)
+    if long is None or short is None or long.quantity != short.quantity:
+        raise ValueError("Target is not an exact two-leg vertical close")
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref:
+        raise ValueError("Paper account changed; no vertical target was repriced")
+    symbols = (long.symbol, short.symbol)
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                               statuses=active))
+    if any(other.order_id != order_id and other.status in active and
+           any(leg.symbol in symbols for leg in other.legs)
+           for other_group in groups for other in other_group.orders):
+        raise ValueError("another order touches a vertical leg; resolve it before repricing")
+    quotes = service.adapter.query(QuotesQuery(symbols, AssetType.OPTION))
+    intent = vertical_close_plan({"long_contract": long.symbol,
+                                  "short_contract": short.symbol,
+                                  "net_price": str(price), "role": "target",
+                                  "request_id": request_id}, account, quotes)
+    if tuple((leg.symbol, leg.quantity, leg.instruction) for leg in intent.legs) != tuple(
+            (leg.symbol, leg.quantity, leg.instruction) for leg in order.legs):
+        raise ValueError("Held vertical no longer matches the working target")
+    return service, order, account
+
+
+@app.post("/api/paper/vertical/target/reprice/preview")
+async def paper_vertical_target_reprice_preview(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        order_id = str(UUID(str(body.get("order_id"))))
+        request_id = str(UUID(str(body.get("request_id"))))
+        price = Decimal(str(body.get("net_price")))
+        _, order, _ = await run_in_threadpool(
+            _paper_vertical_target_reprice_check, order_id, price, request_id)
+        return {"ok": True, "order_id": order_id,
+                "legs": [leg.symbol for leg in order.legs],
+                "quantity": str(order.legs[0].quantity),
+                "old_price": str(order.limit_price), "new_price": str(price),
+                "warning": "One broker-held multi-leg profit target remains without a paired stop. Replacement can be refused or fill before confirmation."}
+    except (ValueError, TypeError, AttributeError, InvalidOperation) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper vertical target replace preview failed; nothing was sent"}
+
+
+@app.post("/api/paper/vertical/target/reprice/submit")
+async def paper_vertical_target_reprice_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        order_id = str(UUID(str(body.get("order_id"))))
+        request_id = str(UUID(str(body.get("request_id"))))
+        price = Decimal(str(body.get("net_price")))
+        result = await run_in_threadpool(_replace_paper_vertical_target,
+                                         order_id, price, request_id)
+    except (ValueError, TypeError, AttributeError, InvalidOperation) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper vertical target replace preflight failed; nothing was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _replace_paper_vertical_target(order_id: str, price: Decimal, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, original, account = _paper_vertical_target_reprice_check(
+            order_id, price, request_id)
+        if not service.armed or not service._market_open(datetime.now(timezone.utc)):
+            raise ValueError("Arm Paper orders during regular hours before moving a vertical target")
+        def preflight(current):
+            if (current.account_ref != account.account_ref or
+                    current.status != account.status or current.positions != account.positions):
+                raise ValueError("Vertical positions changed before replacement; nothing was sent")
+            _, checked, _ = _paper_vertical_target_reprice_check(
+                order_id, price, request_id)
+            if checked != original:
+                raise ValueError("Vertical target changed before replacement; nothing was sent")
+        return service.execute(ReplaceOrder(order_id, limit_price=price,
+                                            client_order_id=f"et-vertical-target-r-{UUID(request_id).hex}"),
+                               request_id, preflight=preflight)
 
 
 def _paper_option_fixed_exit(body: dict):
