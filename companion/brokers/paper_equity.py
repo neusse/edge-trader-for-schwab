@@ -106,15 +106,18 @@ def oco_plan(body: dict, position: Position, quote,
 
 def close_plan(body: dict, position: Position, quote,
                now: datetime | None = None) -> SimpleOrderIntent:
-    """Close an order-free whole-share paper position with one reviewed market order."""
+    """Close all or part of an order-free position with one reviewed market order."""
     if not isinstance(body, dict) or position.asset_type != AssetType.EQUITY:
         raise ValueError("Paper close requires an equity position")
     symbol = body.get("symbol")
     if symbol != position.symbol or not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol):
         raise ValueError("close symbol must match the held equity position")
-    quantity = position.quantity
-    if quantity <= 0 or quantity != quantity.to_integral_value() or quantity > 10000:
+    held = position.quantity
+    if held <= 0 or held != held.to_integral_value() or held > 10000:
         raise ValueError("Paper close requires 1 to 10000 whole shares")
+    quantity = _positive(body["shares"], "shares") if body.get("shares") not in (None, "") else held
+    if quantity != quantity.to_integral_value() or quantity > held:
+        raise ValueError("shares must be whole and no greater than the held quantity")
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
