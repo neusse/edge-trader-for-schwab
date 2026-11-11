@@ -66,7 +66,8 @@ def collect(scenario: str, app: dict, status: dict, account, groups, fills,
         "quote_stale": bool(p.get("quote_stale")),
     } for p in app.get("positions") or ()]
     app_orders = [{
-        "order_ref": opaque(o.get("order_id")), "symbol_ref": opaque(o.get("symbol")),
+        "order_ref": opaque(o["order_id"]) if o.get("order_id") else None,
+        "symbol_ref": opaque(o["symbol"]) if o.get("symbol") else None,
         "asset": o.get("asset_type"), "role": o.get("role"),
         "status": o.get("status"), "group_class": o.get("group_type"),
         "quantity": str(o.get("qty")), "filled": str(o.get("filled") or 0),
