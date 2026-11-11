@@ -34,6 +34,7 @@ On the same date, a read-only 365-day Paper order query at `b3ed911` found 50 hi
 
 - [x] `.env.example` contains Paper-only keys and the fixed Paper endpoint.
 - [x] `requirements.txt` pins `alpaca-py` and the Schwab client.
+- [x] README Quick start and Schwab setup sections match `setup.bat`, `launch.bat`, `stop.bat`, and `login.bat` and link to this fork's CI and releases.
 - [x] README describes the equities-only scope, broker-held equity brackets/OCO exits, and unprotected orders.
 - [x] README identifies local storage and broker/data outbound calls.
 - [x] README troubleshooting covers Paper connection, disabled reviews, stale IEX quotes, uncertain order outcomes, broker switching, and read-only option holdings.
