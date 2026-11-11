@@ -5,7 +5,7 @@ from companion.brokers.capabilities import ALPACA_PAPER
 from companion.brokers.fake import FakeBrokerAdapter
 from companion.brokers.models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, CancelOrder,
-    BrokerOrder, ClientOrderQuery, MarketSession, MarketSessionsQuery, OrderQuery,
+    BrokerOrder, ClientOrderQuery, MarketSession, MarketSessionsQuery, OrderQuery, OrdersQuery,
     MutationResult, MutationStatus, MultiLegOrderIntent, OrderClass, OrderGroup, OrderRole,
     OrderStatus, OrderLeg,
     OrderInstruction, OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent,
@@ -355,5 +355,36 @@ def test_auto_be_bracket_reconciliation_requires_filled_entry_and_both_exits(tmp
                             group(OrderStatus.FILLED))
         assert service.reconcile_replace("be-bracket").status == MutationStatus.UNKNOWN
         assert service.reconcile_replace("be-bracket").status == MutationStatus.ACCEPTED
+    finally:
+        store.close()
+
+
+def test_auto_be_reconcile_recovers_complete_bracket_from_singleton_stop(tmp_path):
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT)
+    adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, "replacement"))
+    service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
+    entry_leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY,
+                         Decimal(1), filled_quantity=Decimal(1))
+    exit_leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL, Decimal(1))
+    entry = BrokerOrder("entry", OrderStatus.FILLED, OrderType.MARKET,
+                        TimeInForce.DAY, (entry_leg,), OrderRole.ENTRY)
+    target = BrokerOrder("target", OrderStatus.WORKING, OrderType.LIMIT,
+                         TimeInForce.DAY, (exit_leg,), OrderRole.TARGET,
+                         limit_price=Decimal(120))
+    stop = BrokerOrder("new-stop", OrderStatus.WORKING, OrderType.STOP,
+                       TimeInForce.DAY, (exit_leg,), OrderRole.STOP,
+                       client_order_id="et-autobe-singleton", stop_price=Decimal(100))
+    singleton = OrderGroup("entry", OrderClass.BRACKET, OrderStatus.WORKING, (stop,))
+    complete = OrderGroup("entry", OrderClass.BRACKET, OrderStatus.FILLED,
+                          (entry, target, stop))
+    try:
+        service.execute(ReplaceOrder("old-stop", stop_price=Decimal(100),
+                                     client_order_id="et-autobe-singleton"), "be-singleton")
+        adapter.given_query(ClientOrderQuery, singleton)
+        adapter.given_query(OrdersQuery, (singleton,), (complete,))
+        assert service.reconcile_replace("be-singleton").status == MutationStatus.ACCEPTED
+        assert store.open_mutations() == []
     finally:
         store.close()
