@@ -6,7 +6,7 @@ This is the validation record for [issue #12](https://github.com/neusse/edge-tra
 
 - [ ] Run `\.venv\Scripts\python.exe -m pytest -q` from a clean checkout with no broker credentials loaded; record the commit and result.
 - [ ] Run CI on the release candidate on Windows and Linux, or record the platform gap.
-- [ ] Exercise the same canonical account, order, and mutation contract against Schwab fixtures, Alpaca fixtures, and the in-memory fake.
+- [x] Exercise the same canonical account, order, and mutation contract against Schwab fixtures, Alpaca fixtures, and the in-memory fake (`tests/test_shared_broker_contract.py`; 9 passing cases).
 - [ ] Verify that live Alpaca credentials and any endpoint other than `https://paper-api.alpaca.markets` are rejected before a network request.
 - [ ] Verify that changing brokers disarms the previous ticket, closes its poller, activates the selected broker's store, and does not carry over position or order state.
 - [ ] Verify restart recovery, stale reads, rate limits, unknown submit/cancel/replace results, and no automatic mutation retry.
