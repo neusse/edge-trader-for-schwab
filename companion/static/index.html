@@ -1298,7 +1298,7 @@ function renderAlpacaOverview(st) {
     ${p.asset_type === "OPTION" && p.protection === "NONE" && st.broker?.workflows?.includes("option-close") ?
       `<button type="button" class="btn sm ghost" data-paper-option-close="${esc(p.symbol)}" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="Review a limit close of an order-free Paper option position">Close option</button>` : ""}
     ${p.asset_type === "OPTION" && p.protection === "NONE" && st.broker?.workflows?.includes("option-fixed-exit") ?
-      `<button type="button" class="btn sm ghost" data-paper-option-exit="${esc(p.symbol)}" data-paper-option-role="stop" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="One broker-held fixed stop, with no paired target">Stop</button> <button type="button" class="btn sm ghost" data-paper-option-exit="${esc(p.symbol)}" data-paper-option-role="target" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="One broker-held target, with no paired stop">Target</button>` : ""}</td></tr>`).join("");
+      `<button type="button" class="btn sm ghost" data-paper-option-exit="${esc(p.symbol)}" data-paper-option-role="stop" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="One broker-held fixed stop, with no paired target">Stop</button> <button type="button" class="btn sm ghost" data-paper-option-exit="${esc(p.symbol)}" data-paper-option-role="stop-limit" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="One broker-held stop-limit; it may not fill after triggering">Stop limit</button> <button type="button" class="btn sm ghost" data-paper-option-exit="${esc(p.symbol)}" data-paper-option-role="target" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="One broker-held target, with no paired stop">Target</button>` : ""}</td></tr>`).join("");
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td>
     <td>${o.cancellable && o.group_type === "BRACKET" && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}
     ${o.group_type === "OCO" && ["STOP", "TARGET"].includes(o.role) && st.broker?.workflows?.includes("equity-oco-adjust") ? `<button type="button" class="btn sm ghost" data-paper-oco-adjust="${esc(o.order_id)}" data-paper-role="${o.role.toLowerCase()}" data-paper-symbol="${esc(o.symbol)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move ${esc(o.role.toLowerCase())}</button>` : ""}
@@ -2186,31 +2186,38 @@ $("alpaca-overview").addEventListener("click", async e => {
   const position = (lastState.positions || []).find(p => p.symbol === contract &&
     p.asset_type === "OPTION" && p.protection === "NONE" && !p.quote_stale &&
     Number.isInteger(Number(p.qty)) && Number(p.qty) > 0);
-  if (!position || !["stop", "target"].includes(role) ||
+  if (!position || !["stop", "stop-limit", "target"].includes(role) ||
       (lastState.orders || []).some(o => o.symbol === contract)) return;
   const mark = Number(position.quote?.mark);
-  const factor = role === "stop" ? (position.side === "LONG" ? .8 : 1.2) :
+  const factor = role !== "target" ? (position.side === "LONG" ? .8 : 1.2) :
     (position.side === "LONG" ? 1.2 : .8);
   const suggested = Number.isFinite(mark) && mark > 0 ?
     (mark * factor).toFixed(2) : "";
-  const price = window.prompt(`${role === "stop" ? "Fixed stop" : "Target"} premium per share for ${contract}`, suggested);
+  const price = window.prompt(`${role === "target" ? "Target" : "Fixed stop trigger"} premium per share for ${contract}`, suggested);
   if (price === null) return;
   if (!Number.isFinite(Number(price)) || Number(price) <= 0) {
     paperMessage("Enter a positive option exit price."); return;
   }
-  const key = JSON.stringify([contract, position.opened, role, price]);
+  const limitPrice = role === "stop-limit" ? window.prompt(
+    `Stop-limit execution price for ${contract}; this order may remain unfilled after triggering`,
+    (Number(price) * (position.side === "LONG" ? .9 : 1.1)).toFixed(2)) : null;
+  if (role === "stop-limit" && limitPrice === null) return;
+  if (role === "stop-limit" && (!Number.isFinite(Number(limitPrice)) || Number(limitPrice) <= 0)) {
+    paperMessage("Enter a positive option stop-limit execution price."); return;
+  }
+  const key = JSON.stringify([contract, position.opened, role, price, limitPrice]);
   if (paperOptionExitSentKeys.has(key)) {
     paperMessage("This exact option exit was already sent. Verify broker status before another action."); return;
   }
   const requestId = crypto.randomUUID();
-  const payload = {contract, role, price, request_id:requestId};
+  const payload = {contract, role, price, limit_price:limitPrice, request_id:requestId};
   paperBusy = true; paperRequestId = requestId; paperCommand = "SubmitOrder"; paperIntentKey = null;
   renderPaperControls(lastState);
   let sent = false;
   try {
     const preview = await post("/api/paper/options/exit/preview", payload, 45000);
     if (!preview.ok) throw new Error(preview.error || preview.detail || "Option exit preview refused");
-    if (!window.confirm(`Attach one ${preview.time_in_force.toUpperCase()} ${preview.role} at ${preview.price} for all ${preview.quantity} ${preview.contract} contracts (${preview.side})? ` +
+    if (!window.confirm(`Attach one ${preview.time_in_force.toUpperCase()} ${preview.role} at ${preview.price}${preview.limit_price ? `, limit ${preview.limit_price}` : ""} for all ${preview.quantity} ${preview.contract} contracts (${preview.side})? ` +
         `Indicative mark ${preview.indicative_mark}. ${preview.protection}`)) {
       paperMessage("Paper option exit review canceled."); return;
     }

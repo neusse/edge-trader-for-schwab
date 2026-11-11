@@ -86,7 +86,7 @@ APP_WORKFLOWS = {
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; held options can be closed or given one fixed stop or target, and unfilled option quantities canceled. Option exits are single orders, never OCO pairs. Other option and spread workflows are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; held options can be closed or given one fixed stop, stop-limit, or target, and unfilled option quantities canceled. Option exits are single orders, never OCO pairs. Other option and spread workflows are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -628,16 +628,21 @@ async def paper_option_exit_preview(request: Request):
     try:
         _, intent, position, quote = await run_in_threadpool(_paper_option_fixed_exit,
                                                                await request.json())
-        role = "stop" if intent.stop_price is not None else "target"
+        role = ("stop-limit" if intent.order_type == OrderType.STOP_LIMIT else
+                "stop" if intent.stop_price is not None else "target")
         return {"ok": True, "contract": intent.leg.symbol,
                 "side": intent.leg.instruction.value,
                 "quantity": str(position.quantity), "role": role,
                 "price": str(intent.stop_price or intent.limit_price),
+                "limit_price": str(intent.limit_price) if role == "stop-limit" else None,
                 "time_in_force": intent.time_in_force.value,
                 "indicative_mark": str(quote.mark),
                 "protection": ("One broker-held fixed stop after Alpaca accepts it; no target is paired. "
                                "A triggered stop becomes a market order and may fill at another price."
                                if role == "stop" else
+                               "One broker-held stop-limit after Alpaca accepts it; no target is paired. "
+                               "A triggered limit order may remain unfilled while losses grow."
+                               if role == "stop-limit" else
                                "One broker-held target after Alpaca accepts it; no stop is paired.")}
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
