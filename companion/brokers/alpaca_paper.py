@@ -242,9 +242,11 @@ class AlpacaPaperAdapter(BrokerAdapter):
             from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestQuoteRequest
             if query.asset_type == AssetType.OPTION:
                 request = OptionLatestQuoteRequest(symbol_or_symbols=list(query.symbols),
-                                                   feed=OptionsFeed.INDICATIVE)
+                                                   feed=(OptionsFeed.OPRA if query.realtime_required else
+                                                         OptionsFeed.INDICATIVE))
                 raw = self._market_client(query.asset_type).get_option_latest_quote(request)
-                source, realtime = "Alpaca indicative options", False
+                source, realtime = (("Alpaca OPRA options", True) if query.realtime_required else
+                                    ("Alpaca indicative options", False))
             elif query.asset_type == AssetType.EQUITY:
                 request = StockLatestQuoteRequest(symbol_or_symbols=list(query.symbols), feed=DataFeed.IEX)
                 raw = self._market_client(query.asset_type).get_stock_latest_quote(request)
@@ -256,6 +258,7 @@ class AlpacaPaperAdapter(BrokerAdapter):
                 last=None, mark=(Decimal(str(item.bid_price)) + Decimal(str(item.ask_price))) / 2
                 if item.bid_price is not None and item.ask_price is not None else None,
                 observed_at=item.timestamp, realtime=realtime, source=source,
+                timestamp_verified=realtime,
             ) for symbol, item in raw.items()}
         if isinstance(query, FillsQuery):
             params = {"after": query.start.isoformat(), "until": query.end.isoformat(),
