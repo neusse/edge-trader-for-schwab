@@ -306,3 +306,62 @@ def test_vertical_target_reprice_keeps_exact_mleg_and_rechecks_positions(monkeyp
     refused = client.post("/api/paper/vertical/target/reprice/preview",
                           json=payload, headers=headers).json()
     assert not refused["ok"] and "unfilled" in refused["error"]
+
+
+def test_paper_spread_stop_preview_suspends_without_opra_and_send_requires_it(monkeypatch):
+    import companion.app as appmod
+
+    account = _held_account()
+    now = datetime.now(timezone.utc)
+    def fresh(source, realtime):
+        return {symbol: Quote(symbol, D("1.90"), D("2.10"), None, D(2),
+                              now, realtime, source, timestamp_verified=realtime)
+                for symbol in (account.positions[0].symbol, account.positions[1].symbol)}
+    opra = fresh("Alpaca OPRA options", True)
+    class Forbidden(Exception):
+        status_code = 403
+    allow_opra = False
+    def query(value):
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return ()
+        if isinstance(value, QuotesQuery):
+            if value.realtime_required:
+                if not allow_opra: raise Forbidden()
+                return opra
+            raise AssertionError("stop setup must not depend on indicative quotes")
+        raise AssertionError(type(value))
+    store = SimpleNamespace(open_mutations=lambda: [])
+    saved = []
+    watch = SimpleNamespace(store=store, set=lambda *args: (
+        saved.append(args), {"stop_id": "pair-stop", "status": "watching",
+                             "send": args[-1]})[1])
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query), store=store,
+                              account_ref="paper-account", armed=True,
+                              _market_open=lambda _now: True)
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    monkeypatch.setattr(appmod, "poller", SimpleNamespace(spread_stops=watch))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    body = {"long_contract": account.positions[0].symbol,
+            "short_contract": account.positions[1].symbol,
+            "stop_value": "0.80", "send": False, "request_id": REQUEST_ID}
+    preview = client.post("/api/paper/vertical/stop/preview", json=body,
+                          headers=headers).json()
+    assert preview["ok"] and not preview["feed_ready"]
+    assert "WATCH ONLY" in preview["warning"]
+    reviewed = {key: preview[key] for key in ("quantity", "basis", "width", "maximum_loss")}
+    set_result = client.post("/api/paper/vertical/stop/set",
+                             json={**body, "reviewed": reviewed}, headers=headers).json()
+    assert set_result["ok"] and not set_result["feed_ready"] and len(saved) == 1
+    refused = client.post("/api/paper/vertical/stop/preview",
+                          json={**body, "send": True}, headers=headers).json()
+    assert not refused["ok"] and "OPRA subscription" in refused["error"]
+    allow_opra = True
+    automatic = client.post("/api/paper/vertical/stop/preview",
+                            json={**body, "send": True}, headers=headers).json()
+    assert automatic["ok"] and automatic["feed_ready"]
+    sent = client.post("/api/paper/vertical/stop/set",
+                       json={**body, "send": True,
+                             "reviewed": {key: automatic[key] for key in reviewed}},
+                       headers=headers).json()
+    assert sent["ok"] and sent["send"] and len(saved) == 2

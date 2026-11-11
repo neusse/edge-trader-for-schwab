@@ -147,6 +147,19 @@ class BrokerOrderService:
             if match is None:
                 return MutationResult(MutationStatus.UNKNOWN,
                                       message="Broker response did not match the client order ID")
+            if client_order_id.startswith("et-vertical-") and match.status != OrderStatus.REJECTED:
+                expected_legs = intent.get("legs") or ()
+                if (group.order_class != OrderClass.MULTI_LEG or
+                        len(group.orders) != 1 or len(match.legs) != 2 or
+                        match.parent_id is not None or len(expected_legs) != 2 or
+                        match.limit_price != Decimal(str(intent.get("limit_price"))) or
+                        match.time_in_force.value != intent.get("time_in_force") or
+                        tuple((leg.symbol, leg.asset_type.value, leg.instruction.value,
+                               leg.quantity) for leg in match.legs) !=
+                        tuple((leg["symbol"], leg["asset_type"], leg["instruction"],
+                               Decimal(str(leg["quantity"]))) for leg in expected_legs)):
+                    return MutationResult(MutationStatus.UNKNOWN,
+                                          message="Broker multi-leg order does not match the reviewed vertical")
             status = (MutationStatus.REJECTED if match.status == OrderStatus.REJECTED
                       else MutationStatus.ACCEPTED)
             message = f"Reconciled against broker order status {match.status.value}"

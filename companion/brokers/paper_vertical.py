@@ -11,6 +11,12 @@ from .models import (AccountSnapshot, AssetType, MultiLegOrderIntent, OptionChai
 from .paper_options import ET, OCC, _occ_symbol, chain_query
 
 
+def _known_option_quote(quote: Quote) -> bool:
+    return ((quote.source == "Alpaca indicative options" and not quote.realtime) or
+            (quote.source == "Alpaca OPRA options" and quote.realtime and
+             quote.timestamp_verified))
+
+
 def vertical_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
                         now: datetime | None = None) -> MultiLegOrderIntent:
     """Build one atomic 1:1 debit or credit vertical; never separate legs."""
@@ -41,7 +47,7 @@ def vertical_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain
             raise ValueError("vertical requires two tradable standard contracts of one expiry and type")
         quote = contract.quote
         if (quote is None or quote.symbol.replace(" ", "") != symbol or
-                quote.source != "Alpaca indicative options" or quote.realtime or
+                not _known_option_quote(quote) or
                 quote.observed_at.tzinfo is None or
                 not 0 <= (now - quote.observed_at).total_seconds() <= 60 or
                 quote.bid is None or quote.ask is None or
@@ -85,7 +91,8 @@ def vertical_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain
 
 
 def vertical_close_plan(body: dict, account: AccountSnapshot,
-                        quotes: dict[str, Quote], now: datetime | None = None) -> MultiLegOrderIntent:
+                        quotes: dict[str, Quote], now: datetime | None = None,
+                        *, require_quotes: bool = True) -> MultiLegOrderIntent:
     """Close or target one exact held 1:1 vertical in one broker multi-leg order."""
     if not isinstance(body, dict) or account.status.upper() != "ACTIVE":
         raise ValueError("an active Paper account and vertical close request are required")
@@ -117,15 +124,16 @@ def vertical_close_plan(body: dict, account: AccountSnapshot,
     width = abs(Decimal(long_match.group(6)) - Decimal(short_match.group(6))) / 1000
     if width <= 0:
         raise ValueError("held vertical strikes must differ")
-    for symbol in (long_symbol, short_symbol):
-        quote = quotes.get(symbol)
-        if (quote is None or quote.symbol.replace(" ", "") != symbol or
-                quote.source != "Alpaca indicative options" or quote.realtime or
-                quote.observed_at.tzinfo is None or
-                not 0 <= (now - quote.observed_at).total_seconds() <= 60 or
-                quote.bid is None or quote.ask is None or
-                quote.bid <= 0 or quote.ask <= 0):
-            raise ValueError("both held vertical legs require current indicative bid and ask")
+    if require_quotes:
+        for symbol in (long_symbol, short_symbol):
+            quote = quotes.get(symbol)
+            if (quote is None or quote.symbol.replace(" ", "") != symbol or
+                    not _known_option_quote(quote) or
+                    quote.observed_at.tzinfo is None or
+                    not 0 <= (now - quote.observed_at).total_seconds() <= 60 or
+                    quote.bid is None or quote.ask is None or
+                    quote.bid <= 0 or quote.ask <= 0):
+                raise ValueError("both held vertical legs require current indicative bid and ask")
     try:
         net = Decimal(str(body.get("net_price")))
     except (InvalidOperation, TypeError, ValueError):

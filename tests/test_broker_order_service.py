@@ -6,7 +6,7 @@ from companion.brokers.fake import FakeBrokerAdapter
 from companion.brokers.models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, CancelOrder,
     BrokerOrder, ClientOrderQuery, MarketSession, MarketSessionsQuery, OrderQuery,
-    MutationResult, MutationStatus, OrderClass, OrderGroup, OrderRole,
+    MutationResult, MutationStatus, MultiLegOrderIntent, OrderClass, OrderGroup, OrderRole,
     OrderStatus, OrderLeg,
     OrderInstruction, OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent,
     SubmitOrder, TimeInForce,
@@ -253,5 +253,41 @@ def test_vertical_target_replacement_reconciles_only_same_atomic_legs(tmp_path):
         assert service.reconcile_replace("vertical-replace").status == MutationStatus.UNKNOWN
         assert service.reconcile_replace("vertical-replace").status == MutationStatus.ACCEPTED
         assert store.open_mutations() == []
+    finally:
+        store.close()
+
+
+def test_vertical_submit_reconciliation_requires_exact_atomic_pair(tmp_path):
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT, ACCOUNT)
+    adapter.given_query(MarketSessionsQuery, SESSION)
+    adapter.given_command(SubmitOrder, MutationResult(MutationStatus.UNKNOWN,
+                                                     message="timeout"))
+    service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
+    service.arm(True)
+    legs = (OrderLegIntent("AAPL261113C00100000", AssetType.OPTION,
+                           OrderInstruction.BUY_TO_OPEN, Decimal(2)),
+            OrderLegIntent("AAPL261113C00105000", AssetType.OPTION,
+                           OrderInstruction.SELL_TO_OPEN, Decimal(2)))
+    intent = MultiLegOrderIntent(legs, OrderType.LIMIT, TimeInForce.DAY,
+                                 "et-vertical-test", Decimal("1.30"))
+    def group(symbol):
+        order = BrokerOrder("mleg-order", OrderStatus.WORKING, OrderType.LIMIT,
+                            TimeInForce.DAY,
+                            (OrderLeg(legs[0].symbol, AssetType.OPTION,
+                                      OrderInstruction.BUY_TO_OPEN, Decimal(2)),
+                             OrderLeg(symbol, AssetType.OPTION,
+                                      OrderInstruction.SELL_TO_OPEN, Decimal(2))),
+                            OrderRole.ENTRY, client_order_id="et-vertical-test",
+                            limit_price=Decimal("1.30"))
+        return OrderGroup("mleg-order", OrderClass.MULTI_LEG,
+                          OrderStatus.WORKING, (order,))
+    try:
+        assert service.execute(SubmitOrder(intent), "vertical-submit").status == MutationStatus.UNKNOWN
+        adapter.given_query(ClientOrderQuery,
+                            group("AAPL261113C00110000"), group(legs[1].symbol))
+        assert service.reconcile_submit("vertical-submit").status == MutationStatus.UNKNOWN
+        assert service.reconcile_submit("vertical-submit").status == MutationStatus.ACCEPTED
     finally:
         store.close()

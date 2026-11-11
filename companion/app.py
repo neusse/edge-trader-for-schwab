@@ -85,12 +85,12 @@ APP_WORKFLOWS = {
                      "option-long-entry", "option-close", "option-cancel",
                      "option-fixed-exit", "option-covered-short", "vertical-entry",
                      "vertical-close", "vertical-target", "vertical-cancel",
-                     "vertical-target-reprice"),
+                     "vertical-target-reprice", "vertical-stop"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order; an exact held vertical can be closed or given one broker-held target. Held options can be closed or given one fixed stop, stop-limit, or target. Spread stops are app-watched and are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order; an exact held vertical can be closed or given one broker-held target. Held options can be closed or given one fixed stop, stop-limit, or target. Spread stops are app-watched and require fresh OPRA option quotes; the indicative feed never triggers one.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -109,7 +109,10 @@ def make_poller(broker_key: str):
     """Select exactly one broker runtime without falling back to another broker."""
     if broker_key not in BROKERS:
         raise ValueError("unknown broker runtime")
-    return POLLERS[broker_key]()
+    selected = POLLERS[broker_key]()
+    if isinstance(selected, AlpacaBootstrapPoller):
+        selected.action_lock = BROKER_ACTION_LOCK
+    return selected
 
 
 poller = make_poller(BROKER_KEY)
@@ -627,7 +630,7 @@ def _send_paper_vertical_entry(body: dict, request_id: str):
         return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 
-def _paper_vertical_close(body: dict):
+def _paper_vertical_close(body: dict, *, require_quotes: bool = True):
     service, _ = _paper_service()
     if not isinstance(body, dict):
         raise ValueError("vertical close request must be an object")
@@ -649,8 +652,9 @@ def _paper_vertical_close(body: dict):
     symbols = (body.get("long_contract"), body.get("short_contract"))
     if not all(isinstance(item, str) and item for item in symbols):
         raise ValueError("both held vertical OCC contracts are required")
-    quotes = service.adapter.query(QuotesQuery(symbols, AssetType.OPTION))
-    intent = vertical_close_plan(body, account, quotes)
+    quotes = (service.adapter.query(QuotesQuery(symbols, AssetType.OPTION))
+              if require_quotes else {})
+    intent = vertical_close_plan(body, account, quotes, require_quotes=require_quotes)
     return service, intent, quotes
 
 
@@ -1039,6 +1043,162 @@ def _replace_paper_vertical_target(order_id: str, price: Decimal, request_id: st
         return service.execute(ReplaceOrder(order_id, limit_price=price,
                                             client_order_id=f"et-vertical-target-r-{UUID(request_id).hex}"),
                                request_id, preflight=preflight)
+
+
+def _paper_vertical_stop_plan(body: dict):
+    service, _ = _paper_service()
+    if not isinstance(body, dict) or type(body.get("send")) is not bool:
+        raise ValueError("Paper spread stop requires an explicit send or watch-only choice")
+    long_symbol, short_symbol = body.get("long_contract"), body.get("short_contract")
+    if not isinstance(long_symbol, str) or not isinstance(short_symbol, str):
+        raise ValueError("Choose both held vertical legs")
+    try:
+        request_id = str(UUID(str(body.get("request_id"))))
+        stop_value = Decimal(str(body.get("stop_value")))
+    except (ValueError, TypeError, AttributeError, InvalidOperation):
+        raise ValueError("Spread stop value and request ID are invalid") from None
+    if not stop_value.is_finite() or stop_value <= 0 or stop_value != stop_value.quantize(Decimal("0.01")):
+        raise ValueError("Spread stop must be a positive cent-precision premium")
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref or account.status.upper() != "ACTIVE":
+        raise ValueError("Paper account changed or is inactive")
+    held = {position.symbol.replace(" ", ""): position for position in account.positions}
+    long, short = held.get(long_symbol), held.get(short_symbol)
+    if long is None or short is None or long.average_price is None or short.average_price is None:
+        raise ValueError("Both held vertical legs need a known entry basis")
+    entry_net = long.average_price - short.average_price
+    if entry_net == 0:
+        raise ValueError("Vertical entry basis is zero; stop risk cannot be measured")
+    kind = "debit" if entry_net > 0 else "credit"
+    signed_close = -stop_value if kind == "debit" else stop_value
+    plan_body = {"long_contract": long_symbol, "short_contract": short_symbol,
+                 "net_price": str(signed_close), "role": "close",
+                 "request_id": request_id}
+    _, intent, _ = _paper_vertical_close(plan_body, require_quotes=False)
+    if intent.legs[0].quantity != long.quantity or intent.legs[1].quantity != short.quantity:
+        raise ValueError("Vertical quantity changed during stop review")
+    current = service.adapter.query(AccountQuery())
+    if current.positions != account.positions:
+        raise ValueError("Vertical position changed during stop review")
+    match_long, match_short = OCC.fullmatch(long_symbol), OCC.fullmatch(short_symbol)
+    width = abs(Decimal(match_long.group(6)) - Decimal(match_short.group(6))) / 1000
+    basis = abs(entry_net)
+    if ((kind == "debit" and stop_value >= basis) or
+            (kind == "credit" and stop_value <= basis) or stop_value >= width):
+        raise ValueError("Spread stop must cut loss before maximum spread loss")
+    feed_ready = False
+    feed_reason = None
+    try:
+        now = datetime.now(timezone.utc)
+        opra = service.adapter.query(QuotesQuery((long_symbol, short_symbol), AssetType.OPTION,
+                                                 realtime_required=True))
+        feed_ready = all(quote and quote.source == "Alpaca OPRA options" and
+                         quote.realtime and quote.timestamp_verified and
+                         quote.observed_at.tzinfo is not None and
+                         0 <= (now - quote.observed_at).total_seconds() <= 15 and
+                         quote.bid is not None and quote.ask is not None and
+                         0 <= quote.bid <= quote.ask and quote.ask > 0
+                         for quote in (opra.get(long_symbol), opra.get(short_symbol)))
+        if not feed_ready:
+            feed_reason = "Fresh verified OPRA quotes are unavailable"
+    except Exception as exc:
+        feed_reason = ("OPRA subscription is unavailable for this Paper account" if
+                       getattr(exc, "status_code", None) == 403 else
+                       "OPRA quote verification failed")
+    if body["send"] and not feed_ready:
+        raise ValueError(f"Automatic spread stop is unavailable: {feed_reason}")
+    watch = getattr(poller, "spread_stops", None)
+    if watch is None or watch.store is not service.store:
+        raise ValueError("Paper stop store is not active for this account")
+    maximum_loss = (basis if kind == "debit" else width - basis) * long.quantity * 100
+    stop_loss = ((basis - stop_value) if kind == "debit" else
+                 (stop_value - basis)) * long.quantity * 100
+    return service, watch, {"long_contract": long_symbol,
+                            "short_contract": short_symbol,
+                            "quantity": long.quantity, "kind": kind,
+                            "basis": basis, "long_average": long.average_price,
+                            "short_average": short.average_price,
+                            "width": width, "stop_value": stop_value,
+                            "send": body["send"], "feed_ready": feed_ready,
+                            "feed_reason": feed_reason,
+                            "maximum_loss": maximum_loss, "stop_loss": stop_loss}
+
+
+@app.post("/api/paper/vertical/stop/preview")
+async def paper_vertical_stop_preview(request: Request):
+    _guard(request)
+    try:
+        _, _, plan = await run_in_threadpool(_paper_vertical_stop_plan, await request.json())
+        return {"ok": True, **{key: str(value) if isinstance(value, Decimal) else value
+                               for key, value in plan.items()},
+                "warning": ("APP-WATCHED: one close attempt only while this app runs, Paper orders are armed, regular hours are open, and both OPRA quotes stay fresh. No broker-held stop; a limit close can remain unfilled." if plan["send"] else
+                            "WATCH ONLY: no order will be sent. This alert needs a running app and fresh OPRA quotes.")}
+    except (ValueError, TypeError, AttributeError, InvalidOperation) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Paper spread stop review failed; no stop was set"}
+
+
+@app.post("/api/paper/vertical/stop/set")
+async def paper_vertical_stop_set(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        result = await run_in_threadpool(_set_paper_vertical_stop, body)
+        return {"ok": True, **result}
+    except (ValueError, TypeError, AttributeError, InvalidOperation) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Paper spread stop preflight failed; no stop was set"}
+
+
+def _set_paper_vertical_stop(body: dict) -> dict:
+    with BROKER_ACTION_LOCK:
+        service, watch, plan = _paper_vertical_stop_plan(body)
+        expected = body.get("reviewed") if isinstance(body, dict) else None
+        if expected != {key: str(plan[key]) for key in ("quantity", "basis", "width", "maximum_loss")}:
+            raise ValueError("Vertical size or risk changed since preview; review again")
+        if plan["send"] and (not service.armed or
+                             not service._market_open(datetime.now(timezone.utc)) or
+                             service.store.open_mutations()):
+            raise ValueError("Arm Paper orders during regular hours and resolve earlier outcomes before enabling a send stop")
+        stop = watch.set(plan["long_contract"], plan["short_contract"], plan["quantity"],
+                         plan["kind"], plan["basis"], plan["long_average"],
+                         plan["short_average"], plan["width"], plan["stop_value"],
+                         plan["send"])
+        return {"stop_id": stop["stop_id"], "status": stop["status"],
+                "send": stop["send"], "feed_ready": plan["feed_ready"],
+                "message": ("App-watched Paper spread stop set; no broker-held stop exists" if
+                            plan["feed_ready"] else
+                            "Watch-only stop saved but suspended until fresh OPRA quotes are available")}
+
+
+@app.post("/api/paper/vertical/stop/clear")
+async def paper_vertical_stop_clear(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        stop_id = body.get("stop_id")
+        if not isinstance(stop_id, str) or len(stop_id) > 100:
+            raise ValueError("A Paper spread stop ID is required")
+        def clear():
+            with BROKER_ACTION_LOCK:
+                service, _ = _paper_service()
+                watch = getattr(poller, "spread_stops", None)
+                if watch is None or watch.store is not service.store:
+                    raise ValueError("Paper stop store is not active for this account")
+                if body.get("acknowledged") is True and not watch.acknowledge_unknown(stop_id):
+                    raise ValueError("Unknown stop outcome is still unresolved; inspect the Paper order first")
+                if not watch.clear(stop_id):
+                    raise ValueError("A stop close may be in flight; reconcile before clearing it")
+                return {"ok": True, "stop_id": stop_id}
+        return await run_in_threadpool(clear)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _paper_option_fixed_exit(body: dict):
@@ -1806,8 +1966,16 @@ async def paper_entry_reconcile(request: Request):
         request_id = str(UUID(str((await request.json()).get("request_id"))))
     except (ValueError, TypeError, AttributeError):
         raise HTTPException(400, "request_id must be a UUID") from None
-    service, _ = _paper_service()
-    result = await run_in_threadpool(service.reconcile_submit, request_id)
+    def reconcile():
+        with BROKER_ACTION_LOCK:
+            service, _ = _paper_service()
+            result = service.reconcile_submit(request_id)
+            watch = getattr(poller, "spread_stops", None)
+            if watch is not None and watch.store is service.store and result.status.value in (
+                    "accepted", "rejected"):
+                watch.resolve_request(request_id, result.accepted, result.message or "Paper order reconciled")
+            return result
+    result = await run_in_threadpool(reconcile)
     return {"ok": result.accepted, "status": result.status.value,
             "order_id": result.order_id, "message": result.message,
             "request_id": request_id}
