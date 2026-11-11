@@ -37,7 +37,7 @@ from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_re
                                    oco_plan, trailing_plan)
 from .brokers.paper_options import (chain_query, chain_response, expirations_query,
                                     expirations_response, long_entry_plan,
-                                    option_close_plan)
+                                    option_close_plan, option_fixed_exit_plan)
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -80,12 +80,13 @@ APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
     "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
                      "equity-oco-adjust", "equity-add", "equity-trailing",
-                     "option-long-entry", "option-close", "option-cancel"),
+                     "option-long-entry", "option-close", "option-cancel",
+                     "option-fixed-exit"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put with a reviewed limit order; held options can be closed, and unfilled Paper option quantities canceled. Other option and spread workflows are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; held options can be closed or given one fixed stop or target, and unfilled option quantities canceled. Option exits are single orders, never OCO pairs. Other option and spread workflows are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -595,6 +596,96 @@ def _cancel_paper_option(order_id: str, request_id: str):
     with BROKER_ACTION_LOCK:
         service, _, _, _ = _paper_option_cancel_check(order_id)
         return service.execute(CancelOrder(order_id), request_id)
+
+
+def _paper_option_fixed_exit(body: dict):
+    service, _ = _paper_service()
+    symbol = body.get("contract") if isinstance(body, dict) else None
+    if not isinstance(symbol, str) or not symbol:
+        raise ValueError("an OCC option contract is required")
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref or account.status.upper() != "ACTIVE":
+        raise ValueError("Alpaca Paper account changed or is inactive")
+    positions = [position for position in account.positions
+                 if position.symbol.replace(" ", "") == symbol]
+    if len(positions) != 1:
+        raise ValueError("exactly one held option position is required")
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=active))
+    if any(symbol == leg.symbol.replace(" ", "") for group in groups
+           for order in group.orders if order.status in active for leg in order.legs):
+        raise ValueError("an active option order already exists; resolve it before attaching an exit")
+    quote = service.adapter.query(QuotesQuery((symbol,), AssetType.OPTION)).get(symbol)
+    intent = option_fixed_exit_plan(body, positions[0], quote)
+    return service, intent, positions[0], quote
+
+
+@app.post("/api/paper/options/exit/preview")
+async def paper_option_exit_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, position, quote = await run_in_threadpool(_paper_option_fixed_exit,
+                                                               await request.json())
+        role = "stop" if intent.stop_price is not None else "target"
+        return {"ok": True, "contract": intent.leg.symbol,
+                "side": intent.leg.instruction.value,
+                "quantity": str(position.quantity), "role": role,
+                "price": str(intent.stop_price or intent.limit_price),
+                "time_in_force": intent.time_in_force.value,
+                "indicative_mark": str(quote.mark),
+                "protection": ("One broker-held fixed stop after Alpaca accepts it; no target is paired. "
+                               "A triggered stop becomes a market order and may fill at another price."
+                               if role == "stop" else
+                               "One broker-held target after Alpaca accepts it; no stop is paired.")}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option exit preview failed; no order was sent"}
+
+
+@app.post("/api/paper/options/exit/submit")
+async def paper_option_exit_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_option_exit, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option exit preflight failed; no order was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_option_exit(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, intent, position, _ = _paper_option_fixed_exit(body)
+        symbol = intent.leg.symbol
+        def preflight(account):
+            positions = [held for held in account.positions
+                         if held.symbol.replace(" ", "") == symbol]
+            if (account.status.upper() != "ACTIVE" or len(positions) != 1 or
+                    positions[0].asset_type != AssetType.OPTION or
+                    positions[0].side != position.side or
+                    positions[0].quantity != position.quantity):
+                raise ValueError("option position changed; no exit was sent")
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                       statuses=active))
+            if any(symbol == leg.symbol.replace(" ", "") for group in groups
+                   for order in group.orders if order.status in active for leg in order.legs):
+                raise ValueError("another option order appeared; no exit was sent")
+        return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 
 def _paper_entry(body: dict, for_submit: bool = False):

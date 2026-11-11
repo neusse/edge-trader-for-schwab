@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from .models import (AccountSnapshot, AssetType, OptionChain, OptionChainQuery,
                      OptionExpirationsQuery, OptionType, OrderInstruction,
                      OrderLegIntent, OrderType, Position, PositionSide,
-                     SimpleOrderIntent, TimeInForce)
+                     Quote, SimpleOrderIntent, TimeInForce)
 
 UNDERLYING = re.compile(r"[A-Z][A-Z0-9.]{0,5}\Z")
 OCC = re.compile(r"([A-Z0-9.]{1,6}) {0,5}(\d{2})(\d{2})(\d{2})([CP])(\d{8})\Z")
@@ -192,3 +192,61 @@ def option_close_plan(body: dict, position: Position,
         OrderLegIntent(symbol, AssetType.OPTION, instruction, quantity),
         OrderType.LIMIT, TimeInForce.DAY, f"et-opt-close-{request_id.hex}",
         limit_price=limit)
+
+
+def option_fixed_exit_plan(body: dict, position: Position, quote: Quote | None,
+                           now: datetime | None = None) -> SimpleOrderIntent:
+    """One full-position Paper option stop OR target; never a synthetic OCO."""
+    if not isinstance(body, dict) or position.asset_type != AssetType.OPTION:
+        raise ValueError("Paper option exit requires a held option position")
+    symbol = body.get("contract")
+    match = OCC.fullmatch(position.symbol)
+    if symbol != position.symbol.replace(" ", "") or match is None:
+        raise ValueError("option exit contract must match the held OCC position")
+    _, year, month, day, _, _ = match.groups()
+    try:
+        expiration = date(2000 + int(year), int(month), int(day))
+    except ValueError:
+        raise ValueError("held option OCC expiration is invalid") from None
+    quantity = position.quantity
+    if quantity <= 0 or quantity != quantity.to_integral_value() or quantity > 10000:
+        raise ValueError("option exit requires 1 to 10000 whole held contracts")
+    if (quote is None or quote.symbol.replace(" ", "") != symbol or
+            quote.source != "Alpaca indicative options" or quote.realtime or
+            quote.observed_at.tzinfo is None):
+        raise ValueError("a current Alpaca indicative option quote is required")
+    now = now or datetime.now(timezone.utc)
+    if expiration < now.astimezone(ET).date():
+        raise ValueError("expired option position cannot receive a new exit")
+    if not 0 <= (now - quote.observed_at).total_seconds() <= 60:
+        raise ValueError("Alpaca option quote is stale; refresh before attaching an exit")
+    mark = quote.mark
+    if mark is None or mark <= 0:
+        raise ValueError("Alpaca option quote has no usable bid/ask mark")
+    role = body.get("role")
+    if role not in ("stop", "target"):
+        raise ValueError("option exit role must be stop or target")
+    try:
+        price = Decimal(str(body.get("price")))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("option exit price must be positive") from None
+    if not price.is_finite() or price <= 0 or price != price.quantize(Decimal("0.01")):
+        raise ValueError("option exit price must be positive with cent precision")
+    if role == "stop" and ((position.side == PositionSide.LONG and price >= mark) or
+                           (position.side == PositionSide.SHORT and price <= mark)):
+        raise ValueError("fixed stop must be on the loss side of the indicative mark")
+    if role == "target" and ((position.side == PositionSide.LONG and price <= mark) or
+                             (position.side == PositionSide.SHORT and price >= mark)):
+        raise ValueError("target must be on the profit side of the indicative mark")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("request_id must be a UUID") from None
+    instruction = (OrderInstruction.SELL_TO_CLOSE if position.side == PositionSide.LONG else
+                   OrderInstruction.BUY_TO_CLOSE)
+    return SimpleOrderIntent(
+        OrderLegIntent(symbol, AssetType.OPTION, instruction, quantity),
+        OrderType.STOP if role == "stop" else OrderType.LIMIT,
+        TimeInForce.GTC, f"et-opt-exit-{request_id.hex}",
+        stop_price=price if role == "stop" else None,
+        limit_price=price if role == "target" else None)

@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal as D
 from types import SimpleNamespace
 
@@ -16,7 +16,8 @@ from companion.brokers.models import (AccountQuery, AccountSnapshot, AssetType,
                                       QuotesQuery)
 from companion.brokers.paper_options import chain_query, chain_response
 from companion.brokers.paper_options import (expirations_query, expirations_response,
-                                             long_entry_plan, option_close_plan)
+                                             long_entry_plan, option_close_plan,
+                                             option_fixed_exit_plan)
 
 
 NOW = datetime(2026, 11, 11, 17, 0, tzinfo=timezone.utc)
@@ -125,6 +126,34 @@ def test_option_close_plan_maps_long_short_and_partial_without_overclosing():
         option_close_plan({**body, "quantity": "4"}, _held_option(), NOW)
     with pytest.raises(ValueError, match="cent precision"):
         option_close_plan({**body, "limit_price": "1.405"}, _held_option(), NOW)
+
+
+def test_option_fixed_exit_is_one_whole_position_stop_or_target():
+    quote = _chain().contracts[0].quote
+    base = {"contract": "AAPL261113C00225000", "request_id": _entry_body()["request_id"]}
+    long_stop = option_fixed_exit_plan({**base, "role": "stop", "price": "1.00"},
+                                       _held_option(), quote, NOW)
+    long_target = option_fixed_exit_plan({**base, "role": "target", "price": "1.60"},
+                                         _held_option(), quote, NOW)
+    short_stop = option_fixed_exit_plan({**base, "role": "stop", "price": "1.60"},
+                                        _held_option(PositionSide.SHORT), quote, NOW)
+    short_target = option_fixed_exit_plan({**base, "role": "target", "price": "1.00"},
+                                          _held_option(PositionSide.SHORT), quote, NOW)
+    assert long_stop.order_type == OrderType.STOP and long_stop.stop_price == D("1.00")
+    assert long_stop.leg.quantity == 3 and long_stop.time_in_force == TimeInForce.GTC
+    assert long_target.order_type == OrderType.LIMIT and long_target.limit_price == D("1.60")
+    assert short_stop.leg.instruction == OrderInstruction.BUY_TO_CLOSE
+    assert short_target.leg.instruction == OrderInstruction.BUY_TO_CLOSE
+    assert short_target.limit_price == D("1.00")
+    with pytest.raises(ValueError, match="loss side"):
+        option_fixed_exit_plan({**base, "role": "stop", "price": "1.50"},
+                               _held_option(), quote, NOW)
+    with pytest.raises(ValueError, match="current"):
+        option_fixed_exit_plan({**base, "role": "stop", "price": "1.00"},
+                               _held_option(), None, NOW)
+    with pytest.raises(ValueError, match="stale"):
+        option_fixed_exit_plan({**base, "role": "stop", "price": "1.00"},
+                               _held_option(), quote, NOW + timedelta(seconds=61))
 
 
 def test_option_discovery_route_uses_active_paper_adapter_without_mutation(monkeypatch):
@@ -258,3 +287,37 @@ def test_option_cancel_previews_only_remaining_owned_contracts(monkeypatch):
                                              OrderStatus.WORKING, (external,))
     refused = client.post("/api/paper/options/cancel/preview", json=body, headers=headers)
     assert not refused.json()["ok"]
+
+
+def test_option_fixed_exit_route_rechecks_order_free_full_position(monkeypatch):
+    import companion.app as appmod
+
+    held = _held_option()
+    account = _account(positions=(held,))
+    commands = []
+    def query(value):
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return ()
+        if isinstance(value, QuotesQuery): return {held.symbol: _chain().contracts[0].quote}
+        raise AssertionError(type(value))
+    def execute(command, request_id, preflight):
+        preflight(account)
+        commands.append(command)
+        return MutationResult(MutationStatus.ACCEPTED, "paper-option-stop")
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query),
+                              account_ref="paper-account", execute=execute)
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    monkeypatch.setattr("companion.brokers.paper_options.datetime", SimpleNamespace(
+        now=lambda _tz: NOW))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    body = {"contract": held.symbol, "role": "stop", "price": "1.00",
+            "request_id": _entry_body()["request_id"]}
+    headers = {"X-Companion": "1"}
+    preview = client.post("/api/paper/options/exit/preview", json=body, headers=headers)
+    assert preview.json()["ok"], preview.json()
+    assert preview.json()["quantity"] == "3"
+    assert "no target is paired" in preview.json()["protection"]
+    result = client.post("/api/paper/options/exit/submit", json=body, headers=headers)
+    assert result.json()["ok"] and len(commands) == 1
+    assert commands[0].intent.order_type == OrderType.STOP
+    assert commands[0].intent.leg.quantity == 3
