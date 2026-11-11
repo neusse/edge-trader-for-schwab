@@ -48,6 +48,12 @@ def test_canonical_gtc_translates_to_schwab_duration():
     assert order["duration"] == "GOOD_TILL_CANCEL"
 
 
+def test_schwab_simple_equity_preserves_fractional_quantity():
+    intent = SimpleOrderIntent(OrderLegIntent("AAPL", AssetType.EQUITY, OrderInstruction.SELL, D("0.5")),
+                               OrderType.MARKET, TimeInForce.DAY, "fractional-close")
+    assert build_schwab_order(intent)["orderLegCollection"][0]["quantity"] == 0.5
+
+
 def credit_spread():
     return MultiLegOrderIntent((
         OrderLegIntent("AAPL261113P00100000", AssetType.OPTION,

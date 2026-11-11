@@ -25,7 +25,10 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
-from .brokers.models import CancelOrder, MutationResult, MutationStatus
+from .brokers.models import (
+    AssetType, CancelOrder, MutationResult, MutationStatus, OrderInstruction,
+    OrderLegIntent, OrderType, SimpleOrderIntent, SubmitOrder, TimeInForce,
+)
 from .brokers.schwab_adapter import SchwabAdapter
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
@@ -1314,34 +1317,33 @@ class Trader:
             if guard:
                 return guard
         size = abs(qty)
-        order = {"orderStrategyType": "SINGLE", "orderType": "MARKET", "session": "NORMAL",
-                 "duration": "DAY",
-                 "orderLegCollection": [{"instruction": instr, "quantity": int(size) if size == int(size) else size,
-                                         "instrument": {"symbol": symbol, "assetType": asset}}]}
+        intent = SimpleOrderIntent(
+            OrderLegIntent(symbol, AssetType[asset], OrderInstruction[instr], Decimal(str(size))),
+            OrderType.MARKET, TimeInForce.DAY, f"close-{symbol}-{now_iso()}",
+        )
         self.store.log_action("close", symbol, None, "SENDING", f"{instr} {size:g} MARKET")
         log.warning("CLOSE %s %s %s MARKET", instr, size, symbol)
         try:
-            r = self._logged("place_order", lambda: client.place_order(self._hash, order))
+            result = self._broker_mutation("place_order", SubmitOrder(intent))
         except Exception as e:
             self.store.log_action("close", symbol, None, "UNKNOWN", repr(e))
             return {"ok": False, "symbol": symbol, "unresolved_close": True,
                     "error": "No answer from Schwab on the close. It MAY have been sent (and your stop/target "
                              "cancelled by Schwab): check thinkorswim now."}
-        if r.status_code == 429:
-            self.store.log_action("close", symbol, None, "RATE_LIMITED", r.text[:300])
+        if result.status == MutationStatus.RATE_LIMITED:
+            self.store.log_action("close", symbol, None, "RATE_LIMITED", result.message)
             return {"ok": False, "symbol": symbol,
-                    "error": "Schwab throttled the close (HTTP 429): nothing was sent. Your stop/target are still working."}
-        if r.status_code >= 500:
-            self.store.log_action("close", symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:300]}")
+                    "error": "Schwab throttled the close: nothing was sent. Your stop/target are still working."}
+        if result.status == MutationStatus.UNKNOWN:
+            self.store.log_action("close", symbol, None, "UNKNOWN", result.message)
             return {"ok": False, "symbol": symbol, "unresolved_close": True,
-                    "error": f"Schwab answered HTTP {r.status_code}: the close MAY have been sent. Check thinkorswim now."}
-        if r.status_code not in (200, 201):
-            self.store.log_action("close", symbol, None, "REJECTED", f"HTTP {r.status_code} {r.text[:300]}")
+                    "error": "The close MAY have been sent. Check thinkorswim now."}
+        if result.status == MutationStatus.REJECTED:
+            self.store.log_action("close", symbol, None, "REJECTED", result.message)
             return {"ok": False, "symbol": symbol,
-                    "error": f"Schwab refused the close (HTTP {r.status_code}): {r.text[:200]}. "
+                    "error": f"Schwab refused the close: {result.message}. "
                              "Your stop/target should still be working: check thinkorswim."}
-        tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-        oid = int(tail) if tail.isdigit() else None
+        oid = int(result.order_id) if result.order_id else None
         final: dict = {}
         if oid:
             for _ in range(10):   # a market order usually fills well within a second

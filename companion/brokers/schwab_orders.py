@@ -40,8 +40,10 @@ def _leg(leg: OrderLegIntent, instruction: OrderInstruction | None = None) -> di
             OrderInstruction.BUY_TO_OPEN, OrderInstruction.SELL_TO_OPEN,
             OrderInstruction.BUY_TO_CLOSE, OrderInstruction.SELL_TO_CLOSE):
         raise ValueError("Schwab option orders require an explicit open or close instruction")
+    quantity = (float(leg.quantity) if leg.asset_type == AssetType.EQUITY and
+                leg.quantity != leg.quantity.to_integral_value() else _qty(leg.quantity))
     return {"instruction": action.value.upper().replace("-", "_"),
-            "quantity": _qty(leg.quantity),
+            "quantity": quantity,
             "instrument": {"symbol": leg.symbol, "assetType": leg.asset_type.value.upper()}}
 
 
