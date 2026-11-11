@@ -279,6 +279,7 @@ def test_close_sends_one_paired_net_debit(desk):
     o = desk.t._client.placed[-1]
     assert o["orderType"] == "NET_DEBIT" and [l["instruction"] for l in o["orderLegCollection"]] == \
         ["BUY_TO_CLOSE", "SELL_TO_CLOSE"]
+    assert o == close_order(desk.book.get(sid)["legs"], False, Decimal("1.20"), 1)
     assert desk.book.get(sid)["state"] == "CLOSING"
 
 
@@ -302,6 +303,15 @@ def test_an_unclear_close_holds_the_spread_and_is_never_resent(desk):
     desk.t._client.place_exc = None
     assert "Only an OPEN spread" in desk.close({"spread_id": sid, "expected_limit": "1.20"})["error"]
     assert len(desk.t._client.placed) == 2          # the entry and the one unclear close
+
+
+@pytest.mark.parametrize("action,limit", [("close", "1.20"), ("set_target", "0.60")])
+def test_spread_exit_server_error_keeps_the_hold(desk, action, limit):
+    sid = open_spread(desk)
+    desk.t._client.place_resp = Resp(500, text="server error")
+    result = getattr(desk, action)({"spread_id": sid, "expected_limit": limit})
+    assert result["status"] == "UNKNOWN" and desk.book.get(sid)["hold"]
+    assert len(desk.t._client.placed) == 2
 
 
 def test_resolve_clears_a_hold(desk):
@@ -537,6 +547,8 @@ def test_set_target_sends_one_gtc_paired_close_of_what_is_held(desk):
     o = desk.t._client.placed[-1]
     assert o["duration"] == "GOOD_TILL_CANCEL" and o["orderType"] == "NET_DEBIT" and o["price"] == "0.60"
     assert [l["quantity"] for l in o["orderLegCollection"]] == [2, 2]
+    assert o == close_order(desk.book.get(sid)["legs"], False, Decimal("0.60"), 2,
+                            duration="GOOD_TILL_CANCEL")
     sp = desk.book.get(sid)
     assert sp["target_order_id"] == 800 and sp["state"] == "OPEN" and sp["detail"] == "target sent at 0.60"
     assert desk.close_plan(sid)["working"][0]["role"] == "target"

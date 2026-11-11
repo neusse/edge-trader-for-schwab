@@ -28,6 +28,10 @@ def _price(value: Decimal) -> str:
     return format(value, "f")
 
 
+def _duration(value: TimeInForce) -> str:
+    return "GOOD_TILL_CANCEL" if value == TimeInForce.GTC else value.value.upper()
+
+
 def _leg(leg: OrderLegIntent, instruction: OrderInstruction | None = None) -> dict:
     if leg.asset_type not in (AssetType.EQUITY, AssetType.OPTION):
         raise ValueError("Schwab canonical orders support equities and options only")
@@ -43,7 +47,7 @@ def _leg(leg: OrderLegIntent, instruction: OrderInstruction | None = None) -> di
 
 def _simple(intent: SimpleOrderIntent) -> dict:
     body = {"orderStrategyType": "SINGLE", "orderType": intent.order_type.value.upper().replace("-", "_"),
-            "session": "NORMAL", "duration": intent.time_in_force.value.upper(),
+            "session": "NORMAL", "duration": _duration(intent.time_in_force),
             "orderLegCollection": [_leg(intent.leg)]}
     if intent.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
         body["price"] = _price(intent.limit_price)
@@ -94,8 +98,8 @@ def build_schwab_order(intent) -> dict:
         entry["childOrderStrategies"] = [{
             "orderStrategyType": "OCO",
             "childOrderStrategies": [
-                _target(exit_leg, intent.take_profit_price, intent.entry.time_in_force.value.upper()),
-                _stop(exit_leg, intent.stop_loss, intent.entry.time_in_force.value.upper()),
+                _target(exit_leg, intent.take_profit_price, _duration(intent.entry.time_in_force)),
+                _stop(exit_leg, intent.stop_loss, _duration(intent.entry.time_in_force)),
             ],
         }]
         return entry
@@ -104,14 +108,14 @@ def build_schwab_order(intent) -> dict:
                 OrderInstruction.SELL, OrderInstruction.BUY_TO_COVER,
                 OrderInstruction.SELL_TO_CLOSE, OrderInstruction.BUY_TO_CLOSE):
             raise ValueError("Schwab OCO legs must close an existing position")
-        duration = intent.time_in_force.value.upper()
+        duration = _duration(intent.time_in_force)
         return {"orderStrategyType": "OCO", "childOrderStrategies": [
             _target(intent.leg, intent.take_profit_price, duration),
             _stop(intent.leg, intent.stop_loss, duration),
         ]}
     if isinstance(intent, TrailingOrderIntent):
         body = {"orderStrategyType": "SINGLE", "orderType": "TRAILING_STOP",
-                "session": "NORMAL", "duration": intent.time_in_force.value.upper(),
+                "session": "NORMAL", "duration": _duration(intent.time_in_force),
                 "stopPriceLinkBasis": "MARK",
                 "stopPriceLinkType": "VALUE" if intent.trail_price is not None else "PERCENT",
                 "stopPriceOffset": float(intent.trail_price if intent.trail_price is not None
@@ -134,7 +138,7 @@ def build_schwab_order(intent) -> dict:
         return {"orderStrategyType": "SINGLE",
                 "orderType": "NET_DEBIT" if intent.limit_price > 0 else "NET_CREDIT",
                 "complexOrderStrategyType": "VERTICAL", "session": "NORMAL",
-                "duration": intent.time_in_force.value.upper(),
+                "duration": _duration(intent.time_in_force),
                 "price": _price(abs(intent.limit_price)), "quantity": qty,
                 "orderLegCollection": [_leg(leg) for leg in intent.legs]}
     raise TypeError(f"unknown Schwab order intent: {type(intent).__name__}")
