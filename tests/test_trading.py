@@ -627,6 +627,33 @@ def test_move_stop_keeps_the_oco_and_its_target(trader, monkeypatch):
     assert body["orderLegCollection"][0]["quantity"] == 57
 
 
+def test_unclear_stop_replace_blocks_another_move(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    broker = Broker([_mu_oco()])
+    attempts = []
+    broker.replace_order = lambda _hash, oid, body: (attempts.append((oid, body)), Resp(500))[1]
+    trader._client = broker
+    first = trader.move_stop("MXR", "910.00", [], set())
+    assert not first["ok"] and "outcome unknown" in first["message"] and len(attempts) == 1
+    second = trader.move_stop("MXR", "909.00", [], set())
+    assert not second["ok"] and "Resolve" in second["error"] and len(attempts) == 1
+
+
+def test_stop_limit_replace_preserves_limit_and_gtc(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    stop = _mu_oco()
+    stop_leg = stop["childOrderStrategies"][0]
+    stop_leg["orderType"] = "STOP_LIMIT"
+    stop_leg["price"] = "914.00"
+    stop_leg["duration"] = "GOOD_TILL_CANCEL"
+    trader._client = Broker([stop])
+    result = trader.move_stop("MXR", "910.00", [], set())
+    assert result["ok"], result
+    (_oid, body), = trader._client.replaced
+    assert body["orderType"] == "STOP_LIMIT" and body["price"] == "914.00"
+    assert body["duration"] == "GOOD_TILL_CANCEL" and body["stopPrice"] == "910.00"
+
+
 def test_move_standalone_stop_without_target_is_fine(trader, monkeypatch):
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
     lone = {"orderId": 60, "orderStrategyType": "OCO", "status": "WORKING",   # container only to reuse fake
@@ -657,6 +684,18 @@ def test_new_stop_is_sent_with_the_existing_target_as_one_oco(trader, monkeypatc
     assert order["orderStrategyType"] == "OCO"
     assert target["orderType"] == "LIMIT" and target["price"] == "900.18"
     assert stop["orderType"] == "STOP" and stop["stopPrice"] == "912.00"
+
+
+def test_unclear_created_stop_blocks_another_stop(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    broker = Broker([])
+    attempts = []
+    broker.place_order = lambda _hash, order: (attempts.append(order), Resp(500))[1]
+    trader._client = broker
+    first = trader.move_stop("MXR", "912.00", [], set())
+    assert not first["ok"] and "MAY have been placed" in first["error"] and len(attempts) == 1
+    second = trader.move_stop("MXR", "911.00", [], set())
+    assert not second["ok"] and "Resolve" in second["error"] and len(attempts) == 1
 
 
 def test_partial_market_then_rebuilds_oco_on_the_rest(trader, monkeypatch):
