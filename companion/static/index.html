@@ -1325,7 +1325,8 @@ function renderAlpacaOverview(st) {
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td>
     <td>${o.cancellable && o.group_type === "BRACKET" && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}
     ${o.group_type === "OCO" && ["STOP", "TARGET"].includes(o.role) && st.broker?.workflows?.includes("equity-oco-adjust") ? `<button type="button" class="btn sm ghost" data-paper-oco-adjust="${esc(o.order_id)}" data-paper-role="${o.role.toLowerCase()}" data-paper-symbol="${esc(o.symbol)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move ${esc(o.role.toLowerCase())}</button>` : ""}
-    ${o.group_type === "SIMPLE" && o.asset_type === "OPTION" && o.tag?.startsWith("et-opt-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("option-cancel") ? `<button type="button" class="btn sm ghost" data-paper-option-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperOptionCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel remaining</button>` : ""}</td></tr>`).join("");
+    ${o.group_type === "SIMPLE" && o.asset_type === "OPTION" && o.tag?.startsWith("et-opt-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("option-cancel") ? `<button type="button" class="btn sm ghost" data-paper-option-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperOptionCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel remaining</button>` : ""}
+    ${o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.asset_type === "OPTION" && o.tag?.startsWith("et-vertical-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("vertical-cancel") ? `<button type="button" class="btn sm ghost" data-paper-vertical-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperVerticalCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel spread remainder</button>` : ""}</td></tr>`).join("");
   const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
   const fillRows = fills.map(f => `<tr><td>${esc(new Date(f.time).toLocaleString())}</td><td>${esc(f.symbol)}</td><td>${esc(f.instruction)}</td><td>${esc(f.quantity)}</td><td>${money(Number(f.price), false)}</td></tr>`).join("");
   panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
@@ -1365,6 +1366,7 @@ function render(st) {
     paperOptionExitSentKeys.clear();
     paperVerticalSentKeys.clear();
     paperVerticalCloseSentKeys.clear();
+    paperVerticalCancelSentIds.clear();
     for (const name of ["long_contract", "short_contract"]) {
       const select = $("paper-vertical-close-form").elements[name];
       select.innerHTML = '<option value="">No held options</option>';
@@ -1517,6 +1519,7 @@ const paperOptionCancelSentIds = new Set();
 const paperOptionExitSentKeys = new Set();
 const paperVerticalSentKeys = new Set();
 const paperVerticalCloseSentKeys = new Set();
+const paperVerticalCancelSentIds = new Set();
 const paperOptionsForm = $("paper-options-form");
 const paperExpirySelect = paperOptionsForm.elements.expiration;
 function resetPaperOptionSelection() {
@@ -2384,6 +2387,49 @@ $("alpaca-overview").addEventListener("click", async e => {
     if (sent) {
       paperOutcome = "unknown"; paperOptionCancelSentIds.add(orderId);
       paperMessage(`Option cancel may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(String(err.message || err));
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
+$("alpaca-overview").addEventListener("click", async e => {
+  const button = e.target.closest("[data-paper-vertical-cancel]");
+  if (!button || paperBusy || paperOutcome === "unknown" ||
+      lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready) return;
+  const orderId = button.dataset.paperVerticalCancel;
+  if (paperVerticalCancelSentIds.has(orderId)) return;
+  const order = (lastState.orders || []).find(o => o.order_id === orderId &&
+    o.group_type === "MULTI-LEG" && o.asset_type === "OPTION" &&
+    o.tag?.startsWith("et-vertical-") && o.live && Number(o.qty) > 0);
+  if (!order) return;
+  const requestId = crypto.randomUUID(), payload = {order_id:orderId, request_id:requestId};
+  paperBusy = true; paperRequestId = requestId; paperCommand = "CancelOrder"; paperIntentKey = null;
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const preview = await post("/api/paper/vertical/cancel/preview", payload);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Vertical cancel preview refused");
+    const legs = preview.legs.map(leg => `${leg.contract}: ${leg.remaining} remaining, ${leg.filled} filled`).join("; ");
+    if (!window.confirm(`Cancel the unfilled remainder of one Paper vertical order ${orderId}? ${legs}. ${preview.warning}`)) {
+      paperMessage("Paper vertical cancel review canceled."); return;
+    }
+    paperMessage("Sending Paper vertical cancel once…");
+    sent = true;
+    const result = await post("/api/paper/vertical/cancel/submit", payload);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown"; paperVerticalCancelSentIds.add(orderId);
+      paperMessage(result.message || "Vertical cancel outcome unknown. Reconcile before another action.");
+    } else {
+      paperRequestId = null; paperOutcome = null;
+      if (result.ok) paperVerticalCancelSentIds.add(orderId);
+      paperMessage(result.ok ? `Alpaca Paper accepted cancellation of vertical ${orderId}. Verify final broker state and any filled legs.` :
+        result.message || result.error || result.detail || "Vertical cancel refused");
+    }
+  } catch (err) {
+    if (sent) {
+      paperOutcome = "unknown"; paperVerticalCancelSentIds.add(orderId);
+      paperMessage(`Vertical cancel may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
     } else {
       paperRequestId = null;
       paperMessage(String(err.message || err));

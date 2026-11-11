@@ -7,8 +7,10 @@ from fastapi.testclient import TestClient
 
 from companion.brokers.models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerOrder,
+    CancelOrder,
     MutationResult, MutationStatus, OptionChain, OptionChainQuery,
     OptionContract, OptionType, OrderClass, OrderGroup, OrderInstruction,
+    OrderQuery,
     OrderLeg, OrderRole, OrderStatus, OrderType, OrdersQuery,
     Position, PositionSide, Quote, QuotesQuery, TimeInForce,
 )
@@ -210,3 +212,38 @@ def test_vertical_close_route_rechecks_exact_pair_and_one_mleg(monkeypatch):
                          OrderStatus.PARTIALLY_FILLED, (pending,)),)
     blocked = client.post("/api/paper/vertical/close/preview", json=body, headers=headers)
     assert not blocked.json()["ok"] and "active order" in blocked.json()["error"]
+
+
+def test_vertical_cancel_only_unfilled_owned_mleg_remainder(monkeypatch):
+    import companion.app as appmod
+
+    order_id = "e74ad353-4d70-4705-b046-c5bde18bb55f"
+    body = _body()
+    order = BrokerOrder(order_id, OrderStatus.PARTIALLY_FILLED, OrderType.LIMIT,
+                        TimeInForce.GTC,
+                        (OrderLeg(body["long_contract"], AssetType.OPTION,
+                                  OrderInstruction.SELL_TO_CLOSE, D(2), D(1)),
+                         OrderLeg(body["short_contract"], AssetType.OPTION,
+                                  OrderInstruction.BUY_TO_CLOSE, D(2), D(1))),
+                        OrderRole.TARGET, client_order_id="et-vertical-target-owned")
+    group = OrderGroup(order_id, OrderClass.MULTI_LEG,
+                       OrderStatus.PARTIALLY_FILLED, (order,))
+    commands = []
+    adapter = SimpleNamespace(query=lambda query: group if isinstance(query, OrderQuery)
+                              else _held_account())
+    store = SimpleNamespace(get_mutation_by_client_id=lambda _key: {"status": "accepted"})
+    service = SimpleNamespace(adapter=adapter, store=store,
+                              execute=lambda command, request_id: (
+                                  commands.append(command),
+                                  MutationResult(MutationStatus.ACCEPTED, order_id))[1])
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    payload = {"order_id": order_id, "request_id": REQUEST_ID}
+    headers = {"X-Companion": "1"}
+    preview = client.post("/api/paper/vertical/cancel/preview", json=payload, headers=headers)
+    assert preview.json()["ok"] and [leg["remaining"] for leg in preview.json()["legs"]] == ["1", "1"]
+    sent = client.post("/api/paper/vertical/cancel/submit", json=payload, headers=headers)
+    assert sent.json()["ok"] and len(commands) == 1 and isinstance(commands[0], CancelOrder)
+    store.get_mutation_by_client_id = lambda _key: None
+    refused = client.post("/api/paper/vertical/cancel/preview", json=payload, headers=headers)
+    assert not refused.json()["ok"] and "not owned" in refused.json()["error"]
