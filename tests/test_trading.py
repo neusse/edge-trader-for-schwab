@@ -330,6 +330,26 @@ def test_cancel_reports_fill_that_beat_the_cancel(trader, monkeypatch):
     assert "refused the cancel" in trader.cancel_entry(9)["error"]
 
 
+@pytest.mark.parametrize("status, expected", [(429, "rate limited"), (500, "outcome unknown")])
+def test_cancel_adapter_does_not_retry_uncertain_or_limited_mutation(trader, status, expected):
+    trader._client = CancelClient([_entry()], cancel_status=status)
+    result = trader.cancel_entry(9)
+    assert not result["ok"] and expected in result["error"]
+    assert trader._client.cancelled == [9]
+
+
+def test_cancel_adapter_treats_transport_failure_as_unknown(trader):
+    class TimeoutCancelClient(CancelClient):
+        def cancel_order(self, account_hash, oid):
+            self.cancelled.append(oid)
+            raise TimeoutError("lost reply")
+
+    trader._client = TimeoutCancelClient([_entry()])
+    result = trader.cancel_entry(9)
+    assert not result["ok"] and "outcome unknown" in result["error"]
+    assert trader._client.cancelled == [9]
+
+
 def test_missing_fill_count_or_live_children_refuse():
     e = _entry()
     del e["filledQuantity"]

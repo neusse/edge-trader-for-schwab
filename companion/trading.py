@@ -25,6 +25,8 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
+from .brokers.models import CancelOrder, MutationStatus
+from .brokers.schwab_adapter import SchwabAdapter
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
@@ -510,6 +512,22 @@ class Trader:
         self.store.log_request(endpoint, started, ok, r.status_code, detail)
         return r
 
+    def _broker_mutation(self, endpoint: str, command):
+        """Send one canonical command through the selected Schwab adapter and log its result."""
+        started = now_iso()
+        if self.on_request:
+            self.on_request(None)
+        try:
+            result = SchwabAdapter(self._ensure(), self._hash).execute(command)
+        except Exception as exc:
+            self.store.log_request(endpoint, started, False, None, repr(exc)[:300])
+            raise
+        if result.status == MutationStatus.RATE_LIMITED and self.on_request:
+            self.on_request(str(result.retry_after_seconds or 30))
+        self.store.log_request(endpoint, started, result.accepted, None,
+                               None if result.accepted else result.message[:300])
+        return result
+
     def quote(self, symbol: str, max_age: float = 1.0) -> dict:
         sym = symbol.upper().strip()
         hit = self._quote_cache.get(sym)
@@ -861,16 +879,22 @@ class Trader:
             return {"ok": False, "order_id": order_id, "symbol": sym, "error": f"Not cancelled: {why}."}
         self.store.log_action("cancel_entry", sym, order_id, "SENDING")
         try:
-            r = self._logged("cancel_order", lambda: client.cancel_order(self._hash, order_id))
+            result = self._broker_mutation("cancel_order", CancelOrder(str(order_id)))
         except Exception as e:
             self.store.log_action("cancel_entry", sym, order_id, "UNKNOWN", repr(e))
             return {"ok": False, "order_id": order_id, "symbol": sym,
                     "error": "No answer from Schwab: the entry may or may not be cancelled. Check thinkorswim."}
-        if r.status_code not in (200, 201, 204):
+        if result.status != MutationStatus.ACCEPTED:
             # Typical: it filled a moment before the cancel arrived.
-            self.store.log_action("cancel_entry", sym, order_id, "REJECTED", f"HTTP {r.status_code} {r.text[:300]}")
+            self.store.log_action("cancel_entry", sym, order_id, result.status.value.upper(), result.message)
+            if result.status == MutationStatus.UNKNOWN:
+                return {"ok": False, "order_id": order_id, "symbol": sym,
+                        "error": "Cancel outcome unknown: it may or may not be cancelled. Check thinkorswim."}
+            if result.status == MutationStatus.RATE_LIMITED:
+                return {"ok": False, "order_id": order_id, "symbol": sym,
+                        "error": "Schwab rate limited the cancel. Check the order before another action."}
             return {"ok": False, "order_id": order_id, "symbol": sym,
-                    "error": f"Schwab refused the cancel (HTTP {r.status_code}). It may have filled: check positions."}
+                    "error": "Schwab refused the cancel. It may have filled: check positions."}
         # Confirm: only CANCELED with zero fills counts as done. Up to ~3 s of read-only checks.
         status, filled, final = "UNCONFIRMED", None, {}
         for _ in range(10):
