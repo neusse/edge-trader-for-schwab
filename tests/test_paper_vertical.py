@@ -45,12 +45,13 @@ def _account(level=3, power="10000"):
                            options_trading_level=level, options_approved_level=3)
 
 
-def _held_account(long_strike=100, short_strike=105, kind="call", quantity="2"):
+def _held_account(long_strike=100, short_strike=105, kind="call", quantity="2",
+                  long_basis="2", short_basis="1"):
     body = _body(long_strike, short_strike, kind)
     positions = (Position(body["long_contract"], AssetType.OPTION, PositionSide.LONG,
-                          D(quantity), D("2")),
+                          D(quantity), D(long_basis)),
                  Position(body["short_contract"], AssetType.OPTION, PositionSide.SHORT,
-                          D(quantity), D("1")))
+                          D(quantity), D(short_basis)))
     return AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), positions)
 
 
@@ -110,6 +111,23 @@ def test_vertical_close_uses_opposite_intents_and_exact_held_quantity():
                      AssetType.OPTION, PositionSide.SHORT, D(1), D(1)))
         vertical_close_plan(_body(net="-1.30"), AccountSnapshot(
             "paper-account", "ACTIVE", BalanceSnapshot(), positions), _quotes(), NOW)
+
+
+def test_vertical_target_requires_verified_profit_and_is_one_gtc_mleg():
+    debit_target = vertical_close_plan({**_body(net="-1.30"), "role": "target"},
+                                       _held_account(), _quotes(), NOW)
+    assert debit_target.time_in_force == TimeInForce.GTC
+    assert debit_target.client_order_id.startswith("et-vertical-target-")
+    credit_target = vertical_close_plan({**_body(105, 100, net="0.70"), "role": "target"},
+                                        _held_account(105, 100, long_basis="1",
+                                                      short_basis="2"), _quotes(), NOW)
+    assert credit_target.limit_price == D("0.70")
+    with pytest.raises(ValueError, match="profit"):
+        vertical_close_plan({**_body(net="-0.90"), "role": "target"},
+                            _held_account(), _quotes(), NOW)
+    with pytest.raises(ValueError, match="basis"):
+        vertical_close_plan({**_body(105, 100, net="0.70"), "role": "target"},
+                            _held_account(105, 100), _quotes(), NOW)
 
 
 def test_vertical_entry_route_sends_one_mleg_and_rechecks_account(monkeypatch):
@@ -176,6 +194,10 @@ def test_vertical_close_route_rechecks_exact_pair_and_one_mleg(monkeypatch):
     assert sent.json()["ok"] and len(commands) == 1
     assert [leg.instruction for leg in commands[0].intent.legs] == [
         OrderInstruction.SELL_TO_CLOSE, OrderInstruction.BUY_TO_CLOSE]
+    target = client.post("/api/paper/vertical/close/preview", json={
+        **body, "role": "target"}, headers=headers)
+    assert target.json()["ok"] and target.json()["time_in_force"] == "gtc"
+    assert "No broker-held stop is paired" in target.json()["protection"]
     account = _held_account(quantity="1")
     later = client.post("/api/paper/vertical/close/preview", json=body, headers=headers)
     assert later.json()["ok"] and later.json()["quantity"] == "1"

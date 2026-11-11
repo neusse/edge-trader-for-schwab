@@ -414,12 +414,13 @@
   </form>
   <p id="paper-vertical-msg" class="mut" role="status">Load one option chain, then select two strikes.</p>
   <h3>Close held Paper vertical</h3>
-  <p class="mut">Choose the exact held long and short legs. A reviewed limit closes both in one multi-leg order. Active orders or unequal leg quantities block it; there is no automatic retry.</p>
+  <p class="mut">Choose the exact held long and short legs. A reviewed limit closes both in one multi-leg order. A GTC profit target is one broker-held order without a paired stop. Active orders or unequal leg quantities block another action.</p>
   <form id="paper-vertical-close-form" class="paper-fields">
     <label>Held long leg<select class="in" name="long_contract" required><option value="">No held long options</option></select></label>
     <label>Held short leg<select class="in" name="short_contract" required><option value="">No held short options</option></select></label>
     <label>Signed net close limit / share<input class="in" name="net_price" type="number" step="0.01" required placeholder="- credit / + debit"></label>
-    <button class="btn" type="submit" id="paper-vertical-close-submit" disabled>Review vertical close</button>
+    <button class="btn" type="submit" id="paper-vertical-close-submit" data-vertical-role="close" disabled>Review vertical close</button>
+    <button class="btn ghost" type="submit" id="paper-vertical-target-submit" data-vertical-role="target" disabled>Review profit target</button>
   </form>
   <p id="paper-vertical-close-msg" class="mut" role="status">Choose two held legs during a fresh Paper session.</p>
 </section>
@@ -1771,11 +1772,14 @@ function renderVerticalCloseControls(st) {
   const terms = symbol => symbol?.replaceAll(" ", "").match(/^([A-Z0-9.]{1,6}\d{6}[CP])\d{8}$/)?.[1];
   const pair = long && short && terms(long.symbol) && terms(long.symbol) === terms(short.symbol) &&
     Number(long.qty) === Number(short.qty) && Number(long.qty) > 0;
-  $("paper-vertical-close-submit").disabled = !pair || long.quote_stale || short.quote_stale ||
+  const blocked = !pair || long.quote_stale || short.quote_stale ||
     st?.broker?.key !== "alpaca-paper" || !st.broker.workflows?.includes("vertical-close") ||
     !paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy ||
     paperOutcome === "unknown" || (st.orders || []).some(o =>
       o.symbol === long.symbol || o.symbol === short.symbol);
+  $("paper-vertical-close-submit").disabled = blocked;
+  $("paper-vertical-target-submit").disabled = blocked ||
+    !st.broker.workflows?.includes("vertical-target");
 }
 $("paper-vertical-close-form").addEventListener("change", e => {
   if (["long_contract", "short_contract"].includes(e.target.name)) {
@@ -1790,12 +1794,13 @@ $("paper-vertical-close-form").addEventListener("change", e => {
 });
 $("paper-vertical-close-form").addEventListener("submit", async e => {
   e.preventDefault();
-  if ($("paper-vertical-close-submit").disabled) return;
+  const role = e.submitter?.dataset.verticalRole === "target" ? "target" : "close";
+  if ($(role === "target" ? "paper-vertical-target-submit" : "paper-vertical-close-submit").disabled) return;
   const form = new FormData(e.currentTarget);
   const payload = {long_contract:form.get("long_contract"),
     short_contract:form.get("short_contract"), net_price:form.get("net_price"),
-    request_id:crypto.randomUUID()};
-  const key = JSON.stringify([payload.long_contract,payload.short_contract,payload.net_price]);
+    role, request_id:crypto.randomUUID()};
+  const key = JSON.stringify([role,payload.long_contract,payload.short_contract,payload.net_price]);
   const message = $("paper-vertical-close-msg");
   if (paperVerticalCloseSentKeys.has(key)) {
     message.textContent = "This exact vertical close was already sent. Verify broker status first."; return;
@@ -1809,7 +1814,7 @@ $("paper-vertical-close-form").addEventListener("submit", async e => {
   try {
     const preview = await post("/api/paper/vertical/close/preview", payload, 45000);
     if (!preview.ok) throw new Error(preview.error || preview.detail || "Vertical close preview refused");
-    if (!window.confirm(`Close all ${preview.quantity} held verticals: sell ${preview.long_contract}, buy ${preview.short_contract} at signed net ${preview.net_price} per share? ` +
+    if (!window.confirm(`${role === "target" ? "Attach a GTC profit target for" : "Close"} all ${preview.quantity} held verticals: sell ${preview.long_contract}, buy ${preview.short_contract} at signed net ${preview.net_price} per share? ` +
         `Indicative close cost ${preview.indicative_close_cost}. ${preview.protection}`)) {
       message.textContent = "Paper vertical close review canceled."; return;
     }
@@ -1822,7 +1827,7 @@ $("paper-vertical-close-form").addEventListener("submit", async e => {
     } else {
       paperRequestId = null; paperOutcome = null;
       if (result.ok) paperVerticalCloseSentKeys.add(key);
-      message.textContent = result.ok ? `Alpaca Paper accepted vertical close ${result.order_id}. Verify both leg fills and remaining positions.` :
+      message.textContent = result.ok ? `Alpaca Paper accepted vertical ${role} ${result.order_id}. Verify both leg fills and remaining positions.` :
         result.message || result.error || result.detail || "Vertical close refused";
     }
   } catch (err) {
