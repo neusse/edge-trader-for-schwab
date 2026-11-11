@@ -252,6 +252,27 @@ class BrokerOrderService:
             if expected_stop is not None and order.stop_price != Decimal(str(expected_stop)):
                 return MutationResult(MutationStatus.UNKNOWN,
                                       message="Broker replacement stop does not match the reviewed price")
+            if client_order_id.startswith("et-autobe-") and order.status != OrderStatus.REJECTED:
+                target = next((item for item in group.orders
+                               if item.role == OrderRole.TARGET), None)
+                if (group.order_class != OrderClass.OCO or len(group.orders) != 2 or
+                        order.role != OrderRole.STOP or target is None or
+                        target.status != OrderStatus.WORKING or
+                        len(order.legs) != 1 or len(target.legs) != 1 or
+                        order.legs[0].asset_type != AssetType.EQUITY or
+                        target.legs[0].asset_type != AssetType.EQUITY or
+                        order.legs[0].symbol != target.legs[0].symbol or
+                        order.legs[0].quantity != target.legs[0].quantity or
+                        order.legs[0].instruction != target.legs[0].instruction or
+                        order.legs[0].instruction not in (OrderInstruction.SELL,
+                                                          OrderInstruction.BUY) or
+                        order.time_in_force != TimeInForce.GTC or
+                        target.time_in_force != TimeInForce.GTC or
+                        target.limit_price is None or
+                        order.legs[0].filled_quantity != 0 or
+                        target.legs[0].filled_quantity != 0):
+                    return MutationResult(MutationStatus.UNKNOWN,
+                                          message="Broker Auto B/E replacement did not retain the paired equity target")
             if client_order_id.startswith("et-vertical-target-") and order.status != OrderStatus.REJECTED:
                 try:
                     original = self.adapter.query(OrderQuery(row["payload"]["order_id"]))

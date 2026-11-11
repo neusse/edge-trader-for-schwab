@@ -14,8 +14,9 @@ from .canonical_view import build_canonical_state
 from .errors import read_health
 from .models import (AccountQuery, AssetType, FillsQuery, MarketClockQuery,
                      MarketSessionsQuery, OrdersQuery, OrderStatus, PositionSide,
-                     QuotesQuery, SubmitOrder)
+                     QuotesQuery, ReplaceOrder, SubmitOrder)
 from .order_service import BrokerOrderService
+from .paper_auto_be import PaperAutoBEWatch, oco_auto_be_plan
 from .paper_spread_stop import PaperSpreadStopWatch
 from .paper_vertical import vertical_close_plan
 from .paper_options import OCC
@@ -38,6 +39,7 @@ class AlpacaBootstrapPoller:
         self._thread: threading.Thread | None = None
         self._verified_account: str | None = None
         self.order_service: BrokerOrderService | None = None
+        self.auto_be: PaperAutoBEWatch | None = None
         self.spread_stops: PaperSpreadStopWatch | None = None
         self.action_lock = None  # injected by app; never wait for it while broker selection stops us
         self._last_fill_read: datetime | None = None
@@ -77,6 +79,7 @@ class AlpacaBootstrapPoller:
                     self.store = scoped
                     self.order_service = BrokerOrderService(self._adapter, scoped,
                                                              account.account_ref)
+                    self.auto_be = PaperAutoBEWatch(scoped)
                     self.spread_stops = PaperSpreadStopWatch(scoped)
                     if self.trader is not None:
                         self.trader.store = scoped
@@ -193,6 +196,8 @@ class AlpacaBootstrapPoller:
                 self._last_fill_read is not None, freshness=freshness)
             paper_spread_stops = self._spread_stop_rows(account, groups, clock,
                                                         today_session, now)
+            paper_auto_be = self._auto_be_rows(account, groups, quotes, clock,
+                                               today_session, now)
             positions = [{"symbol": p.symbol, "asset_type": p.asset_type.value,
                           "side": p.side.value, "quantity": str(p.quantity),
                           "average_price": str(p.average_price)} for p in account.positions]
@@ -207,6 +212,7 @@ class AlpacaBootstrapPoller:
                      "booting": False, "broker_ready": not health_errors,
                      "broker_health": health, "market_hours": market_hours,
                      "paper_spread_stops": paper_spread_stops,
+                     "paper_auto_be": paper_auto_be,
                      "fills": [{"activity_id": fill.activity_id, "symbol": fill.symbol,
                                 "instruction": fill.instruction.value, "quantity": str(fill.quantity),
                                 "price": str(fill.price), "time": fill.occurred_at.isoformat()}
@@ -230,6 +236,9 @@ class AlpacaBootstrapPoller:
             state["paper_spread_stops"] = [
                 {**row, "status": "suspended", "reason": "Paper account or poller is not ready"}
                 for row in state.get("paper_spread_stops") or ()]
+            state["paper_auto_be"] = [
+                {**row, "status": "suspended", "reason": "Paper account or poller is not ready"}
+                for row in state.get("paper_auto_be") or ()]
             for position in state.get("positions") or ():
                 position["protection"] = "UNKNOWN"
                 position["quote_stale"] = True
@@ -405,6 +414,115 @@ class AlpacaBootstrapPoller:
                          "stop_value": str(stop["stop_value"]), "send": stop["send"],
                          "status": observation["status"], "reason": observation["reason"],
                          "mid": observation["mid"], "trigger_at": stop["trigger_at"]})
+        return rows
+
+    @staticmethod
+    def _auto_be_pair(account, groups, row: dict) -> bool:
+        if account.status.upper() != "ACTIVE":
+            return False
+        positions = [position for position in account.positions if position.symbol == row["symbol"]]
+        if len(positions) != 1:
+            return False
+        active = {OrderStatus.PENDING, OrderStatus.WORKING,
+                  OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN}
+        touching = [group for group in groups if any(
+            leg.symbol == row["symbol"] for order in group.orders
+            if order.status in active for leg in order.legs)]
+        if len(touching) != 1:
+            return False
+        try:
+            plan = oco_auto_be_plan(positions[0], touching[0])
+        except ValueError:
+            return False
+        return all(plan[key] == row[key] for key in
+                   ("side", "quantity", "basis", "initial_stop", "target", "trigger",
+                    "new_stop", "group_id", "stop_id", "target_id", "oco_client_id"))
+
+    def _send_auto_be(self, row: dict) -> None:
+        watch = self.auto_be
+        lock = self.action_lock
+        if lock is None or not lock.acquire(blocking=False):
+            watch.record_send(row["symbol"], row["request_id"], "refused",
+                              "Another broker action was in progress; no stop was moved")
+            return
+        attempted = False
+        try:
+            service = self.order_service
+            if (self._stop.is_set() or service is None or service.store is not watch.store or
+                    service.store.open_mutations()):
+                raise ValueError("Paper runtime or unresolved order changed; no stop was moved")
+            now = datetime.now(timezone.utc)
+            if not service._market_open(now):
+                raise ValueError("Regular market session closed; no stop was moved")
+            account = self._adapter.query(AccountQuery())
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = self._adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                     statuses=active))
+            if account.account_ref != service.account_ref or not self._auto_be_pair(account, groups, row):
+                raise ValueError("Held position or broker-held OCO changed; no stop was moved")
+            quote = self._adapter.query(QuotesQuery((row["symbol"],), AssetType.EQUITY)).get(row["symbol"])
+            if (quote is None or quote.symbol != row["symbol"] or quote.source != "Alpaca IEX" or
+                    not quote.realtime or not quote.timestamp_verified or
+                    quote.observed_at.tzinfo is None or
+                    not 0 <= (now - quote.observed_at).total_seconds() <= 15):
+                raise ValueError("Fresh verified IEX quote disappeared; no stop was moved")
+            mark = quote.mark or quote.last
+            if (mark is None or mark <= 0 or
+                    (row["side"] == "long" and
+                     (mark < row["trigger"] or mark <= row["new_stop"])) or
+                    (row["side"] == "short" and
+                     (mark > row["trigger"] or mark >= row["new_stop"]))):
+                raise ValueError("IEX mark left the +1R trigger; no stop was moved")
+            command = ReplaceOrder(row["stop_id"], stop_price=row["new_stop"],
+                                   client_order_id=f"et-autobe-{row['request_id'].replace('-', '')}")
+
+            def preflight(current):
+                if current.account_ref != service.account_ref:
+                    raise ValueError("Paper account changed; no stop was moved")
+                later = self._adapter.query(OrdersQuery(now - timedelta(days=3650),
+                                                        datetime.now(timezone.utc),
+                                                        statuses=active))
+                if not self._auto_be_pair(current, later, row):
+                    raise ValueError("OCO changed immediately before Auto B/E; nothing was sent")
+
+            attempted = True
+            result = service.execute(command, row["request_id"], preflight=preflight)
+            status = ("unknown" if result.status.value == "unknown" else
+                      "done" if result.accepted else "refused")
+            watch.record_send(row["symbol"], row["request_id"], status,
+                              result.message or f"Paper stop replacement {result.status.value}")
+        except Exception as exc:
+            watch.record_send(row["symbol"], row["request_id"],
+                              "unknown" if attempted else "refused",
+                              (f"Auto B/E outcome unknown after {type(exc).__name__}; reconcile with Alpaca Paper"
+                               if attempted else
+                               f"Auto B/E preflight failed: {type(exc).__name__}; no stop was moved"))
+        finally:
+            lock.release()
+
+    def _auto_be_rows(self, account, groups, quotes, clock, today_session, now) -> list[dict]:
+        watch = self.auto_be
+        if watch is None:
+            return []
+        market_open = bool(clock and clock.is_open and today_session and
+                           today_session.is_open and today_session.opens_at <= now < today_session.closes_at)
+        rows = []
+        for row in watch.list():
+            position = next((p for p in account.positions if p.symbol == row["symbol"]), None)
+            observation = watch.observe(
+                row["symbol"], position, groups, quotes.get(row["symbol"]),
+                market_open=market_open, monitoring=not self._stop.is_set(), now=now)
+            if observation["fire"]:
+                self._send_auto_be(row)
+                current = watch.get(row["symbol"])
+                observation["status"] = current["status"]
+                observation["reason"] = current["result"]
+            rows.append({"symbol": row["symbol"], "side": row["side"],
+                         "quantity": str(row["quantity"]), "trigger": str(row["trigger"]),
+                         "new_stop": str(row["new_stop"]), "status": observation["status"],
+                         "reason": observation["reason"], "mark": observation["mark"],
+                         "request_id": row["request_id"]})
         return rows
 
     def stop(self) -> None:
