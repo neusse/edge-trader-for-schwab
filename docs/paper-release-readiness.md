@@ -15,6 +15,8 @@ This is the validation record for [issue #12](https://github.com/neusse/edge-tra
 
 Use a small, disposable Paper position during regular market hours. Record date, app commit, account capability level without revealing the account ID, request/client order IDs with sensitive parts redacted, expected behavior, observed broker status, and cleanup. A rejected or unfilled order remains useful evidence when its final state is reconciled. Never use live Alpaca keys.
 
+Before and after each controlled action, run `\.venv\Scripts\python.exe scripts\capture_paper_evidence.py <scenario-label>` with Alpaca Paper selected. The read-only tool compares the app view with independent Paper account, working-order, and fill reads. It appends timestamped evidence to ignored `data/paper-e2e-evidence.jsonl`, hashes account/order/client/fill IDs and symbols with a private salt in `data/.paper-e2e-salt`, and never arms or sends orders. Keep the salt with the evidence file so references remain comparable across snapshots. Use stable labels such as `baseline`, `bracket-filled`, and `cleanup`; inspect the record before sharing a redacted excerpt in #8 or #12. Record the reviewed order request and the exact cleanup separately, since a snapshot alone does not prove the user's confirmation step.
+
 | Workflow | Evidence required | Status |
 | --- | --- | --- |
 | Broker selection | Default Paper, switch to Schwab and Demo, then back; each switch disarms | Passed 2026-11-10 on local running app; all three modes selected and Paper reselected, disarmed throughout |
