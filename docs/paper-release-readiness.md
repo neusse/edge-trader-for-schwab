@@ -8,8 +8,8 @@ This is the validation record for [issue #12](https://github.com/neusse/edge-tra
 - [ ] Run CI on the release candidate on Windows and Linux, or record the platform gap.
 - [x] Exercise the same canonical account, order, and mutation contract against Schwab fixtures, Alpaca fixtures, and the in-memory fake (`tests/test_shared_broker_contract.py`; 9 passing cases).
 - [x] Verify that live Alpaca credentials and any endpoint other than `https://paper-api.alpaca.markets` are rejected before a network request (`tests/test_broker_configuration.py`: live-only credentials fail, live selection fails, fixed Paper client mode, and invalid endpoint fails before client construction).
-- [ ] Verify that changing brokers disarms the previous ticket, closes its poller, activates the selected broker's store, and does not carry over position or order state.
-- [ ] Verify restart recovery, stale reads, rate limits, unknown submit/cancel/replace results, and no automatic mutation retry.
+- [x] Verify that changing brokers disarms the previous ticket, closes its poller, activates the selected broker's store, and does not carry over position or order state. `tests/test_broker_switch.py` exercises the HTTP selector from a Paper runtime with an armed order service and a marked old store; it observes both disarms, old poller stop, new poller start, and an unmarked disarmed store. `tests/test_store_scope.py` covers broker/account storage isolation.
+- [x] Verify restart recovery, stale reads, rate limits, unknown submit/cancel/replace results, and no automatic mutation retry in the automated suite. `tests/test_broker_order_service.py` covers restart, exact client-ID reconciliation, unknown cancel, and exact replacement; `tests/test_alpaca_account.py` covers stale/rate-limited reads; `tests/test_paper_auto_be.py` and `tests/test_paper_spread_stop.py` cover interrupted watches and one-shot sends. Controlled broker failure scenarios remain open below.
 
 ## Controlled Paper scenarios
 
