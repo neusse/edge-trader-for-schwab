@@ -11,8 +11,9 @@ from zoneinfo import ZoneInfo
 
 from .adapter import BrokerAdapter
 from .models import (
-    AccountQuery, AccountSnapshot, BrokerCommand, ClientOrderQuery, MarketSessionsQuery,
-    MutationResult, MutationStatus, OrderQuery, OrderStatus, ReplaceOrder, SubmitOrder,
+    AccountQuery, AccountSnapshot, AssetType, BrokerCommand, ClientOrderQuery, MarketSessionsQuery,
+    MutationResult, MutationStatus, OrderClass, OrderInstruction, OrderQuery, OrderRole,
+    OrderStatus, ReplaceOrder, SubmitOrder, TimeInForce,
 )
 from ..store import Store
 
@@ -238,6 +239,27 @@ class BrokerOrderService:
             if expected_stop is not None and order.stop_price != Decimal(str(expected_stop)):
                 return MutationResult(MutationStatus.UNKNOWN,
                                       message="Broker replacement stop does not match the reviewed price")
+            if client_order_id.startswith("et-vertical-target-") and order.status != OrderStatus.REJECTED:
+                try:
+                    original = self.adapter.query(OrderQuery(row["payload"]["order_id"]))
+                except Exception:
+                    return MutationResult(MutationStatus.UNKNOWN,
+                                          message="Original vertical target could not be verified")
+                old = next((item for item in original.orders if item.order_id ==
+                            row["payload"]["order_id"]), None)
+                if (group.order_class != OrderClass.MULTI_LEG or
+                        original.order_class != OrderClass.MULTI_LEG or old is None or
+                        order.role != OrderRole.TARGET or len(order.legs) != 2 or
+                        order.time_in_force != TimeInForce.GTC or
+                        tuple((leg.symbol, leg.quantity, leg.instruction, leg.asset_type)
+                              for leg in order.legs) !=
+                        tuple((leg.symbol, leg.quantity, leg.instruction, leg.asset_type)
+                              for leg in old.legs) or
+                        {leg.instruction for leg in order.legs} != {
+                            OrderInstruction.SELL_TO_CLOSE, OrderInstruction.BUY_TO_CLOSE} or
+                        any(leg.asset_type != AssetType.OPTION for leg in order.legs)):
+                    return MutationResult(MutationStatus.UNKNOWN,
+                                          message="Broker replacement vertical legs do not match the reviewed target")
             if order.status == OrderStatus.REJECTED:
                 result = MutationResult(MutationStatus.REJECTED, order.order_id,
                                         "Broker rejected the replacement; inspect the original order")

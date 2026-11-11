@@ -218,3 +218,40 @@ def test_stop_replacement_waits_for_exact_reviewed_stop(tmp_path):
         assert service.reconcile_replace("replace-stop").status == MutationStatus.ACCEPTED
     finally:
         store.close()
+
+
+def test_vertical_target_replacement_reconciles_only_same_atomic_legs(tmp_path):
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT, ACCOUNT)
+    adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, "new-target"))
+    service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
+    long = OrderLeg("AAPL261113C00100000", AssetType.OPTION,
+                    OrderInstruction.SELL_TO_CLOSE, Decimal(2))
+    short = OrderLeg("AAPL261113C00105000", AssetType.OPTION,
+                     OrderInstruction.BUY_TO_CLOSE, Decimal(2))
+    original = BrokerOrder("old-target", OrderStatus.REPLACED, OrderType.LIMIT,
+                           TimeInForce.GTC, (long, short), OrderRole.TARGET,
+                           limit_price=Decimal("-1.30"))
+    old_group = OrderGroup("old-target", OrderClass.MULTI_LEG,
+                           OrderStatus.REPLACED, (original,))
+    def replacement(second):
+        order = BrokerOrder("new-target", OrderStatus.WORKING, OrderType.LIMIT,
+                            TimeInForce.GTC, (long, second), OrderRole.TARGET,
+                            client_order_id="et-vertical-target-r-test",
+                            limit_price=Decimal("-1.40"))
+        return OrderGroup("new-target", OrderClass.MULTI_LEG,
+                          OrderStatus.WORKING, (order,))
+    try:
+        command = ReplaceOrder("old-target", limit_price=Decimal("-1.40"),
+                               client_order_id="et-vertical-target-r-test")
+        assert service.execute(command, "vertical-replace").status == MutationStatus.UNKNOWN
+        wrong = OrderLeg("AAPL261113C00110000", AssetType.OPTION,
+                         OrderInstruction.BUY_TO_CLOSE, Decimal(2))
+        adapter.given_query(ClientOrderQuery, replacement(wrong), replacement(short))
+        adapter.given_query(OrderQuery, old_group, old_group)
+        assert service.reconcile_replace("vertical-replace").status == MutationStatus.UNKNOWN
+        assert service.reconcile_replace("vertical-replace").status == MutationStatus.ACCEPTED
+        assert store.open_mutations() == []
+    finally:
+        store.close()

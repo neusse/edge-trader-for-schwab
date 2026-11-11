@@ -1327,7 +1327,8 @@ function renderAlpacaOverview(st) {
     <td>${o.cancellable && (o.group_type === "BRACKET" || (o.group_type === "SIMPLE" && o.asset_type === "EQUITY" && o.role === "ENTRY" && o.tag?.startsWith("et-"))) && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}
     ${o.group_type === "OCO" && ["STOP", "TARGET"].includes(o.role) && st.broker?.workflows?.includes("equity-oco-adjust") ? `<button type="button" class="btn sm ghost" data-paper-oco-adjust="${esc(o.order_id)}" data-paper-role="${o.role.toLowerCase()}" data-paper-symbol="${esc(o.symbol)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move ${esc(o.role.toLowerCase())}</button>` : ""}
     ${o.group_type === "SIMPLE" && o.asset_type === "OPTION" && o.tag?.startsWith("et-opt-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("option-cancel") ? `<button type="button" class="btn sm ghost" data-paper-option-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperOptionCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel remaining</button>` : ""}
-    ${o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.asset_type === "OPTION" && o.tag?.startsWith("et-vertical-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("vertical-cancel") ? `<button type="button" class="btn sm ghost" data-paper-vertical-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperVerticalCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel spread remainder</button>` : ""}</td></tr>`).join("");
+    ${o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.asset_type === "OPTION" && o.tag?.startsWith("et-vertical-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("vertical-cancel") ? `<button type="button" class="btn sm ghost" data-paper-vertical-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperVerticalCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel spread remainder</button>` : ""}
+    ${o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.role === "TARGET" && o.tag?.startsWith("et-vertical-target-") && o.order_type === "LIMIT" && o.filled === 0 && st.broker?.workflows?.includes("vertical-target-reprice") ? `<button type="button" class="btn sm ghost" data-paper-vertical-reprice="${esc(o.order_id)}" ${!st.broker_ready || !paperArmed || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || paperVerticalRepriceSentIds.has(o.order_id) || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move spread target</button>` : ""}</td></tr>`).join("");
   const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
   const fillRows = fills.map(f => `<tr><td>${esc(new Date(f.time).toLocaleString())}</td><td>${esc(f.symbol)}</td><td>${esc(f.instruction)}</td><td>${esc(f.quantity)}</td><td>${money(Number(f.price), false)}</td></tr>`).join("");
   panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
@@ -1368,6 +1369,7 @@ function render(st) {
     paperVerticalSentKeys.clear();
     paperVerticalCloseSentKeys.clear();
     paperVerticalCancelSentIds.clear();
+    paperVerticalRepriceSentIds.clear();
     for (const name of ["long_contract", "short_contract"]) {
       const select = $("paper-vertical-close-form").elements[name];
       select.innerHTML = '<option value="">No held options</option>';
@@ -1521,6 +1523,7 @@ const paperOptionExitSentKeys = new Set();
 const paperVerticalSentKeys = new Set();
 const paperVerticalCloseSentKeys = new Set();
 const paperVerticalCancelSentIds = new Set();
+const paperVerticalRepriceSentIds = new Set();
 const paperOptionsForm = $("paper-options-form");
 const paperExpirySelect = paperOptionsForm.elements.expiration;
 function resetPaperOptionSelection() {
@@ -2446,6 +2449,56 @@ $("alpaca-overview").addEventListener("click", async e => {
     if (sent) {
       paperOutcome = "unknown"; paperVerticalCancelSentIds.add(orderId);
       paperMessage(`Vertical cancel may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(String(err.message || err));
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
+$("alpaca-overview").addEventListener("click", async e => {
+  const button = e.target.closest("[data-paper-vertical-reprice]");
+  if (!button || paperBusy || paperOutcome === "unknown" || !paperArmed ||
+      lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready ||
+      lastState.market_hours?.is_open !== true) return;
+  const orderId = button.dataset.paperVerticalReprice;
+  if (paperVerticalRepriceSentIds.has(orderId)) return;
+  const order = (lastState.orders || []).find(o => o.order_id === orderId &&
+    o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.role === "TARGET" &&
+    o.tag?.startsWith("et-vertical-target-") && o.order_type === "LIMIT" &&
+    o.filled === 0 && ["NEW", "WORKING"].includes(o.status));
+  if (!order) return;
+  const input = window.prompt(`New signed net target limit for ${order.display}`, String(order.price ?? ""));
+  if (input === null) return;
+  if (!Number.isFinite(Number(input)) || Number(input) === 0) {
+    paperMessage("Enter a nonzero signed net target limit."); return;
+  }
+  const requestId = crypto.randomUUID();
+  const payload = {order_id:orderId, net_price:input, request_id:requestId};
+  paperBusy = true; paperRequestId = requestId; paperCommand = "ReplaceOrder";
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const preview = await post("/api/paper/vertical/target/reprice/preview", payload);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Vertical target preview refused");
+    if (!window.confirm(`Move the one Paper multi-leg target for ${preview.quantity} spreads (${preview.legs.join(" / ")}) from signed net ${preview.old_price} to ${preview.new_price}? ${preview.warning}`)) {
+      paperMessage("Paper vertical target review canceled."); return;
+    }
+    paperMessage("Sending Paper vertical target replacement once…");
+    sent = true;
+    const result = await post("/api/paper/vertical/target/reprice/submit", payload);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown"; paperVerticalRepriceSentIds.add(orderId);
+      paperMessage(result.message || "Vertical target replacement pending. Reconcile before another action.");
+    } else {
+      paperRequestId = null; paperOutcome = null;
+      if (result.ok) paperVerticalRepriceSentIds.add(orderId);
+      paperMessage(result.ok ? `Alpaca Paper accepted target replacement ${result.order_id}. Verify both legs and the new limit.` :
+        result.message || result.error || result.detail || "Vertical target replacement refused");
+    }
+  } catch (err) {
+    if (sent) {
+      paperOutcome = "unknown"; paperVerticalRepriceSentIds.add(orderId);
+      paperMessage(`Vertical target replacement may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
     } else {
       paperRequestId = null;
       paperMessage(String(err.message || err));

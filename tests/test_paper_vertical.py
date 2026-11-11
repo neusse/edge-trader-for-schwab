@@ -10,7 +10,7 @@ from companion.brokers.models import (
     CancelOrder,
     MutationResult, MutationStatus, OptionChain, OptionChainQuery,
     OptionContract, OptionType, OrderClass, OrderGroup, OrderInstruction,
-    OrderQuery,
+    OrderQuery, ReplaceOrder,
     OrderLeg, OrderRole, OrderStatus, OrderType, OrdersQuery,
     Position, PositionSide, Quote, QuotesQuery, TimeInForce,
 )
@@ -247,3 +247,62 @@ def test_vertical_cancel_only_unfilled_owned_mleg_remainder(monkeypatch):
     store.get_mutation_by_client_id = lambda _key: None
     refused = client.post("/api/paper/vertical/cancel/preview", json=payload, headers=headers)
     assert not refused.json()["ok"] and "not owned" in refused.json()["error"]
+
+
+def test_vertical_target_reprice_keeps_exact_mleg_and_rechecks_positions(monkeypatch):
+    import companion.app as appmod
+
+    order_id = "f82cb18d-3c10-4676-9219-c3d53f47f339"
+    body = _body(net="-1.40")
+    account = _held_account()
+    original = BrokerOrder(order_id, OrderStatus.WORKING, OrderType.LIMIT,
+                           TimeInForce.GTC,
+                           (OrderLeg(body["long_contract"], AssetType.OPTION,
+                                     OrderInstruction.SELL_TO_CLOSE, D(2)),
+                            OrderLeg(body["short_contract"], AssetType.OPTION,
+                                     OrderInstruction.BUY_TO_CLOSE, D(2))),
+                           OrderRole.TARGET, client_order_id="et-vertical-target-owned",
+                           limit_price=D("-1.30"), status_detail="NEW")
+    group = OrderGroup(order_id, OrderClass.MULTI_LEG, OrderStatus.WORKING,
+                       (original,))
+    commands = []
+    def query(value):
+        if isinstance(value, OrderQuery): return group
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return (group,)
+        if isinstance(value, QuotesQuery): return _quotes()
+        raise AssertionError(type(value))
+    def execute(command, request_id, preflight):
+        preflight(account)
+        commands.append(command)
+        return MutationResult(MutationStatus.UNKNOWN, "replacement-pending")
+    store = SimpleNamespace(get_mutation_by_client_id=lambda _key: {"status": "accepted"})
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query), store=store,
+                              account_ref="paper-account", execute=execute,
+                              armed=True, _market_open=lambda _now: True)
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    monkeypatch.setattr("companion.brokers.paper_vertical.datetime", SimpleNamespace(
+        now=lambda _tz: NOW))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    payload = {"order_id": order_id, "net_price": "-1.40", "request_id": REQUEST_ID}
+    preview = client.post("/api/paper/vertical/target/reprice/preview",
+                          json=payload, headers=headers).json()
+    assert preview["ok"] and preview["legs"] == [body["long_contract"], body["short_contract"]]
+    assert preview["old_price"] == "-1.30" and preview["new_price"] == "-1.40"
+    submitted = client.post("/api/paper/vertical/target/reprice/submit",
+                            json=payload, headers=headers).json()
+    assert submitted["status"] == "unknown" and len(commands) == 1
+    assert isinstance(commands[0], ReplaceOrder)
+    assert commands[0].order_id == order_id and commands[0].limit_price == D("-1.40")
+    assert commands[0].client_order_id.startswith("et-vertical-target-")
+    account = _held_account(quantity="1")
+    refused = client.post("/api/paper/vertical/target/reprice/preview",
+                          json=payload, headers=headers).json()
+    assert not refused["ok"] and "match" in refused["error"]
+    account = _held_account()
+    group = OrderGroup(order_id, OrderClass.MULTI_LEG, OrderStatus.PARTIALLY_FILLED,
+                       (BrokerOrder(**{**original.__dict__, "status": OrderStatus.PARTIALLY_FILLED}),))
+    refused = client.post("/api/paper/vertical/target/reprice/preview",
+                          json=payload, headers=headers).json()
+    assert not refused["ok"] and "unfilled" in refused["error"]
