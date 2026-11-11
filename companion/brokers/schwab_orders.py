@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from .models import (
     AssetType, BracketOrderIntent, MultiLegOrderIntent, OcoOrderIntent, OrderInstruction,
-    OrderLegIntent, OrderType, SimpleOrderIntent, TimeInForce, TrailingOrderIntent,
+    OrderLegIntent, OrderType, SimpleOrderIntent, TimeInForce, TrailingOrderIntent, TrailingStopSpec,
 )
 
 _EXIT = {
@@ -62,6 +62,14 @@ def _simple(intent: SimpleOrderIntent) -> dict:
 
 
 def _stop(leg: OrderLegIntent, stop, duration: str) -> dict:
+    if isinstance(stop, TrailingStopSpec):
+        return {"orderStrategyType": "SINGLE", "orderType": "TRAILING_STOP",
+                "session": "NORMAL", "duration": duration,
+                "stopPriceLinkBasis": stop.basis,
+                "stopPriceLinkType": "VALUE" if stop.trail_price is not None else "PERCENT",
+                "stopPriceOffset": float(stop.trail_price if stop.trail_price is not None
+                                         else stop.trail_percent),
+                "orderLegCollection": [_leg(leg)]}
     body = {"orderStrategyType": "SINGLE", "orderType": "STOP_LIMIT" if stop.limit_price is not None else "STOP",
             "session": "NORMAL", "duration": duration,
             "stopPrice": _price(stop.stop_price), "orderLegCollection": [_leg(leg)]}
@@ -118,7 +126,7 @@ def build_schwab_order(intent) -> dict:
     if isinstance(intent, TrailingOrderIntent):
         body = {"orderStrategyType": "SINGLE", "orderType": "TRAILING_STOP",
                 "session": "NORMAL", "duration": _duration(intent.time_in_force),
-                "stopPriceLinkBasis": "MARK",
+                "stopPriceLinkBasis": intent.basis,
                 "stopPriceLinkType": "VALUE" if intent.trail_price is not None else "PERCENT",
                 "stopPriceOffset": float(intent.trail_price if intent.trail_price is not None
                                          else intent.trail_percent),

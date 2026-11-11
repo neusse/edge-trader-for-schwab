@@ -28,6 +28,7 @@ from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt,
 from .brokers.models import (
     AssetType, CancelOrder, MutationResult, MutationStatus, OcoOrderIntent, OrderInstruction,
     OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent, StopLossIntent, SubmitOrder, TimeInForce,
+    TrailingOrderIntent, TrailingStopSpec,
 )
 from .brokers.schwab_adapter import SchwabAdapter
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
@@ -2631,7 +2632,7 @@ class Trader:
             targets = targets or [True]
         else:
             order, what = stop, stop_txt
-        if preview:
+        if preview and not (asset == "OPTION" and trail):
             refused = self._preview_refusal(client, order)
             if refused:
                 rejected, why = refused
@@ -2643,32 +2644,24 @@ class Trader:
         self.store.log_action("create_stop", symbol, None, "SENDING", f"{what}, {n} {us}")
         log.warning("CREATE STOP %s %s %s", symbol, n, what)
         try:
+            exit_leg = OrderLegIntent(symbol, AssetType[asset], OrderInstruction[instr], Decimal(str(n)))
+            tif = TimeInForce.GTC if _gtc(duration) else TimeInForce.DAY
             if trail:
-                r = self._logged("place_order", lambda: client.place_order(self._hash, order))
-                tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-                if r.status_code in (200, 201):
-                    result = MutationResult(MutationStatus.ACCEPTED if tail.isdigit() else MutationStatus.UNKNOWN,
-                                            order_id=tail if tail.isdigit() else None,
-                                            message=None if tail.isdigit() else "Schwab accepted the stop without an ID")
-                elif r.status_code == 429:
-                    result = MutationResult(MutationStatus.RATE_LIMITED, message=f"HTTP 429 {r.text[:200]}")
-                elif 400 <= r.status_code < 500:
-                    result = MutationResult(MutationStatus.REJECTED,
-                                            message=f"HTTP {r.status_code} {r.text[:200]}")
-                else:
-                    result = MutationResult(MutationStatus.UNKNOWN,
-                                            message=f"HTTP {r.status_code} {r.text[:200]}")
+                trail_values = {"trail_price": Decimal(str(trail["offset"]))} if trail["link"] == "VALUE" else {
+                    "trail_percent": Decimal(str(trail["offset"]))}
+                stop_spec = TrailingStopSpec(basis=trail["basis"], **trail_values)
             else:
-                exit_leg = OrderLegIntent(symbol, AssetType[asset], OrderInstruction[instr], Decimal(str(n)))
-                tif = TimeInForce.GTC if _gtc(duration) else TimeInForce.DAY
-                if target is not None:
-                    intent = OcoOrderIntent(exit_leg, Decimal(fmt(target, tk)),
-                                            StopLossIntent(Decimal(fmt(price, tk))), tif,
-                                            f"stop-{symbol}-{now_iso()}")
-                else:
-                    intent = SimpleOrderIntent(exit_leg, OrderType.STOP, tif, f"stop-{symbol}-{now_iso()}",
-                                               stop_price=Decimal(fmt(price, tk)))
-                result = self._broker_mutation("place_order", SubmitOrder(intent))
+                stop_spec = StopLossIntent(Decimal(fmt(price, tk)))
+            if target is not None:
+                intent = OcoOrderIntent(exit_leg, Decimal(fmt(target, tk)), stop_spec, tif,
+                                        f"stop-{symbol}-{now_iso()}")
+            elif trail:
+                intent = TrailingOrderIntent(exit_leg, tif, f"stop-{symbol}-{now_iso()}",
+                                             basis=trail["basis"], **trail_values)
+            else:
+                intent = SimpleOrderIntent(exit_leg, OrderType.STOP, tif, f"stop-{symbol}-{now_iso()}",
+                                           stop_price=Decimal(fmt(price, tk)))
+            result = self._broker_mutation("place_order", SubmitOrder(intent))
         except Exception as e:
             self.store.log_action("create_stop", symbol, None, "UNKNOWN", repr(e))
             return {"ok": False, "unknown": True, "symbol": symbol,
@@ -2678,6 +2671,15 @@ class Trader:
             return {"ok": False, "unknown": True, "symbol": symbol,
                     "error": f"Schwab's answer was unclear: the {what} MAY have been placed. Check thinkorswim "
                              "before setting it again."}
+        if preview and asset == "OPTION" and trail and result.status != MutationStatus.ACCEPTED:
+            self.store.log_action("create_stop", symbol, None,
+                                  result.status.value.upper().replace("-", "_"), result.message)
+            head = (f"Schwab does not accept this trailing stop on {symbol}" if
+                    (result.message or "").startswith("Schwab preview rejected") else
+                    f"Schwab's preview did not confirm this trailing stop on {symbol}")
+            return {"ok": False, "symbol": symbol, "not_sent": True,
+                    "error": f"{head}: {result.message}. "
+                             "Nothing was sent; your current stop and target are still working."}
         if result.status != MutationStatus.ACCEPTED:
             self.store.log_action("create_stop", symbol, None, result.status.value.upper().replace("-", "_"),
                                   result.message)

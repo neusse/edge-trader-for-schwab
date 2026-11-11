@@ -6,7 +6,7 @@ from decimal import Decimal
 from .models import (
     AssetType, BracketOrderIntent, MultiLegOrderIntent, OcoOrderIntent,
     OrderInstruction, OrderLegIntent, OrderType, SimpleOrderIntent,
-    TrailingOrderIntent,
+    TrailingOrderIntent, TrailingStopSpec,
 )
 
 
@@ -47,6 +47,8 @@ def _quantity(value: Decimal, asset_type: AssetType) -> float:
 def _stop_loss(stop):
     from alpaca.trading.requests import StopLossRequest
 
+    if isinstance(stop, TrailingStopSpec):
+        raise ValueError("Alpaca paper cannot attach a trailing stop to a bracket or OCO")
     return StopLossRequest(stop_price=float(stop.stop_price),
                            limit_price=float(stop.limit_price) if stop.limit_price is not None else None)
 
@@ -108,6 +110,8 @@ def build_order_request(intent):
     if isinstance(intent, TrailingOrderIntent):
         if intent.leg.asset_type != AssetType.EQUITY:
             raise ValueError("Alpaca paper trailing stops require equities")
+        if intent.basis != "MARK":
+            raise ValueError("Alpaca paper trailing stops do not support a chosen quote basis")
         side, _ = _side_and_intent(intent.leg)
         return TrailingStopOrderRequest(
             symbol=intent.leg.symbol, qty=_quantity(intent.leg.quantity, intent.leg.asset_type),

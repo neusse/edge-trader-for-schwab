@@ -1549,10 +1549,19 @@ def test_option_partial_at_the_mid_uses_option_ticks(trader, monkeypatch):
 
 
 def test_option_trail_is_sent_when_schwab_preview_accepts_it(trader, monkeypatch):
+    from companion.brokers.models import OcoOrderIntent, SubmitOrder, TrailingStopSpec
+
     _opt_quote(trader, monkeypatch, bid=0.70, ask=0.75)
     trader._client = OptBroker([_opt_oco()])
+    commands = []
+    execute = trader._broker_mutation
+    monkeypatch.setattr(trader, "_broker_mutation", lambda endpoint, command:
+                        (commands.append(command), execute(endpoint, command))[1])
     r = trader.set_trail(OPT, "$", "0.13", "MARK", [], set(), None)
     assert r["ok"], r
+    assert len(commands) == 1 and isinstance(commands[0], SubmitOrder)
+    assert isinstance(commands[0].intent, OcoOrderIntent)
+    assert isinstance(commands[0].intent.stop_loss, TrailingStopSpec)
     (previewed,) = trader._client.previewed
     (order,) = trader._client.placed
     assert previewed == order
@@ -1586,10 +1595,19 @@ def test_option_trail_without_a_clear_preview_is_refused(trader, monkeypatch, kw
 
 
 def test_stock_trail_is_not_previewed(trader, monkeypatch):
+    from companion.brokers.models import OcoOrderIntent, SubmitOrder, TrailingStopSpec
+
     _quote_mark(trader, monkeypatch)
     trader._client = Broker([_mu_oco()])
     trader._client.preview_order = lambda *a: pytest.fail("a stock trail must not need a preview")
+    commands = []
+    execute = trader._broker_mutation
+    monkeypatch.setattr(trader, "_broker_mutation", lambda endpoint, command:
+                        (commands.append(command), execute(endpoint, command))[1])
     assert trader.set_trail("MXR", "$", 2.5, "MARK", [], set(), None)["ok"]
+    assert len(commands) == 1 and isinstance(commands[0], SubmitOrder)
+    assert isinstance(commands[0].intent, OcoOrderIntent)
+    assert isinstance(commands[0].intent.stop_loss, TrailingStopSpec)
 
 
 def test_option_auto_breakeven_rounds_up_to_the_nickel(trader, monkeypatch):

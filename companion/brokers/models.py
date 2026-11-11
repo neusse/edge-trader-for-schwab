@@ -472,17 +472,31 @@ class StopLossIntent:
 
 
 @dataclass(frozen=True)
+class TrailingStopSpec:
+    trail_price: Decimal | None = None
+    trail_percent: Decimal | None = None
+    basis: str = "MARK"
+
+    def __post_init__(self) -> None:
+        if (self.trail_price is None) == (self.trail_percent is None):
+            raise ValueError("set exactly one trailing stop offset")
+        offset = self.trail_price if self.trail_price is not None else self.trail_percent
+        if offset <= 0 or self.basis not in ("MARK", "LAST", "BID", "ASK"):
+            raise ValueError("trailing stop needs a positive offset and supported quote basis")
+
+
+@dataclass(frozen=True)
 class BracketOrderIntent:
     entry: SimpleOrderIntent
     take_profit_price: Decimal
-    stop_loss: StopLossIntent
+    stop_loss: StopLossIntent | TrailingStopSpec
 
 
 @dataclass(frozen=True)
 class OcoOrderIntent:
     leg: OrderLegIntent
     take_profit_price: Decimal
-    stop_loss: StopLossIntent
+    stop_loss: StopLossIntent | TrailingStopSpec
     time_in_force: TimeInForce
     client_order_id: str
 
@@ -494,10 +508,14 @@ class TrailingOrderIntent:
     client_order_id: str
     trail_price: Decimal | None = None
     trail_percent: Decimal | None = None
+    basis: str = "MARK"
 
     def __post_init__(self) -> None:
         if (self.trail_price is None) == (self.trail_percent is None):
             raise ValueError("set exactly one of trail_price or trail_percent")
+        offset = self.trail_price if self.trail_price is not None else self.trail_percent
+        if offset <= 0 or self.basis not in ("MARK", "LAST", "BID", "ASK"):
+            raise ValueError("trailing stop needs a positive offset and supported quote basis")
 
 
 @dataclass(frozen=True)
