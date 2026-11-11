@@ -102,3 +102,32 @@ def oco_plan(body: dict, position: Position, quote,
     return OcoOrderIntent(OrderLegIntent(symbol, AssetType.EQUITY, instruction, quantity),
                           target, StopLossIntent(stop), TimeInForce.GTC,
                           f"et-oco-{request_id.hex}")
+
+
+def close_plan(body: dict, position: Position, quote,
+               now: datetime | None = None) -> SimpleOrderIntent:
+    """Close an order-free whole-share paper position with one reviewed market order."""
+    if not isinstance(body, dict) or position.asset_type != AssetType.EQUITY:
+        raise ValueError("Paper close requires an equity position")
+    symbol = body.get("symbol")
+    if symbol != position.symbol or not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol):
+        raise ValueError("close symbol must match the held equity position")
+    quantity = position.quantity
+    if quantity <= 0 or quantity != quantity.to_integral_value() or quantity > 10000:
+        raise ValueError("Paper close requires 1 to 10000 whole shares")
+    if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
+        raise ValueError("a current Alpaca Paper IEX quote is required")
+    now = now or datetime.now(timezone.utc)
+    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+        raise ValueError("Alpaca Paper quote is stale; refresh before closing")
+    if not (quote.mark or quote.last) or (quote.mark or quote.last) <= 0:
+        raise ValueError("Alpaca Paper quote has no usable price")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("request_id must be a UUID") from None
+    instruction = (OrderInstruction.SELL if position.side == PositionSide.LONG else
+                   OrderInstruction.BUY_TO_COVER)
+    return SimpleOrderIntent(OrderLegIntent(symbol, AssetType.EQUITY, instruction, quantity),
+                             OrderType.MARKET, TimeInForce.DAY,
+                             f"et-close-{request_id.hex}")

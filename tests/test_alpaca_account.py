@@ -173,6 +173,30 @@ def test_order_history_pages_with_boundary_overlap_and_uuid_deduplication():
     assert len({group.group_id for group in groups}) == 501
 
 
+def test_open_order_read_preserves_unrecognized_broker_status_as_unknown():
+    from datetime import datetime, timedelta, timezone
+    from alpaca.trading.models import Order
+    from companion.brokers.models import OrdersQuery, OrderStatus
+
+    now = datetime.now(timezone.utc)
+    raw = Order.model_construct(
+        id="unrecognized-order", group_id=None, order_class="simple", group_role=None,
+        status="new_broker_status", type="limit", time_in_force="day", legs=[],
+        symbol="AAPL", asset_class="us_equity", qty="1", filled_qty="0",
+        side="sell", position_intent=None, limit_price="110", stop_price=None,
+        trail_price=None, trail_percent=None, submitted_at=now, updated_at=None,
+        client_order_id="external")
+    class Client:
+        def get_orders(self, request):
+            assert request.status.value == "open"
+            return [raw]
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = AlpacaPaperAdapter(Client()).query(OrdersQuery(now - timedelta(days=1), now,
+                                                             statuses=active))
+    assert groups[0].orders[0].status == OrderStatus.UNKNOWN
+
+
 def test_fill_read_normalizes_opaque_ids_and_option_side():
     from datetime import datetime, timezone
     from companion.brokers.models import FillsQuery, OrderInstruction
@@ -272,7 +296,7 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
 
     paper = broker_info("alpaca-paper")
     assert "option-trading" in paper["capabilities"]
-    assert paper["workflows"] == ("equity-bracket", "equity-oco")
+    assert paper["workflows"] == ("equity-bracket", "equity-oco", "equity-close")
     assert "option-bracket" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")

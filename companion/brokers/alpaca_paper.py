@@ -238,7 +238,8 @@ class AlpacaPaperAdapter(BrokerAdapter):
             from alpaca.common.enums import Sort
             from alpaca.trading.enums import QueryOrderStatus
             from alpaca.trading.requests import GetOrdersRequest
-            active = {OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED}
+            active = {OrderStatus.PENDING, OrderStatus.WORKING,
+                      OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN}
             status = (QueryOrderStatus.OPEN if query.statuses and query.statuses <= active
                       else QueryOrderStatus.ALL)
             cursor = query.start
