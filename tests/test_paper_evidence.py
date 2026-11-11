@@ -77,6 +77,13 @@ def test_clean_market_preflight_requires_independent_open_paper_clock_and_empty_
                       "working_orders": []},
               "paper": {"positions": [], "working_orders": [], "fills_today": []}}
     require_clean_market(record, clock, now)
+    later_clock = SimpleNamespace(is_open=True,
+                                  observed_at=now + timedelta(seconds=2),
+                                  next_close=now + timedelta(hours=5))
+    # The clock is fetched after the account snapshot; freshness uses a later time.
+    require_clean_market(record, later_clock, now + timedelta(seconds=3))
+    with pytest.raises(PreflightRefused, match="open session"):
+        require_clean_market(record, later_clock, now)
     with pytest.raises(PreflightRefused, match="open session"):
         require_clean_market(record, SimpleNamespace(**{**vars(clock), "is_open": False}), now)
     with pytest.raises(PreflightRefused, match="open session"):
