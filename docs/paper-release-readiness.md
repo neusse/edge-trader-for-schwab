@@ -4,8 +4,8 @@ This is the validation record for [issue #12](https://github.com/neusse/edge-tra
 
 ## Automated gate
 
-- [x] Run `\.venv\Scripts\python.exe -m pytest -q` from a clean checkout with no broker credentials loaded; record the commit and result. On 2026-11-10, detached clean worktree at `7e827f1`, with no `.env` and Alpaca/Schwab environment variables removed in the test process: 567 passed, 1 Starlette deprecation warning (Windows, Python 3.11 virtual environment). The worktree was removed after the run.
-- [ ] Run CI on the release candidate on Windows and Linux, or record the platform gap.
+- [x] Run `\.venv\Scripts\python.exe -m pytest -q` from a clean checkout with no broker credentials loaded; record the commit and result. On 2026-11-10, detached clean worktree at merged commit `b3ed911`, with no `.env` and Alpaca/Schwab environment variables removed in the test process: 593 passed, 1 Starlette deprecation warning (Windows). The worktree was removed after the run.
+- [ ] Run CI on the final release candidate on Windows and Linux. Interim equities-only PR #81 passed both platforms at `4dbb1e1`; repeat after the controlled Paper equity scenarios and final changes.
 - [x] Exercise the same canonical account, order, and mutation contract against Schwab fixtures, Alpaca fixtures, and the in-memory fake (`tests/test_shared_broker_contract.py`; 9 passing cases).
 - [x] Verify that live Alpaca credentials and any endpoint other than `https://paper-api.alpaca.markets` are rejected before a network request (`tests/test_broker_configuration.py`: live-only credentials fail, live selection fails, fixed Paper client mode, and invalid endpoint fails before client construction).
 - [x] Verify that changing brokers disarms the previous ticket, closes its poller, activates the selected broker's store, and does not carry over position or order state. `tests/test_broker_switch.py` exercises the HTTP selector from a Paper runtime with an armed order service and a marked old store; it observes both disarms, old poller stop, new poller start, and an unmarked disarmed store. `tests/test_store_scope.py` covers broker/account storage isolation.
@@ -28,6 +28,8 @@ Alpaca Paper simulates fills, so these checks establish API and app behavior, no
 
 On 2026-11-10 the configured Paper endpoint authenticated successfully and reported an active account with no open orders. This was a read-only readiness check; it does not count as workflow end-to-end evidence. The US equity session was closed during this check.
 
+On the same date, a read-only 365-day Paper order query at `b3ed911` found 50 historical bracket groups that normalized to ENTRY, TARGET, and STOP, and 48 OCO groups that normalized to TARGET and STOP. No historical order carried an Edge Trader `et-` client ID, so these records cannot stand in for a controlled app order test. No order mutation was sent. At the merged app runtime, switching Paper → Schwab → Paper succeeded and left Paper disarmed. Paper option submit and Schwab option ticket requests were refused with HTTP 403.
+
 ## Documentation and release gate
 
 - [x] `.env.example` contains Paper-only keys and the fixed Paper endpoint.
@@ -38,8 +40,8 @@ On 2026-11-10 the configured Paper endpoint authenticated successfully and repor
 - [x] Capture invented-data screenshots for the Paper overview and equity entry. `docs/screenshot-alpaca-paper-demo.png` and `docs/screenshot-paper-entry-demo.png` were visually checked on 2026-11-10; no real account data was used. The older option screenshot is historical and excluded from the release.
 - [ ] Complete every applicable controlled Paper scenario above and attach redacted evidence to #12.
 - [ ] Re-run the automated gate on the final commit and record the results in #12.
-- [ ] Confirm Schwab is selectable and its regression suite passes.
-- [ ] Confirm no live Alpaca endpoint or mode is reachable.
+- [x] Confirm Schwab is selectable and its regression suite passes. The merged app switched Paper → Schwab → Paper on 2026-11-10; PR #81 passed Linux and Windows CI and the credential-free suite passed 593 tests.
+- [x] Confirm no live Alpaca endpoint or mode is reachable. `tests/test_broker_configuration.py` verifies live-only credentials, live selection, and non-Paper endpoints fail before client construction; the merged runtime selected the fixed Paper endpoint.
 
 ## Rollback
 
