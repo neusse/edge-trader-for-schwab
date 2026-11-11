@@ -156,6 +156,7 @@ class BalanceSnapshot:
     day_trading_buying_power: Decimal | None = None
     available_funds: Decimal | None = None
     maintenance_requirement: Decimal | None = None
+    options_buying_power: Decimal | None = None
 
 
 @dataclass(frozen=True)

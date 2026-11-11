@@ -17,7 +17,7 @@ from companion.brokers.models import (AccountQuery, AccountSnapshot, AssetType,
 from companion.brokers.paper_options import chain_query, chain_response
 from companion.brokers.paper_options import (expirations_query, expirations_response,
                                              long_entry_plan, option_close_plan,
-                                             option_fixed_exit_plan)
+                                             option_fixed_exit_plan, short_entry_plan)
 
 
 NOW = datetime(2026, 11, 11, 17, 0, tzinfo=timezone.utc)
@@ -108,6 +108,49 @@ def test_long_option_entry_refuses_level_position_and_bad_premium():
         long_entry_plan({**body, "limit_price": "100"}, _account(), _chain(), NOW)
     with pytest.raises(ValueError, match="whole contracts"):
         long_entry_plan({**body, "quantity": "1.5"}, _account(), _chain(), NOW)
+
+
+def test_short_call_requires_uncommitted_cover_and_level_one():
+    body = _entry_body()
+    shares = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, D("200"), D("200"))
+    plan = short_entry_plan(body, _account(level=1, positions=(shares,)), _chain(), NOW)
+    assert plan.leg.instruction == OrderInstruction.SELL_TO_OPEN
+    assert plan.leg.quantity == 2 and plan.time_in_force == TimeInForce.DAY
+    with pytest.raises(ValueError, match="covered call"):
+        short_entry_plan(body, _account(level=1), _chain(), NOW)
+    prior = Position("AAPL261120C00230000", AssetType.OPTION,
+                     PositionSide.SHORT, D("1"), D("1"))
+    with pytest.raises(ValueError, match="uncommitted"):
+        short_entry_plan(body, _account(level=1, positions=(shares, prior)), _chain(), NOW)
+    with pytest.raises(ValueError, match="level 1"):
+        short_entry_plan(body, _account(level=0, positions=(shares,)), _chain(), NOW)
+    with pytest.raises(ValueError, match="current"):
+        stale = _chain().contracts[0]
+        quote = Quote(body["contract"], D("1.20"), D("1.40"), None, D("1.30"),
+                      NOW - timedelta(seconds=61), False, "Alpaca indicative options")
+        short_entry_plan(body, _account(level=1, positions=(shares,)), OptionChain(
+            "AAPL", (OptionContract(stale.symbol, "AAPL", stale.expiration, stale.strike,
+                                     stale.option_type, quote=quote),), NOW), NOW)
+
+
+def test_short_put_requires_full_strike_collateral():
+    body = {**_entry_body(), "option_type": "put", "contract": "AAPL261113P00225000",
+            "quantity": "1"}
+    call = _chain().contracts[0]
+    quote = Quote(body["contract"], D("1.20"), D("1.40"), None, D("1.30"), NOW,
+                  False, "Alpaca indicative options")
+    contract = OptionContract("AAPL  261113P00225000", "AAPL", call.expiration,
+                              call.strike, OptionType.PUT, quote=quote)
+    chain = OptionChain("AAPL", (contract,), NOW)
+    account = AccountSnapshot("paper-account", "ACTIVE",
+                              BalanceSnapshot(options_buying_power=D("22500")), (),
+                              options_trading_level=1, options_approved_level=1)
+    plan = short_entry_plan(body, account, chain, NOW)
+    assert plan.leg.instruction == OrderInstruction.SELL_TO_OPEN
+    with pytest.raises(ValueError, match="options buying power"):
+        short_entry_plan(body, _account(level=1), chain, NOW)
+    with pytest.raises(ValueError, match="strike price"):
+        short_entry_plan({**body, "limit_price": "226"}, account, chain, NOW)
 
 
 def _held_option(side=PositionSide.LONG):
@@ -232,6 +275,49 @@ def test_long_option_preview_and_submit_are_account_bound_and_one_shot(monkeypat
     submit = client.post("/api/paper/options/long/submit", json=_entry_body(), headers=headers)
     assert submit.json()["ok"] and submit.json()["order_id"] == "paper-option-order"
     assert len(commands) == 1 and commands[0][0].intent.leg.instruction == OrderInstruction.BUY_TO_OPEN
+
+
+def test_short_option_route_rechecks_covered_shares_before_send(monkeypatch):
+    import companion.app as appmod
+
+    shares = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, D("200"), D("200"))
+    account = _account(level=1, positions=(shares,))
+    groups = ()
+    commands = []
+    def query(value):
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return groups
+        if isinstance(value, OptionChainQuery): return _chain()
+        raise AssertionError(type(value))
+    def execute(command, request_id, preflight):
+        preflight(account)
+        commands.append(command)
+        return MutationResult(MutationStatus.ACCEPTED, "paper-covered-call")
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query),
+                              account_ref="paper-account", execute=execute)
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    monkeypatch.setattr("companion.brokers.paper_options.datetime", SimpleNamespace(
+        now=lambda _tz: NOW))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    preview = client.post("/api/paper/options/short/preview", json=_entry_body(), headers=headers)
+    assert preview.json()["ok"] and preview.json()["collateral_required"] == "200"
+    assert preview.json()["collateral_type"] == "covered shares"
+    accepted = client.post("/api/paper/options/short/submit", json=_entry_body(), headers=headers)
+    assert accepted.json()["ok"] and len(commands) == 1
+    assert commands[0].intent.leg.instruction == OrderInstruction.SELL_TO_OPEN
+    pending = BrokerOrder("external", OrderStatus.WORKING, OrderType.LIMIT,
+                          TimeInForce.DAY,
+                          (OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL,
+                                    D("100")),), OrderRole.EXIT)
+    groups = (OrderGroup("external", OrderClass.SIMPLE, OrderStatus.WORKING,
+                         (pending,)),)
+    conflict = client.post("/api/paper/options/short/preview", json=_entry_body(), headers=headers)
+    assert not conflict.json()["ok"] and "active order" in conflict.json()["error"]
+    groups = ()
+    account = _account(level=1)
+    refused = client.post("/api/paper/options/short/submit", json=_entry_body(), headers=headers)
+    assert not refused.json()["ok"] and len(commands) == 1
 
 
 def test_option_close_route_previews_and_rechecks_held_quantity(monkeypatch):

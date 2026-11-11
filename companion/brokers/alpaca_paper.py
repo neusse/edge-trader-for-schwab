@@ -353,6 +353,7 @@ class AlpacaPaperAdapter(BrokerAdapter):
                 day_trading_buying_power=_decimal(account.daytrading_buying_power),
                 available_funds=_decimal(account.cash),
                 maintenance_requirement=_decimal(account.maintenance_margin),
+                options_buying_power=_decimal(getattr(account, "options_buying_power", None)),
             ),
             positions=tuple(positions), observed_at=datetime.now(timezone.utc),
             options_trading_level=_option_level(getattr(account, "options_trading_level", None)),

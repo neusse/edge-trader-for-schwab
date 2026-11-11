@@ -385,7 +385,7 @@
 </section>
 <section class="panel" id="paper-options" aria-label="Alpaca Paper option discovery">
   <h2>Paper option discovery</h2>
-  <p class="mut">Browse one expiration and type at a time. Alpaca option quotes and Greeks are indicative and may be delayed or absent. A level-2-or-higher Paper account can buy a long call or put with a reviewed limit order. It has no attached stop or target; the full premium can be lost.</p>
+  <p class="mut">Browse one expiration and type at a time. Alpaca option quotes and Greeks are indicative and may be delayed or absent. Level 2 can buy a long call or put; level 1 can sell a covered call or cash-secured put. Each is a reviewed limit order without an attached stop or target. Short options can be assigned.</p>
   <form id="paper-options-form" class="paper-fields">
     <label>Underlying<input class="in" name="underlying" required maxlength="6" placeholder="AAPL" autocomplete="off"></label>
     <label>Expiration<select class="in" name="expiration" required><option value="">Find expirations</option></select></label>
@@ -397,9 +397,10 @@
   <div id="paper-options-chain" class="alpaca-list"></div>
   <form id="paper-option-entry-form" class="paper-fields">
     <label>Selected OCC contract<input class="in" name="contract" readonly placeholder="Select from chain" style="width:230px"></label>
+    <label>Position<select class="in" name="position_side"><option value="long">Buy long</option><option value="short">Sell covered / cash-secured</option></select></label>
     <label>Contracts<input class="in" name="quantity" type="number" min="1" max="100" step="1" value="1" required></label>
     <label>Limit premium / share<input class="in" name="limit_price" type="number" min="0.01" step="0.01" required></label>
-    <button class="btn" type="submit" id="paper-option-submit" disabled>Review long option order</button>
+    <button class="btn" type="submit" id="paper-option-submit" disabled>Review option order</button>
   </form>
   <p id="paper-option-entry-msg" class="mut" role="status">Select a tradable contract. Paper orders must be armed above.</p>
 </section>
@@ -1566,15 +1567,24 @@ $("paper-options-chain").addEventListener("click", e => {
   if (!contract) return;
   paperOptionSelected = contract.symbol;
   $("paper-option-entry-form").elements.contract.value = contract.symbol;
-  $("paper-option-entry-form").elements.limit_price.value = contract.ask || "";
-  $("paper-option-entry-msg").textContent = `${contract.symbol} selected. Indicative ask ${contract.ask ?? "unavailable"}; set your own limit and review the maximum premium.`;
+  const short = $("paper-option-entry-form").elements.position_side.value === "short";
+  $("paper-option-entry-form").elements.limit_price.value = (short ? contract.bid : contract.ask) || "";
+  $("paper-option-entry-msg").textContent = `${contract.symbol} selected. Indicative ${short ? "bid" : "ask"} ${short ? contract.bid ?? "unavailable" : contract.ask ?? "unavailable"}; set your own limit and review collateral.`;
+  renderOptionEntryControls(lastState);
+});
+$("paper-option-entry-form").elements.position_side.addEventListener("change", e => {
+  const contract = (paperOptionChain?.contracts || []).find(c => c.symbol === paperOptionSelected);
+  $("paper-option-entry-form").elements.limit_price.value = contract ?
+    (e.target.value === "short" ? contract.bid || "" : contract.ask || "") : "";
   renderOptionEntryControls(lastState);
 });
 function renderOptionEntryControls(st) {
+  const short = $("paper-option-entry-form").elements.position_side.value === "short";
   const allowed = st?.broker?.key === "alpaca-paper" &&
-    st.broker.workflows?.includes("option-long-entry") &&
-    Number(st.alpaca?.options_trading_level) >= 2 &&
-    Number(st.alpaca?.options_approved_level) >= 2;
+    st.broker.workflows?.includes(short ? "option-covered-short" : "option-long-entry") &&
+    Number(st.alpaca?.options_trading_level) >= (short ? 1 : 2) &&
+    Number(st.alpaca?.options_approved_level) >= (short ? 1 : 2);
+  $("paper-option-submit").textContent = short ? "Review covered short" : "Review long option";
   $("paper-option-submit").disabled = !allowed || !paperOptionSelected || !paperArmed ||
     !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown";
 }
@@ -1582,10 +1592,11 @@ $("paper-option-entry-form").addEventListener("submit", async e => {
   e.preventDefault();
   if ($("paper-option-submit").disabled || !paperOptionChain || !paperOptionSelected) return;
   const form = new FormData(e.currentTarget);
+  const short = form.get("position_side") === "short";
   const payload = {underlying:paperOptionChain.underlying, expiration:paperOptionChain.expiration,
     option_type:paperOptionChain.option_type, contract:paperOptionSelected,
     quantity:form.get("quantity"), limit_price:form.get("limit_price"), request_id:crypto.randomUUID()};
-  const key = JSON.stringify([payload.contract,payload.quantity,payload.limit_price]);
+  const key = JSON.stringify([short,payload.contract,payload.quantity,payload.limit_price]);
   const message = $("paper-option-entry-msg");
   if (paperOptionSentKeys.has(key)) {
     message.textContent = "This exact option entry was already sent. Change the order to plan a new one.";
@@ -1601,15 +1612,16 @@ $("paper-option-entry-form").addEventListener("submit", async e => {
   renderPaperControls(lastState);
   let sent = false;
   try {
-    const preview = await post("/api/paper/options/long/preview", payload, 45000);
+    const route = short ? "/api/paper/options/short" : "/api/paper/options/long";
+    const preview = await post(`${route}/preview`, payload, 45000);
     if (!preview.ok) throw new Error(preview.error || preview.detail || "Option preview refused");
-    if (!window.confirm(`Buy to open ${preview.quantity} ${preview.contract} at a limit of ${preview.limit_price} per share? ` +
-        `Maximum premium ${preview.maximum_premium}. Indicative bid/ask ${preview.indicative_bid ?? "—"}/${preview.indicative_ask ?? "—"}. ${preview.protection}.`)) {
+    if (!window.confirm(`${short ? "Sell to open" : "Buy to open"} ${preview.quantity} ${preview.contract} at a limit of ${preview.limit_price} per share? ` +
+        `${short ? `${preview.collateral_required} ${preview.collateral_type} required` : `Maximum premium ${preview.maximum_premium}`}. Indicative bid/ask ${preview.indicative_bid ?? "—"}/${preview.indicative_ask ?? "—"}. ${preview.protection}`)) {
       message.textContent = "Paper option review canceled."; return;
     }
     message.textContent = "Sending Paper option order once…";
     sent = true;
-    const result = await post("/api/paper/options/long/submit", payload, 45000);
+    const result = await post(`${route}/submit`, payload, 45000);
     if (result.status === "unknown") {
       paperOutcome = "unknown"; paperOptionSentKeys.add(key);
       message.textContent = result.message || "Option outcome unknown. Reconcile above before another action.";
