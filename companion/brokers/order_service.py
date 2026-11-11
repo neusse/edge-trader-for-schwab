@@ -256,6 +256,23 @@ class BrokerOrderService:
             if order is None:
                 return MutationResult(MutationStatus.UNKNOWN,
                                       message="Broker response did not match the replacement client ID")
+            if (client_order_id.startswith("et-autobe-") and
+                    group.order_class in (OrderClass.BRACKET, OrderClass.OCO) and
+                    len(group.orders) < (3 if group.order_class == OrderClass.BRACKET else 2)):
+                # Alpaca's client-ID lookup can return only the replaced stop.
+                # Confirm its paired exit from a fresh nested order read.
+                try:
+                    from .alpaca_paper import query_complete_active_groups
+                    complete = query_complete_active_groups(self.adapter, self.clock())
+                    group = next((candidate for candidate in complete
+                                  if candidate.group_id == group.group_id and
+                                  any(item.client_order_id == client_order_id
+                                      for item in candidate.orders)), group)
+                    order = next(item for item in group.orders
+                                 if item.client_order_id == client_order_id)
+                except Exception:
+                    return MutationResult(MutationStatus.UNKNOWN,
+                                          message="Broker paired exits could not be verified")
             expected_limit = row["payload"].get("limit_price")
             if expected_limit is not None and order.limit_price != Decimal(str(expected_limit)):
                 return MutationResult(MutationStatus.UNKNOWN,
