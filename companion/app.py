@@ -35,6 +35,7 @@ from .brokers.models import (AccountQuery, AssetType, CancelOrder,
                              SubmitOrder)
 from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_reprice,
                                    oco_plan, trailing_plan)
+from .brokers.paper_options import chain_query, chain_response
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -321,6 +322,25 @@ def _paper_service():
     if not snap.get("broker_ready") or not 0 <= age <= 30 or account.get("account_status", "").upper() != "ACTIVE":
         raise HTTPException(409, "Alpaca Paper account data is not fresh and ready")
     return poller.order_service, snap
+
+
+@app.post("/api/paper/options/chain")
+async def paper_option_chain(request: Request):
+    """Discover exact-expiry OCC contracts; quotes are indicative and never arm an order."""
+    _guard(request)
+    try:
+        body = await request.json()
+        query = chain_query(body)
+        def fetch():
+            service, _ = _paper_service()
+            return chain_response(query, service.adapter.query(query))
+        return await run_in_threadpool(fetch)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option discovery failed; no order was sent"}
 
 
 def _paper_entry(body: dict, for_submit: bool = False):
