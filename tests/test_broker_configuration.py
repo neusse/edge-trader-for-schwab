@@ -44,3 +44,15 @@ def test_client_constructor_is_fixed_to_paper(monkeypatch):
     monkeypatch.setattr(alpaca.trading.client, "TradingClient", capture)
     paper_trading_client({"alpaca_paper_api_key": "key", "alpaca_paper_secret": "secret"})
     assert seen == {"key": "key", "secret": "secret", "paper": True}
+
+
+def test_live_endpoint_is_refused_before_client_construction(monkeypatch):
+    import alpaca.trading.client
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("trading client was constructed")
+
+    monkeypatch.setattr(alpaca.trading.client, "TradingClient", forbidden)
+    with pytest.raises(ValueError, match="Alpaca Paper endpoint"):
+        paper_trading_client({"alpaca_paper_api_key": "key", "alpaca_paper_secret": "secret",
+                              "alpaca_paper_endpoint": "https://api.alpaca.markets"})
