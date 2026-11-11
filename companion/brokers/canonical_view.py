@@ -83,8 +83,12 @@ def _pending(groups: tuple[OrderGroup, ...],
                     parent_id=order.parent_id,
                     oco_id=order.oco_id or (group.group_id if group.order_class.value in ("oco", "bracket")
                     and role != OrderRole.ENTRY else None),
-                    # Pending activation is deliberately not counted as broker-held protection.
-                    status=order.status_detail or
+                    # A filled Alpaca bracket/OCO may hold its conditional exit at
+                    # the broker until the price trigger; it still protects shares.
+                    status=("AWAITING_STOP_CONDITION" if order.status_detail == "HELD" and
+                            group.order_class.value in ("bracket", "oco") and
+                            role in (OrderRole.STOP, OrderRole.TARGET) and
+                            order.status == OrderStatus.WORKING else order.status_detail) or
                     ("WORKING" if order.status in _ACTIVE else "PENDING_NEW"),
                     symbol=leg.symbol, underlying=leg.underlying or leg.symbol,
                     asset_type=leg.asset_type.value.upper(),
