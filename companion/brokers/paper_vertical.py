@@ -86,7 +86,7 @@ def vertical_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain
 
 def vertical_close_plan(body: dict, account: AccountSnapshot,
                         quotes: dict[str, Quote], now: datetime | None = None) -> MultiLegOrderIntent:
-    """Close one exact held 1:1 vertical in a single broker multi-leg order."""
+    """Close or target one exact held 1:1 vertical in one broker multi-leg order."""
     if not isinstance(body, dict) or account.status.upper() != "ACTIVE":
         raise ValueError("an active Paper account and vertical close request are required")
     long_symbol, short_symbol = body.get("long_contract"), body.get("short_contract")
@@ -136,6 +136,17 @@ def vertical_close_plan(body: dict, account: AccountSnapshot,
             net != net.quantize(Decimal("0.01")) or
             (debit_entry and net > 0) or (not debit_entry and net < 0)):
         raise ValueError("vertical close limit must be a cent-precision credit or debit inside strike width")
+    role = body.get("role", "close")
+    if role not in ("close", "target"):
+        raise ValueError("vertical exit role must be close or target")
+    if role == "target":
+        if long.average_price is None or short.average_price is None:
+            raise ValueError("held vertical entry basis is unavailable for a profit target")
+        entry_net = long.average_price - short.average_price
+        if (debit_entry and entry_net <= 0) or (not debit_entry and entry_net >= 0):
+            raise ValueError("held vertical entry basis does not match its strike direction")
+        if net >= -entry_net:
+            raise ValueError("vertical target must lock in a profit before fees")
     try:
         request_id = UUID(str(body.get("request_id")))
     except (ValueError, TypeError, AttributeError):
@@ -146,4 +157,5 @@ def vertical_close_plan(body: dict, account: AccountSnapshot,
                         quantity),
          OrderLegIntent(short_symbol, AssetType.OPTION, OrderInstruction.BUY_TO_CLOSE,
                         quantity)),
-        OrderType.LIMIT, TimeInForce.DAY, f"et-vertical-close-{request_id.hex}", net)
+        OrderType.LIMIT, TimeInForce.GTC if role == "target" else TimeInForce.DAY,
+        f"et-vertical-{role}-{request_id.hex}", net)

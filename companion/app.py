@@ -84,12 +84,12 @@ APP_WORKFLOWS = {
                      "equity-oco-adjust", "equity-add", "equity-trailing",
                      "option-long-entry", "option-close", "option-cancel",
                      "option-fixed-exit", "option-covered-short", "vertical-entry",
-                     "vertical-close"),
+                     "vertical-close", "vertical-target"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order, and an exact held vertical can be closed atomically. Held options can be closed or given one fixed stop, stop-limit, or target. Spread targets and app-watched stops are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order; an exact held vertical can be closed or given one broker-held target. Held options can be closed or given one fixed stop, stop-limit, or target. Spread stops are app-watched and are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -665,8 +665,13 @@ async def paper_vertical_close_preview(request: Request):
                 "short_contract": intent.legs[1].symbol,
                 "quantity": str(intent.legs[0].quantity),
                 "net_price": str(intent.limit_price),
+                "role": "target" if intent.time_in_force.value == "gtc" else "close",
+                "time_in_force": intent.time_in_force.value,
                 "indicative_close_cost": str(indicative),
-                "protection": "One broker multi-leg limit close. Both held legs remain exposed until the broker confirms a complete fill; a partial or unknown outcome blocks another action."}
+                "protection": ("One broker-held multi-leg GTC profit target after Alpaca accepts it. "
+                               "No broker-held stop is paired; both legs remain exposed until a complete fill."
+                               if intent.time_in_force.value == "gtc" else
+                               "One broker multi-leg limit close. Both held legs remain exposed until the broker confirms a complete fill; a partial or unknown outcome blocks another action.")}
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     except HTTPException:
