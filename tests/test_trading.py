@@ -799,6 +799,30 @@ def test_set_target_without_a_stop_sends_a_lone_target(trader, monkeypatch):
     assert order["orderType"] == "LIMIT" and order["orderLegCollection"][0]["instruction"] == "BUY_TO_COVER"
 
 
+def test_unknown_lone_target_blocks_a_second_send(trader, monkeypatch):
+    _mu_quote(trader, monkeypatch)
+    broker = Broker([])
+    sent = []
+
+    def server_error(_hash, order):
+        sent.append(order)
+        return Resp(500)
+
+    broker.place_order = server_error
+    trader._client = broker
+    result = trader.set_target("MXR", "900", None, [], set(), None)
+    assert not result["ok"] and "outcome unknown" in result["error"] and len(sent) == 1
+    blocked = trader.set_target("MXR", "899", None, [], set(), None)
+    assert not blocked["ok"] and "Resolve" in blocked["error"] and len(sent) == 1
+
+
+def test_canonical_lone_target_keeps_schwab_gtc_duration(trader):
+    result = trader._place_exit("MXR", "BUY_TO_COVER", "EQUITY", 57,
+                                Decimal("900.00"), "GOOD_TILL_CANCEL")
+    assert result.accepted
+    assert trader._client.placed[-1]["duration"] == "GOOD_TILL_CANCEL"
+
+
 def _quote_mark(trader, monkeypatch, mark=906.0):
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
     monkeypatch.setattr(trader, "quote", lambda s, max_age=0: {"bid": mark - 0.1, "ask": mark + 0.1, "mark": mark})
@@ -2285,6 +2309,23 @@ def test_a_replaced_limit_never_sends_the_rest_at_market(trader, monkeypatch):
     r = trader.take_partial("MXR", 0.5, None, [], set(), mode="mid")
     assert not [o for o in b.placed if o.get("orderType") == "MARKET"], b.placed
     assert r.get("unresolved_close"), r
+
+
+def test_unclear_limit_cancel_never_sends_the_rest_at_market(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    b = Broker([_mu_oco()], fill_limits=False)
+    attempts = []
+
+    def lost_cancel(_hash, oid):
+        attempts.append(oid)
+        return Resp(500, text="lost reply")
+
+    b.cancel_order = lost_cancel
+    trader._client = b
+    result = trader.take_partial("MXR", 0.5, None, [], set(), mode="mid")
+    assert len(attempts) == 1
+    assert not [order for order in b.placed if order.get("orderType") == "MARKET"]
+    assert result.get("unresolved_close"), result
 
 
 def test_market_rest_with_missing_legs_stays_open(trader, monkeypatch):

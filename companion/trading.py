@@ -1174,14 +1174,14 @@ class Trader:
     SETTLED = {"FLAT", "RATE_LIMITED", "REJECTED", "RESOLVED_MANUALLY", "DONE", "CHECK", "FINAL"}
 
     def _unresolved_close(self, symbol: str, client=None) -> dict | None:
-        """The latest close or partial for this symbol, if its outcome is still open: SENDING /
+        """The latest close, partial, add, or target for this symbol if its outcome is open: SENDING /
         UNKNOWN (no answer), or a Schwab status that is not final (WORKING, QUEUED, SENT...). An
         open Schwab status is asked again first; once Schwab says it is final, it stops blocking.
         Until then no new close, partial, stop, target or trail is sent for the symbol. Looks back
         30 days, not just today: an unclear close before an overnight hold must still block."""
         start = datetime.now(timezone.utc) - timedelta(days=30)
         acts = [a for a in self.store.actions_since(start.isoformat())
-                if a["kind"] in ("close", "partial", "add") and a["symbol"] == symbol]
+                if a["kind"] in ("close", "partial", "add", "set_target") and a["symbol"] == symbol]
         if not acts:
             return None
         last = acts[-1]
@@ -1264,7 +1264,7 @@ class Trader:
         return {"ok": ok, "spread_id": spread_id, "error": why}
 
     def resolve_close(self, symbol: str) -> None:
-        """the user checked thinkorswim after an unclear close or partial; allow orders again."""
+        """The user checked thinkorswim after an unclear symbol action; allow orders again."""
         self.store.log_action("close", symbol.upper().strip(), None, "RESOLVED_MANUALLY", "resolved by the user")
 
     def _guard_leg(self, symbol: str, qty: float, asset: str | None, positions: list[dict],
@@ -1956,11 +1956,16 @@ class Trader:
             instr = {("EQUITY", True): "SELL", ("EQUITY", False): "BUY_TO_COVER",
                      ("OPTION", True): "SELL_TO_CLOSE", ("OPTION", False): "BUY_TO_CLOSE"}.get((asset, side == "LONG"))
             self.store.log_action("set_target", symbol, None, "SENDING", f"target {label}, no stop")
-            r = self._place_exit(client, symbol, instr, asset, int(abs(qty)), target, _exit_tif(pend, symbol, side))
-            ok = r.status_code in (200, 201)
+            result = self._place_exit(symbol, instr, asset, int(abs(qty)), target,
+                                      _exit_tif(pend, symbol, side))
+            ok = result.accepted
             msg = (f"Target set at {label} for {abs(qty):g} {unit_w}. WARNING: there is no stop: use Stop to B/E "
-                   "or Move stop." if ok else f"Schwab refused the target (HTTP {r.status_code}): {r.text[:150]}")
-            self.store.log_action("set_target", symbol, None, "DONE" if ok else "REJECTED", msg)
+                   "or Move stop." if ok else
+                   "Target outcome unknown: it MAY be working. Check thinkorswim before setting another target."
+                   if result.status == MutationStatus.UNKNOWN else
+                   f"Schwab refused the target: {result.message}")
+            self.store.log_action("set_target", symbol, None, "DONE" if ok else
+                                  result.status.value.upper().replace("-", "_"), msg)
             return {"ok": ok, "symbol": symbol, "message": msg, "error": None if ok else msg}
         self.store.log_action("set_target", symbol, None, "SENDING", f"target {label} + stop {stop}, {abs(qty):g} {us}")
         res = self._create_stop(client, symbol, side, abs(qty), asset, Decimal(str(stop)), [], set(),
@@ -2045,15 +2050,16 @@ class Trader:
         return [(float(e["quantity"]), float(e["price"])) for a in final.get("orderActivityCollection") or []
                 if a.get("executionType") == "FILL" for e in a.get("executionLegs") or []]
 
-    def _place_exit(self, client, symbol: str, instr: str, asset: str, n: int, price: Decimal | None,
-                    duration: str = "DAY"):
-        order = {"orderStrategyType": "SINGLE", "orderType": "LIMIT" if price else "MARKET",
-                 "session": "NORMAL", "duration": duration,
-                 "orderLegCollection": [{"instruction": instr, "quantity": n,
-                                         "instrument": {"symbol": symbol, "assetType": asset}}]}
-        if price:
-            order["price"] = fmt(price, ticks_for(asset))
-        return self._logged("place_order", lambda: client.place_order(self._hash, order))
+    def _place_exit(self, symbol: str, instr: str, asset: str, n: float,
+                    price: Decimal | None, duration: str = "DAY") -> MutationResult:
+        intent = SimpleOrderIntent(
+            OrderLegIntent(symbol, AssetType[asset], OrderInstruction[instr], Decimal(str(n))),
+            OrderType.LIMIT if price is not None else OrderType.MARKET,
+            TimeInForce.GTC if _gtc(duration) else TimeInForce.DAY,
+            f"exit-{symbol}-{now_iso()}",
+            limit_price=Decimal(fmt(price, ticks_for(asset))) if price is not None else None,
+        )
+        return self._broker_mutation("place_order", SubmitOrder(intent))
 
     def _send_partial(self, client, symbol: str, instr: str, asset: str, n: int, mode: str,
                       kind: str = "partial") -> dict:
@@ -2080,33 +2086,35 @@ class Trader:
                 price = _to_tick(ask, "ROUND_CEILING", tk)      # literal ask (rests for a sell, takes for a cover)
         how = f"limit {fmt(price, tk)} at the {where}" if price else "market"
         uncertain_rest = False
+        cancel_attempted = False
         self.store.log_action(kind, symbol, None, "SENDING", f"{instr} {n} {how}")
         log.warning("%s %s %s %s %s", kind.upper(), instr, n, symbol, how)
         try:
-            r = self._place_exit(client, symbol, instr, asset, n, price)
+            result = self._place_exit(symbol, instr, asset, n, price)
         except Exception as e:
             self.store.log_action(kind, symbol, None, "UNKNOWN", repr(e))
             return {"unresolved": True,
                     "error": f"No answer from Schwab on the {what}. It MAY have been sent, and Schwab may "
                              "have cancelled your stop/target: check thinkorswim now, then press Resolve."}
-        if r.status_code == 429 or 400 <= r.status_code < 500:
-            self.store.log_action(kind, symbol, None, "REJECTED", f"HTTP {r.status_code} {r.text[:200]}")
-            return {"error": f"Schwab refused the {what} (HTTP {r.status_code}): {r.text[:150]}. "
+        if result.status in (MutationStatus.RATE_LIMITED, MutationStatus.REJECTED):
+            self.store.log_action(kind, symbol, None, result.status.value.upper().replace("-", "_"),
+                                  result.message)
+            return {"error": f"Schwab refused the {what}: {result.message}. "
                              "Nothing was sent; your stop/target should still be working."}
-        if r.status_code not in (200, 201):
-            self.store.log_action(kind, symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:200]}")
+        if result.status == MutationStatus.UNKNOWN:
+            self.store.log_action(kind, symbol, None, "UNKNOWN", result.message)
             return {"unresolved": True,
-                    "error": f"Schwab answered HTTP {r.status_code} on the {what}: it MAY have been sent. "
+                    "error": f"Schwab's answer on the {what} was unclear: it MAY have been sent. "
                              "Check thinkorswim now, then press Resolve."}
-        tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-        oid = int(tail) if tail.isdigit() else None
+        oid = int(result.order_id) if result.order_id else None
         final = self._wait_fill(client, oid, self.MID_WAIT_S if price else 2.5) if oid else {}
         fills = self._fills(final)
         filled = sum(q for q, _ in fills)
         if price and oid and filled < n - 1e-9 and final.get("status") not in TERMINAL:
             # Mid did not fill in time: cancel the rest, then send it at market.
+            cancel_attempted = True
             try:
-                self._logged("cancel_order", lambda: client.cancel_order(self._hash, oid))
+                self._broker_mutation("cancel_order", CancelOrder(str(oid)))
             except Exception:
                 pass
             final = self._wait_fill(client, oid, 1.5)
@@ -2125,27 +2133,27 @@ class Trader:
             elif final.get("status") in TERMINAL and rest > 0:
                 rest_ok = False
                 try:
-                    r2 = self._place_exit(client, symbol, instr, asset, rest, None)
+                    r2 = self._place_exit(symbol, instr, asset, rest, None)
                 except Exception:
                     r2 = None
-                tail2 = r2.headers.get("Location", "").rstrip("/").split("/")[-1] if r2 is not None and r2.status_code in (200, 201) else ""
-                if tail2.isdigit():
-                    final2 = self._wait_fill(client, int(tail2), 2.5)
+                rest_id = int(r2.order_id) if r2 is not None and r2.accepted and r2.order_id else None
+                if rest_id is not None:
+                    final2 = self._wait_fill(client, rest_id, 2.5)
                     fills += self._fills(final2)
                     filled = sum(q for q, _ in fills)
                     legs2 = sum(q for q, _ in self._fills(final2))
                     rest_ok = (final2.get("status") in TERMINAL and final2.get("status") != "REPLACED"
                                and float(final2.get("filledQuantity") or 0) <= legs2 + 1e-9)
-                elif r2 is not None and (r2.status_code == 429 or 400 <= r2.status_code < 500):
+                elif r2 is not None and r2.status in (MutationStatus.RATE_LIMITED, MutationStatus.REJECTED):
                     rest_ok = True        # refused: nothing more was sent
                 how += f", rest at market after {self.MID_WAIT_S:g} s"
                 if not rest_ok:
                     uncertain_rest = True
-        if oid and final.get("status") not in TERMINAL and not (price and "rest at market" in how):
+        if oid and final.get("status") not in TERMINAL and not cancel_attempted:
             # Still working (a market order that did not report done): cancel what is left so the
             # size is known before protection is rebuilt.
             try:
-                self._logged("cancel_order", lambda: client.cancel_order(self._hash, oid))
+                self._broker_mutation("cancel_order", CancelOrder(str(oid)))
             except Exception:
                 pass
             final = self._wait_fill(client, oid, 1.5)
@@ -2279,15 +2287,15 @@ class Trader:
             tk = ticks_for(asset)
             self.store.log_action("partial", symbol, None, "SENDING", f"target {fmt(Decimal(str(target)), tk)}, no stop")
             try:
-                r = self._place_exit(client, symbol, instr, asset, nleft, Decimal(str(target)), tif)
-                ok = r.status_code in (200, 201)
+                result = self._place_exit(symbol, instr, asset, nleft, Decimal(str(target)), tif)
+                ok = result.accepted
                 if ok:
                     tgt_txt = f" Target {fmt(Decimal(str(target)), tk)} put back on the {abs(left):g} {unit_w} left."
-                elif 400 <= r.status_code < 500:
-                    tgt_txt = (f" Schwab refused the target (HTTP {r.status_code}): {r.text[:150]}."
+                elif result.status in (MutationStatus.RATE_LIMITED, MutationStatus.REJECTED):
+                    tgt_txt = (f" Schwab refused the target: {result.message}."
                                " The target is GONE: use Set target.")
-                else:                             # a 5xx may still have placed it
-                    tgt_txt = (f" Schwab's answer on the target was unclear (HTTP {r.status_code}): it MAY be "
+                else:
+                    tgt_txt = (" Schwab's answer on the target was unclear: it MAY be "
                                "working. Check thinkorswim before using Set target.")
             except Exception as e:
                 ok = False
@@ -2494,11 +2502,13 @@ class Trader:
             res = self._create_stop(client, symbol, side, protect, asset, new_stop, [], set(), target=tgt, rebuild=True,
                                     duration=tif, exits_gone=True)
         elif tgt is not None:
-            r = self._place_exit(client, symbol, "SELL" if side == "LONG" else "BUY_TO_COVER", asset,
-                                 int(protect), tgt, tif)
-            ok = r.status_code in (200, 201)
+            result = self._place_exit(symbol, "SELL" if side == "LONG" else "BUY_TO_COVER", asset,
+                                      int(protect), tgt, tif)
+            ok = result.accepted
             res = {"ok": False, "message": (f"Target {fmt(tgt, EQUITY)} put back on {protect:g} shares. "
-                                            if ok else f"Schwab refused the target (HTTP {r.status_code}). ")
+                                            if ok else "Target outcome unclear; check thinkorswim. "
+                                            if result.status == MutationStatus.UNKNOWN else
+                                            f"Schwab refused the target: {result.message}. ")
                    + "There is NO STOP (there was none before): use Set stop."}
         else:
             res = {"ok": False, "message": "There was no stop or target to put back: the position has NO STOP."}
