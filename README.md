@@ -115,9 +115,9 @@ name are refused). It needs no account and sends no telemetry.
 
 ### What leaves your computer
 
-- **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
+- **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the equity orders you click. When Alpaca Paper is selected, a separate read-only quotes client prices any visible option holdings or working option orders through Schwab; it cannot send orders.
 - **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads plus the equity actions described above. The app sends an order only after its review and confirmation. No live Alpaca order endpoint is configured.
-- **Alpaca market data** (`data.alpaca.markets`): stock IEX quotes for equity workflows. Existing option holdings may be quoted indicatively; option trading and automatic spread stops are disabled.
+- **Alpaca market data** (`data.alpaca.markets`): stock IEX quotes for equity workflows. The hidden, read-only option-chain discovery API can still return Alpaca indicative data; visible Paper option holdings and working orders use Schwab quotes. Option trading and automatic spread stops are disabled.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
@@ -197,7 +197,7 @@ risk before you send.
 
 - **Futures:** Schwab's API reports futures fills but not futures positions or orders, so Edge Trader
   shows futures realized P&L only and cannot trade futures.
-- **Options and spreads:** trading controls are disabled for Alpaca Paper and Schwab. Existing holdings remain visible as read-only account data. Manage any existing option orders directly with the broker.
+- **Options and spreads:** trading controls are disabled for Alpaca Paper and Schwab. Existing Paper option holdings remain visible as read-only account data and use Schwab market quotes when its login is available. Missing Schwab option quotes leave those holdings unpriced without disabling Paper equity trading. Manage any existing option orders directly with the broker.
 - **No stop at entry:** a trade sent without a stop gets its R from the first stop you set from the
   app once Schwab shows it working (a stop set in thinkorswim does not count).
 - **One stream per Schwab user:** Edge Trader polls (REST) and never opens Schwab's streamer, so it
