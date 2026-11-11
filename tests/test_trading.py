@@ -554,6 +554,28 @@ def test_close_is_one_market_order_and_schwab_cancels_the_oco(trader, monkeypatc
     assert trader._client.cancelled == []            # no pre-cancel round trip: Schwab did it
 
 
+def test_close_keeps_fractional_equity_quantity(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([], position=("MXR", -0.5, "EQUITY"))
+    result = trader.close_position("MXR", [], set())
+    assert result["ok"] and trader._client.placed[0]["orderLegCollection"][0]["quantity"] == 0.5
+
+
+def test_close_server_error_blocks_another_send(trader):
+    broker = Broker([_mu_oco()])
+    sends = []
+
+    def server_error(_hash, order):
+        sends.append(order)
+        return Resp(500)
+
+    broker.place_order = server_error
+    trader._client = broker
+    result = trader.close_position("MXR", [], set())
+    assert result["unresolved_close"] and len(sends) == 1
+    assert "Resolve" in trader.close_position("MXR", [], set())["error"] and len(sends) == 1
+
+
 def test_close_cleans_up_orders_schwab_left_working(trader, monkeypatch):
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
     entry = {"orderId": 70, "orderStrategyType": "TRIGGER", "status": "FILLED", "filledQuantity": 57,
