@@ -519,6 +519,24 @@ class TrailingOrderIntent:
 
 
 @dataclass(frozen=True)
+class TriggeredOrderIntent:
+    """An entry that activates one or two broker-held exits after its fill."""
+
+    entry: SimpleOrderIntent
+    exits: tuple[SimpleOrderIntent | OcoOrderIntent | TrailingOrderIntent, ...]
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.exits) <= 2:
+            raise ValueError("a triggered order needs one or two exit groups")
+        legs = tuple(exit_intent.leg for exit_intent in self.exits)
+        if any(leg.symbol != self.entry.leg.symbol or leg.asset_type != self.entry.leg.asset_type
+               for leg in legs):
+            raise ValueError("triggered exits must use the entry's symbol and asset")
+        if sum((leg.quantity for leg in legs), Decimal(0)) != self.entry.leg.quantity:
+            raise ValueError("triggered exits must cover the full entry quantity")
+
+
+@dataclass(frozen=True)
 class MultiLegOrderIntent:
     legs: tuple[OrderLegIntent, ...]
     order_type: OrderType
@@ -538,7 +556,8 @@ class MultiLegOrderIntent:
 
 
 OrderIntent: TypeAlias = (
-    SimpleOrderIntent | BracketOrderIntent | OcoOrderIntent | TrailingOrderIntent | MultiLegOrderIntent
+    SimpleOrderIntent | BracketOrderIntent | OcoOrderIntent | TrailingOrderIntent |
+    TriggeredOrderIntent | MultiLegOrderIntent
 )
 
 

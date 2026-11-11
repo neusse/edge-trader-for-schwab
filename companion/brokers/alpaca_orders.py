@@ -6,7 +6,7 @@ from decimal import Decimal
 from .models import (
     AssetType, BracketOrderIntent, MultiLegOrderIntent, OcoOrderIntent,
     OrderInstruction, OrderLegIntent, OrderType, SimpleOrderIntent,
-    TrailingOrderIntent, TrailingStopSpec,
+    TrailingOrderIntent, TrailingStopSpec, TriggeredOrderIntent,
 )
 
 
@@ -86,6 +86,8 @@ def build_order_request(intent):
 
     if isinstance(intent, SimpleOrderIntent):
         return _simple(intent)
+    if isinstance(intent, TriggeredOrderIntent):
+        raise ValueError("Alpaca paper requires a supported bracket plan; this triggered exit structure is unavailable")
     if isinstance(intent, BracketOrderIntent):
         if intent.entry.leg.asset_type != AssetType.EQUITY:
             raise ValueError("Alpaca paper brackets require equity entry")
