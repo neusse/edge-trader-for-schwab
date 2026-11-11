@@ -189,7 +189,9 @@ def main() -> None:
                          now=now, revision=revision, salt=salt)
         if args.require_clean_market:
             broker_clock = adapter.query(MarketClockQuery())
-            require_clean_market(record, broker_clock, now)
+            # The broker clock is queried after account/order/fill reads. Compare it
+            # with a time observed after that query, not the earlier snapshot time.
+            require_clean_market(record, broker_clock, datetime.now(timezone.utc))
             record["preflight"] = {"clean_market": True,
                                    "broker_clock_at": broker_clock.observed_at.isoformat()}
         output.parent.mkdir(parents=True, exist_ok=True)
