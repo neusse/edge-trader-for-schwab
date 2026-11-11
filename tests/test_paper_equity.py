@@ -18,7 +18,7 @@ from companion.brokers.models import (
     SubmitOrder,
 )
 from companion.brokers.order_service import BrokerOrderService
-from companion.brokers.paper_equity import entry_plan, oco_plan
+from companion.brokers.paper_equity import close_plan, entry_plan, oco_plan
 from companion.store import Store
 from companion.trading import Trader
 
@@ -72,6 +72,101 @@ def test_oco_plan_closes_the_exact_whole_equity_position():
                           Decimal("1.5"), Decimal(100))
     with pytest.raises(ValueError, match="whole shares"):
         oco_plan(body, fractional, quote(now), now)
+
+
+def test_close_plan_handles_long_and_short_without_attaching_an_exit():
+    now = datetime.now(timezone.utc)
+    body = {"symbol": "AAPL", "request_id": str(uuid4())}
+    for side, instruction in ((PositionSide.LONG, OrderInstruction.SELL),
+                              (PositionSide.SHORT, OrderInstruction.BUY_TO_COVER)):
+        position = Position("AAPL", AssetType.EQUITY, side, Decimal(2), Decimal(100))
+        plan = close_plan(body, position, quote(now), now)
+        assert plan.leg.quantity == 2 and plan.leg.instruction == instruction
+        assert plan.order_type == OrderType.MARKET
+        assert plan.client_order_id.startswith("et-close-")
+    with pytest.raises(ValueError, match="stale"):
+        close_plan(body, position, quote(now - timedelta(seconds=31)), now)
+    with pytest.raises(ValueError, match="whole shares"):
+        close_plan(body, Position("AAPL", AssetType.EQUITY, side,
+                                  Decimal("1.5"), Decimal(100)), quote(now), now)
+
+
+def test_paper_close_route_requires_order_free_position_and_rechecks_before_send(monkeypatch, tmp_path):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    held = Position("AAPL", AssetType.EQUITY, PositionSide.SHORT, Decimal(2), Decimal(100))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (held,))
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, account, account, account)
+    adapter.given_query(OrdersQuery, (), (), ())
+    adapter.given_query(QuotesQuery, {"AAPL": quote(now)}, {"AAPL": quote(now)})
+    et_day = now.astimezone(timezone(timedelta(hours=-5))).date()
+    adapter.given_query(MarketSessionsQuery, (MarketSession(
+        et_day, now - timedelta(hours=1), now + timedelta(hours=1), True),))
+    adapter.given_command(SubmitOrder, MutationResult(MutationStatus.ACCEPTED, "close-order"))
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
+    poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
+                     "updated_at": now.isoformat(), "positions": [], "orders": []}}
+    class Selection:
+        def get(self): return "alpaca-paper"
+    monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
+    monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "BrokerSelection", Selection)
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    body = {"symbol": "AAPL", "request_id": str(uuid4())}
+    try:
+        preview = client.post("/api/paper/position/close/preview", json=body, headers=headers).json()
+        assert preview["ok"] and preview["quantity"] == "2"
+        assert preview["order_type"] == "market"
+        poller.order_service.arm(True)
+        sent = client.post("/api/paper/position/close/submit", json=body, headers=headers).json()
+        assert sent["status"] == "accepted" and sent["order_id"] == "close-order"
+        assert len(adapter.commands) == 1
+        assert adapter.commands[0].intent.leg.instruction == OrderInstruction.BUY_TO_COVER
+    finally:
+        store.close()
+        poller.store.close()
+
+
+def test_paper_close_refuses_order_that_appears_during_preflight(monkeypatch, tmp_path):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    held = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, Decimal(2), Decimal(100))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (held,))
+    leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL, Decimal(2))
+    active = OrderGroup("existing", OrderClass.SIMPLE, OrderStatus.UNKNOWN,
+                        (BrokerOrder("existing", OrderStatus.UNKNOWN, OrderType.LIMIT,
+                                     TimeInForce.DAY, (leg,), OrderRole.EXIT),))
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, account, account)
+    adapter.given_query(OrdersQuery, (), (active,))
+    adapter.given_query(QuotesQuery, {"AAPL": quote(now)})
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
+    poller.order_service.arm(True)
+    poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
+                     "updated_at": now.isoformat(), "positions": [], "orders": []}}
+    class Selection:
+        def get(self): return "alpaca-paper"
+    monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
+    monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "BrokerSelection", Selection)
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    try:
+        result = client.post("/api/paper/position/close/submit", json={
+            "symbol": "AAPL", "request_id": str(uuid4())},
+            headers={"X-Companion": "1"}).json()
+        assert result["status"] == "rejected" and "another order appeared" in result["message"]
+        assert adapter.commands == []
+    finally:
+        store.close()
+        poller.store.close()
 
 
 def test_paper_entry_route_arms_previews_sends_once_and_disarms_on_selection(monkeypatch, tmp_path):

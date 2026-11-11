@@ -82,7 +82,7 @@ class AlpacaBootstrapPoller:
             stage = "orders_today"
             recent = self._adapter.query(OrdersQuery(now - timedelta(days=30), now))
             active = frozenset({OrderStatus.PENDING, OrderStatus.WORKING,
-                                OrderStatus.PARTIALLY_FILLED})
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN})
             stage = "orders_sweep"
             working = self._adapter.query(OrdersQuery(now - timedelta(days=3650), now,
                                                         statuses=active))
