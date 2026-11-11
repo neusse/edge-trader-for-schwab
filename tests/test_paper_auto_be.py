@@ -94,6 +94,16 @@ def test_auto_be_plan_accepts_filled_bracket_but_not_partial_entry():
         oco_auto_be_plan(position, partial)
 
 
+def test_auto_be_plan_accepts_normalized_short_cover_bracket():
+    position, group = bracket_pair(PositionSide.SHORT, stop="105", target="90")
+    group = replace(group, orders=(group.orders[0], *(
+        replace(order, legs=(replace(order.legs[0],
+                                     instruction=OrderInstruction.BUY_TO_COVER),))
+        for order in group.orders[1:])))
+    plan = oco_auto_be_plan(position, group)
+    assert (plan["trigger"], plan["new_stop"]) == (D(95), D(100))
+
+
 def test_auto_be_requires_two_new_verified_quotes_and_blocks_unknown_clear(tmp_path):
     now = datetime.now(timezone.utc)
     position, group = pair()

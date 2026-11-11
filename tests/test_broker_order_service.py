@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import pytest
 
 from companion.brokers.capabilities import ALPACA_PAPER
 from companion.brokers.fake import FakeBrokerAdapter
@@ -359,15 +360,20 @@ def test_auto_be_bracket_reconciliation_requires_filled_entry_and_both_exits(tmp
         store.close()
 
 
-def test_auto_be_reconcile_recovers_complete_bracket_from_singleton_stop(tmp_path):
+@pytest.mark.parametrize("entry_instruction,exit_instruction", [
+    (OrderInstruction.BUY, OrderInstruction.SELL),
+    (OrderInstruction.SELL_SHORT, OrderInstruction.BUY_TO_COVER),
+])
+def test_auto_be_reconcile_recovers_complete_bracket_from_singleton_stop(
+        tmp_path, entry_instruction, exit_instruction):
     store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
     adapter = FakeBrokerAdapter(ALPACA_PAPER)
     adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT)
     adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, "replacement"))
     service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
-    entry_leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY,
+    entry_leg = OrderLeg("AAPL", AssetType.EQUITY, entry_instruction,
                          Decimal(1), filled_quantity=Decimal(1))
-    exit_leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL, Decimal(1))
+    exit_leg = OrderLeg("AAPL", AssetType.EQUITY, exit_instruction, Decimal(1))
     entry = BrokerOrder("entry", OrderStatus.FILLED, OrderType.MARKET,
                         TimeInForce.DAY, (entry_leg,), OrderRole.ENTRY)
     target = BrokerOrder("target", OrderStatus.WORKING, OrderType.LIMIT,

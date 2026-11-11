@@ -232,12 +232,12 @@ def verified_oco_pair(position: Position, group: OrderGroup):
     target = next((order for order in group.orders if order.role == OrderRole.TARGET), None)
     if stop is None or target is None:
         raise ValueError("OCO exit no longer has exactly one target and one stop")
-    exit_instruction = (OrderInstruction.SELL if position.side == PositionSide.LONG else
-                        OrderInstruction.BUY)
+    exit_instructions = ((OrderInstruction.SELL,) if position.side == PositionSide.LONG else
+                         (OrderInstruction.BUY, OrderInstruction.BUY_TO_COVER))
     for order in (stop, target):
         if (order.status != OrderStatus.WORKING or len(order.legs) != 1 or
                 order.legs[0].symbol != symbol or order.legs[0].asset_type != AssetType.EQUITY or
-                order.legs[0].instruction != exit_instruction or
+                order.legs[0].instruction not in exit_instructions or
                 order.legs[0].filled_quantity != 0 or
                 (order.legs[0].remaining_quantity if order.legs[0].remaining_quantity is not None
                  else order.legs[0].quantity) != quantity):
@@ -265,8 +265,8 @@ def verified_bracket_pair(position: Position, group: OrderGroup):
     entry, stop, target = entries[0], stops[0], targets[0]
     entry_instruction = ((OrderInstruction.BUY,) if position.side == PositionSide.LONG
                          else (OrderInstruction.SELL, OrderInstruction.SELL_SHORT))
-    exit_instruction = (OrderInstruction.SELL if position.side == PositionSide.LONG
-                        else OrderInstruction.BUY)
+    exit_instructions = ((OrderInstruction.SELL,) if position.side == PositionSide.LONG else
+                         (OrderInstruction.BUY, OrderInstruction.BUY_TO_COVER))
     if (entry.status != OrderStatus.FILLED or len(entry.legs) != 1 or
             entry.legs[0].symbol != position.symbol or
             entry.legs[0].asset_type != AssetType.EQUITY or
@@ -281,7 +281,7 @@ def verified_bracket_pair(position: Position, group: OrderGroup):
                 order.legs[0].asset_type != AssetType.EQUITY or
                 order.legs[0].quantity != quantity or
                 order.legs[0].filled_quantity != 0 or
-                order.legs[0].instruction != exit_instruction
+                order.legs[0].instruction not in exit_instructions
                 for order in (stop, target)) or
             stop.stop_price is None or target.limit_price is None):
         raise ValueError("Bracket entry or exits changed from the exact held position")

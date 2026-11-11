@@ -21,7 +21,8 @@ from companion.brokers.models import (
 )
 from companion.brokers.order_service import BrokerOrderService
 from companion.brokers.paper_equity import (add_plan, close_plan, entry_plan,
-                                             equity_exit_reprice, oco_plan, trailing_plan)
+                                             equity_exit_reprice, oco_plan, trailing_plan,
+                                             verified_bracket_pair, verified_oco_pair)
 from companion.brokers.paper_options import covered_call_reserved_shares
 from companion.store import Store
 from companion.trading import Trader
@@ -365,6 +366,29 @@ def test_filled_bracket_exit_reprice_requires_exact_held_position(
                                       *group.orders[1:]))
     with pytest.raises(ValueError, match="Bracket entry or exits changed"):
         equity_exit_reprice(body, position, external, quote(now), now)
+
+
+def test_short_exits_accept_alpaca_buy_to_cover_intent():
+    now = datetime.now(timezone.utc)
+    position = Position("AAPL", AssetType.EQUITY, PositionSide.SHORT,
+                        Decimal(2), Decimal(100))
+    bracket = filled_bracket_group(PositionSide.SHORT, stop=Decimal(105),
+                                   target=Decimal(90))
+    bracket = replace(bracket, orders=(bracket.orders[0], *(
+        replace(order, legs=(replace(order.legs[0],
+                                     instruction=OrderInstruction.BUY_TO_COVER),))
+        for order in bracket.orders[1:])))
+    stop, target, _ = verified_bracket_pair(position, bracket)
+    assert stop.stop_price == 105 and target.limit_price == 90
+    body = {"symbol": "AAPL", "order_id": stop.order_id,
+            "role": "stop", "price": "103", "request_id": str(uuid4())}
+    assert equity_exit_reprice(body, position, bracket, quote(now), now).stop_price == 103
+
+    oco = oco_group(PositionSide.SHORT, stop=Decimal(105), target=Decimal(90))
+    oco = replace(oco, orders=tuple(replace(order, legs=(replace(order.legs[0],
+        instruction=OrderInstruction.BUY_TO_COVER),)) for order in oco.orders))
+    stop, target = verified_oco_pair(position, oco)
+    assert stop.stop_price == 105 and target.limit_price == 90
 
 
 def test_oco_exit_reprice_tightens_stop_and_moves_target_with_exact_ids():

@@ -306,7 +306,8 @@ class BrokerOrderService:
                         order.legs[0].quantity != target.legs[0].quantity or
                         order.legs[0].instruction != target.legs[0].instruction or
                         order.legs[0].instruction not in (OrderInstruction.SELL,
-                                                          OrderInstruction.BUY) or
+                                                          OrderInstruction.BUY,
+                                                          OrderInstruction.BUY_TO_COVER) or
                         order.time_in_force not in (TimeInForce.DAY, TimeInForce.GTC) or
                         target.time_in_force != order.time_in_force or
                         target.limit_price is None or
