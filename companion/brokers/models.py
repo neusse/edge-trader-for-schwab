@@ -250,6 +250,7 @@ class BrokerOrder:
     trail_basis: str | None = None
     executions: tuple[OrderExecution, ...] = ()
     reported_filled_quantity: Decimal | None = None
+    reported_average_fill_price: Decimal | None = None
     has_fill_activity: bool = False
 
 

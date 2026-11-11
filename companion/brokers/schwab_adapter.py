@@ -225,12 +225,16 @@ def normalize_order(raw: dict) -> OrderGroup:
         if legs:
             kind = node.get("orderType") or "LIMIT"
             executions = []
+            priced_fills = []
             for activity in node.get("orderActivityCollection") or ():
                 if activity.get("executionType") != "FILL":
                     continue
                 for execution in activity.get("executionLegs") or ():
                     at = execution.get("time")
                     qty = _decimal(execution.get("quantity"))
+                    price = _decimal(execution.get("price"))
+                    if qty is not None and qty > 0 and price is not None and price > 0:
+                        priced_fills.append((qty, price))
                     if not at or qty is None:
                         continue
                     try:
@@ -259,6 +263,10 @@ def normalize_order(raw: dict) -> OrderGroup:
                 trail_basis=node.get("stopPriceLinkBasis"),
                 executions=tuple(executions),
                 reported_filled_quantity=_decimal(node.get("filledQuantity")),
+                reported_average_fill_price=(
+                    sum((qty * price for qty, price in priced_fills), Decimal(0)) /
+                    sum((qty for qty, _ in priced_fills), Decimal(0))
+                    if len(legs) == 1 and priced_fills else None),
                 has_fill_activity=any(activity.get("executionType") == "FILL"
                                       for activity in node.get("orderActivityCollection") or ()),
             ))

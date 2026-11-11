@@ -1217,8 +1217,9 @@ class Trader:
         oid = last.get("order_id")
         if oid and client is not None:
             try:
-                d = self._logged("order_details", lambda: client.order_details(self._hash, oid))
-                now_st = d.json().get("status") if d.status_code == 200 else None
+                group = self._broker_query("order_details", OrderQuery(str(oid)))
+                now_st = (group.status.value.upper().replace("-", "_")
+                          if group.group_id == str(oid) else None)
             except Exception:
                 now_st = None
             if now_st in TERMINAL:
@@ -1368,20 +1369,22 @@ class Trader:
                     "error": f"Schwab refused the close: {result.message}. "
                              "Your stop/target should still be working: check thinkorswim."}
         oid = int(result.order_id) if result.order_id else None
-        final: dict = {}
+        final = None
         if oid:
             for _ in range(10):   # a market order usually fills well within a second
                 time.sleep(0.3)
-                d = self._logged("order_details", lambda: client.order_details(self._hash, oid))
-                if d.status_code == 200:
-                    final = d.json()
-                    if final.get("status") in TERMINAL:
-                        break
-        filled = float(final.get("filledQuantity") or 0)
-        legs = [e for a in final.get("orderActivityCollection") or [] if a.get("executionType") == "FILL"
-                for e in a.get("executionLegs") or []]
-        avg = (sum(e["price"] * e["quantity"] for e in legs) / sum(e["quantity"] for e in legs)) if legs else None
-        status = final.get("status") or ("UNKNOWN" if oid is None else "SENT")
+                try:
+                    group = self._broker_query("order_details", OrderQuery(str(oid)))
+                except Exception:
+                    continue
+                final = next((order for order in group.orders if order.parent_id is None and
+                              order.order_id == str(oid)), None)
+                if final and final.status_detail in TERMINAL:
+                    break
+        filled = float(final.reported_filled_quantity) if final and final.reported_filled_quantity is not None else 0
+        avg = float(final.reported_average_fill_price) if final and final.reported_average_fill_price is not None else None
+        status = (final.status_detail or final.status.value.upper().replace("-", "_")) if final else (
+            "UNKNOWN" if oid is None else "SENT")
         self.store.log_action("close", symbol, oid, status,
                               f"{instr} {filled:g}/{size:g}" + (f" @ {avg:.4f}" if avg else ""))
         # Verify afterwards: anything still working for the symbol (Schwab should have cancelled

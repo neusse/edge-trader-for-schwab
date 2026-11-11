@@ -452,7 +452,7 @@ class Broker(FakeClient):
             self.qty = self.after_qty
         self._next_fill += 1
         oid = self._next_fill
-        self.orders[oid] = {"orderId": oid, "status": "FILLED", "filledQuantity": n,
+        self.orders[oid] = {**order, "orderId": oid, "status": "FILLED", "filledQuantity": n,
                             "orderActivityCollection": [{"executionType": "FILL", "executionLegs": [
                                 {"quantity": n, "price": price}]}]}
         return Resp(201, {"Location": f".../orders/{oid}"})
