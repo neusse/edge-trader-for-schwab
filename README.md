@@ -40,6 +40,9 @@ Those quotes can be delayed or absent. A level-2-or-higher Paper account can sel
 call or put and send a reviewed buy-to-open limit order during regular hours. It has no attached
 stop or target; the full premium can be lost. The app refuses an existing position or active order
 in that contract, and an unknown submit outcome blocks further order actions until reconciled.
+A held Paper option position with no active order can be closed in whole or in part using a
+confirmed limit order. The app rechecks the position before sending; any remaining contracts
+receive no new broker-held exit from that close.
 A lost submit or cancel response also blocks new order actions until the broker confirms its outcome. Other Alpaca order workflows are still being
 connected. Select Schwab in the app for the existing Schwab trading workflows. Switching disarms
 entries and loads a fresh broker runtime before order controls can be used again.
@@ -85,7 +88,7 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, OCO exits with target and tighter fixed-stop adjustments, a standalone trailing stop, a full or partial market close or add shares for an order-free whole-share equity position, and a reviewed long call/put limit entry. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, OCO exits with target and tighter fixed-stop adjustments, a standalone trailing stop, a full or partial market close or add shares for an order-free whole-share equity position, a reviewed long call/put limit entry, and a full or partial held-option limit close. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.

@@ -36,7 +36,8 @@ from .brokers.models import (AccountQuery, AssetType, CancelOrder,
 from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_reprice,
                                    oco_plan, trailing_plan)
 from .brokers.paper_options import (chain_query, chain_response, expirations_query,
-                                    expirations_response, long_entry_plan)
+                                    expirations_response, long_entry_plan,
+                                    option_close_plan)
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -79,12 +80,12 @@ APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
     "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
                      "equity-oco-adjust", "equity-add", "equity-trailing",
-                     "option-long-entry"),
+                     "option-long-entry", "option-close"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put with a reviewed limit order; no option exit is attached. Other option and spread workflows are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put with a reviewed limit order, and an order-free held option can be closed with a reviewed limit order. Other option and spread workflows are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -444,6 +445,93 @@ def _send_paper_option_long(body: dict, request_id: str):
             if any(symbol == leg.symbol.replace(" ", "") for group in groups
                    for order in group.orders if order.status in active for leg in order.legs):
                 raise ValueError("another order appeared for this option; no order was sent")
+        return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
+
+
+def _paper_option_close(body: dict):
+    service, _ = _paper_service()
+    symbol = body.get("contract") if isinstance(body, dict) else None
+    if not isinstance(symbol, str) or not symbol:
+        raise ValueError("an OCC option contract is required")
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref or account.status.upper() != "ACTIVE":
+        raise ValueError("Alpaca Paper account changed or is inactive")
+    positions = [position for position in account.positions
+                 if position.symbol.replace(" ", "") == symbol]
+    if len(positions) != 1:
+        raise ValueError("exactly one held option position is required")
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=active))
+    if any(symbol == leg.symbol.replace(" ", "") for group in groups
+           for order in group.orders if order.status in active for leg in order.legs):
+        raise ValueError("an active order touches this option; resolve it before closing")
+    intent = option_close_plan(body, positions[0])
+    quote = service.adapter.query(QuotesQuery((symbol,), AssetType.OPTION)).get(symbol)
+    return service, intent, positions[0], quote
+
+
+@app.post("/api/paper/options/close/preview")
+async def paper_option_close_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, position, quote = await run_in_threadpool(_paper_option_close,
+                                                              await request.json())
+        return {"ok": True, "contract": intent.leg.symbol,
+                "side": intent.leg.instruction.value,
+                "held": str(position.quantity), "closing": str(intent.leg.quantity),
+                "remaining": str(position.quantity - intent.leg.quantity),
+                "limit_price": str(intent.limit_price),
+                "indicative_bid": str(quote.bid) if quote and quote.bid is not None else None,
+                "indicative_ask": str(quote.ask) if quote and quote.ask is not None else None,
+                "protection": "Limit fill is not guaranteed; any remaining contracts have no new exit attached"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option close preview failed; no order was sent"}
+
+
+@app.post("/api/paper/options/close/submit")
+async def paper_option_close_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_option_close, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option close preflight failed; no order was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_option_close(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, intent, position, _ = _paper_option_close(body)
+        symbol = intent.leg.symbol
+        def preflight(account):
+            positions = [held for held in account.positions
+                         if held.symbol.replace(" ", "") == symbol]
+            if (account.status.upper() != "ACTIVE" or len(positions) != 1 or
+                    positions[0].asset_type != AssetType.OPTION or
+                    positions[0].side != position.side or
+                    positions[0].quantity != position.quantity):
+                raise ValueError("option position changed; no close was sent")
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                       statuses=active))
+            if any(symbol == leg.symbol.replace(" ", "") for group in groups
+                   for order in group.orders if order.status in active for leg in order.legs):
+                raise ValueError("another option order appeared; no close was sent")
         return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 

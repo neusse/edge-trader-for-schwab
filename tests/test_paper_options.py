@@ -9,10 +9,11 @@ from companion.brokers.models import (AccountQuery, AccountSnapshot, AssetType,
                                       BalanceSnapshot, MutationResult, MutationStatus,
                                       OptionChain, OptionChainQuery, OptionContract,
                                       OptionGreeks, OptionType, OrderInstruction,
-                                      OrdersQuery, Position, PositionSide, Quote)
+                                      OrdersQuery, Position, PositionSide, Quote,
+                                      QuotesQuery)
 from companion.brokers.paper_options import chain_query, chain_response
 from companion.brokers.paper_options import (expirations_query, expirations_response,
-                                             long_entry_plan)
+                                             long_entry_plan, option_close_plan)
 
 
 NOW = datetime(2026, 11, 11, 17, 0, tzinfo=timezone.utc)
@@ -105,6 +106,24 @@ def test_long_option_entry_refuses_level_position_and_bad_premium():
         long_entry_plan({**body, "quantity": "1.5"}, _account(), _chain(), NOW)
 
 
+def _held_option(side=PositionSide.LONG):
+    return Position("AAPL261113C00225000", AssetType.OPTION, side, D("3"), D("1.10"))
+
+
+def test_option_close_plan_maps_long_short_and_partial_without_overclosing():
+    body = {"contract": "AAPL261113C00225000", "quantity": "2",
+            "limit_price": "1.40", "request_id": _entry_body()["request_id"]}
+    long = option_close_plan(body, _held_option(), NOW)
+    short = option_close_plan(body, _held_option(PositionSide.SHORT), NOW)
+    assert long.leg.instruction == OrderInstruction.SELL_TO_CLOSE
+    assert short.leg.instruction == OrderInstruction.BUY_TO_CLOSE
+    assert long.leg.quantity == 2 and long.limit_price == D("1.40")
+    with pytest.raises(ValueError, match="held contracts"):
+        option_close_plan({**body, "quantity": "4"}, _held_option(), NOW)
+    with pytest.raises(ValueError, match="cent precision"):
+        option_close_plan({**body, "limit_price": "1.405"}, _held_option(), NOW)
+
+
 def test_option_discovery_route_uses_active_paper_adapter_without_mutation(monkeypatch):
     import companion.app as appmod
 
@@ -165,3 +184,37 @@ def test_long_option_preview_and_submit_are_account_bound_and_one_shot(monkeypat
     submit = client.post("/api/paper/options/long/submit", json=_entry_body(), headers=headers)
     assert submit.json()["ok"] and submit.json()["order_id"] == "paper-option-order"
     assert len(commands) == 1 and commands[0][0].intent.leg.instruction == OrderInstruction.BUY_TO_OPEN
+
+
+def test_option_close_route_previews_and_rechecks_held_quantity(monkeypatch):
+    import companion.app as appmod
+
+    held = _held_option()
+    account = _account(positions=(held,))
+    commands = []
+    def query(value):
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return ()
+        if isinstance(value, QuotesQuery): return {held.symbol: _chain().contracts[0].quote}
+        raise AssertionError(type(value))
+    def execute(command, request_id, preflight):
+        preflight(account)
+        commands.append(command)
+        return MutationResult(MutationStatus.ACCEPTED, "paper-option-close")
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query),
+                              account_ref="paper-account", execute=execute)
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    monkeypatch.setattr("companion.brokers.paper_options.datetime", SimpleNamespace(
+        now=lambda _tz: NOW))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    body = {"contract": held.symbol, "quantity": "2", "limit_price": "1.40",
+            "request_id": _entry_body()["request_id"]}
+    headers = {"X-Companion": "1"}
+    preview = client.post("/api/paper/options/close/preview", json=body, headers=headers)
+    assert preview.json()["ok"] and preview.json()["remaining"] == "1"
+    result = client.post("/api/paper/options/close/submit", json=body, headers=headers)
+    assert result.json()["ok"] and len(commands) == 1
+    assert commands[0].intent.leg.instruction == OrderInstruction.SELL_TO_CLOSE
+    refused = client.post("/api/paper/options/close/preview",
+                          json={**body, "quantity": "4"}, headers=headers)
+    assert not refused.json()["ok"]
