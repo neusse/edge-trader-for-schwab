@@ -37,7 +37,7 @@ On 2026-11-10 the configured Paper endpoint authenticated successfully and repor
 - [x] README distinguishes broker-held equity brackets/OCO exits from app-watched vertical stops and labels unprotected orders.
 - [x] README identifies local storage and broker/data outbound calls.
 - [x] Demo broker selector, Paper overview, and Paper entry screenshots exist under `docs/`; they use invented data.
-- [ ] Capture updated invented-data screenshots for the final Paper workflows; do not publish a real account screenshot.
+- [x] Capture updated invented-data screenshots for the Paper overview, equity entry, option discovery, vertical controls, Auto B/E, and app-watched spread stops. `scripts/capture_paper_demo.js` intercepts the state and option discovery responses; the resulting files are `docs/screenshot-alpaca-paper-demo.png`, `docs/screenshot-paper-entry-demo.png`, and `docs/screenshot-paper-options-demo.png`. Visually checked on 2026-11-10; no real account data was used.
 - [ ] Complete every applicable controlled Paper scenario above and attach redacted evidence to #12.
 - [ ] Re-run the automated gate on the final commit and record the results in #12.
 - [ ] Confirm Schwab is selectable and its regression suite passes.
