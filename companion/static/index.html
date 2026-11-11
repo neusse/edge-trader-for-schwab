@@ -318,6 +318,11 @@
   #paper-entry label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
   #paper-entry .in { width: 115px; }
   #paper-entry .paper-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  #paper-options { display: none; margin: 0 18px 18px; padding: 20px; }
+  #paper-options .paper-fields { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  #paper-options label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  #paper-options .in { width: 135px; }
+  #paper-options .alpaca-list { margin-top: 14px; }
   #alpaca-overview h2 { margin: 0 0 12px; font-size: 18px; }
   .alpaca-metrics { display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 20px; }
   .alpaca-metrics strong { display: block; font-size: 20px; }
@@ -377,6 +382,18 @@
       <button type="button" class="btn" id="paper-reconcile" style="display:none">Reconcile unknown outcome</button></div>
   </form>
   <p id="paper-msg" class="mut" role="status">Paper entries are disarmed.</p>
+</section>
+<section class="panel" id="paper-options" aria-label="Alpaca Paper option discovery">
+  <h2>Paper option discovery</h2>
+  <p class="mut">Browse one expiration and type at a time. Alpaca option quotes and Greeks are indicative, may be delayed or absent, and are for discovery only. No option order is sent from this view.</p>
+  <form id="paper-options-form" class="paper-fields">
+    <label>Underlying<input class="in" name="underlying" required maxlength="6" placeholder="AAPL" autocomplete="off"></label>
+    <label>Expiration<input class="in" name="expiration" required type="date"></label>
+    <label>Type<select class="in" name="option_type"><option value="call">Calls</option><option value="put">Puts</option></select></label>
+    <button class="btn" type="submit" id="paper-options-load">Load contracts</button>
+  </form>
+  <p id="paper-options-msg" class="mut" role="status">Choose an underlying and expiration.</p>
+  <div id="paper-options-chain" class="alpaca-list"></div>
 </section>
 <div class="stats">
   <div class="stat"><div class="k" id="k-real-l">Realized today · net</div><div class="v" id="k-real">-</div><div class="s" id="k-real-s"></div></div>
@@ -1242,6 +1259,7 @@ function renderUpdate(st) {
 function renderAlpacaOverview(st) {
   const panel = $("alpaca-overview");
   $("paper-entry").style.display = st.broker?.key === "alpaca-paper" ? "block" : "none";
+  $("paper-options").style.display = st.broker?.key === "alpaca-paper" ? "block" : "none";
   if (st.broker?.key !== "alpaca-paper") { panel.style.display = "none"; return; }
   panel.style.display = "block";
   const a = st.alpaca;
@@ -1300,6 +1318,8 @@ function render(st) {
     $("t-sym").value = "";
     T.plan = null; T.ticketId = null; T.intentKey = null; T.sentKey = null; T.armed = false;
     paperArmed = false; paperOutcome = null; paperRequestId = null; paperCommand = "SubmitOrder";
+    $("paper-options-chain").innerHTML = "";
+    $("paper-options-msg").textContent = "Choose an underlying and expiration.";
     TV.pos = null; TV.closed = null; TV.flat = {}; TV.said = {};
     if ("speechSynthesis" in window) speechSynthesis.cancel();
   }
@@ -1439,6 +1459,30 @@ const post = (url, body, ms = 25000) => {
     body: JSON.stringify(body || {}), signal: ctl.signal})
     .then(r => r.json()).finally(() => clearTimeout(timer));
 };
+$("paper-options-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready) {
+    $("paper-options-msg").textContent = "Alpaca Paper account data must be ready before discovery.";
+    return;
+  }
+  const form = new FormData(e.currentTarget);
+  const body = {underlying: String(form.get("underlying") || "").trim().toUpperCase(),
+    expiration: form.get("expiration"), option_type: form.get("option_type")};
+  $("paper-options-load").disabled = true;
+  $("paper-options-msg").textContent = "Loading indicative option contracts…";
+  $("paper-options-chain").innerHTML = "";
+  try {
+    const result = await post("/api/paper/options/chain", body, 45000);
+    if (!result.ok) throw new Error(result.error || result.detail || "Option discovery failed");
+    const rows = result.contracts || [];
+    $("paper-options-msg").textContent = `${rows.length} ${result.option_type} contracts for ${result.underlying} ${result.expiration}. Indicative Alpaca data; no order control.`;
+    $("paper-options-chain").innerHTML = rows.length ? `<table><thead><tr><th>OCC symbol</th><th>Strike</th><th>Bid</th><th>Ask</th><th>Mark</th><th>Δ</th><th>Γ</th><th>Θ</th><th>Vega</th><th>Rho</th><th>IV (decimal)</th><th>Open interest</th><th>Quote time</th></tr></thead><tbody>${rows.map(c =>
+      `<tr><td>${esc(c.symbol)}${c.tradable ? "" : " <small>(not tradable)</small>"}</td><td>${esc(c.strike)}</td><td>${esc(c.bid ?? "—")}</td><td>${esc(c.ask ?? "—")}</td><td>${esc(c.mark ?? "—")}</td><td>${esc(c.delta ?? "—")}</td><td>${esc(c.gamma ?? "—")}</td><td>${esc(c.theta ?? "—")}</td><td>${esc(c.vega ?? "—")}</td><td>${esc(c.rho ?? "—")}</td><td>${esc(c.implied_volatility ?? "—")}</td><td>${esc(c.open_interest ?? "—")}</td><td>${c.quote_at ? esc(new Date(c.quote_at).toLocaleTimeString()) : "—"}</td></tr>`).join("")}</tbody></table>` :
+      `<p class="mut">No contracts returned for this expiration and type.</p>`;
+  } catch (err) {
+    $("paper-options-msg").textContent = String(err.message || err);
+  } finally { $("paper-options-load").disabled = false; }
+});
 let paperArmed = false, paperRequestId = null, paperIntentKey = null, paperOutcome = null, paperBusy = false;
 let paperCommand = "SubmitOrder";
 const paperForm = $("paper-form");
