@@ -98,7 +98,13 @@ entries and loads a fresh broker runtime before order controls can be used again
 The strip below the header explains which workflows the selected broker can currently use; Demo
 shows invented data with order controls disabled.
 
+These Paper screenshots use invented account data and intercepted browser responses.
+
+![Alpaca Paper overview with invented Auto B/E and app-watched spread stops](docs/screenshot-alpaca-paper-demo.png)
+
 ![Alpaca Paper equity bracket form with invented demo state](docs/screenshot-paper-entry-demo.png)
+
+![Alpaca Paper option discovery and vertical controls with invented contracts](docs/screenshot-paper-options-demo.png)
 
 - **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks to the selected broker.
 - **Every order is your click.** No signals, no auto-trading. Two exceptions, both opt-in per trade: pick "Auto B/E 1R" on the ticket and the app moves that trade's stop to break-even once, when price reaches +1R; tick "Send when hit" on a spread's stop and the app sends that spread's close once, when the stop is reached.
