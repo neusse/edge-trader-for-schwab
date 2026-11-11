@@ -33,7 +33,8 @@ from .brokers.models import (AccountQuery, AssetType, CancelOrder,
                              OrderClass, OrderInstruction, OrderQuery, OrderRole,
                              OrderStatus, OrderType, OrdersQuery, QuotesQuery, ReplaceOrder,
                              SubmitOrder)
-from .brokers.paper_equity import add_plan, close_plan, entry_plan, oco_exit_reprice, oco_plan
+from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_reprice,
+                                   oco_plan, trailing_plan)
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -75,12 +76,12 @@ BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
     "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
-                     "equity-oco-adjust", "equity-add"),
+                     "equity-oco-adjust", "equity-add", "equity-trailing"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, OCO exits with fixed stop and target adjustments, and market close, partial close, or add shares for an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
+    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, OCO exits with fixed stop and target adjustments, and market close, partial close, add shares, or a standalone trailing stop for an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -458,6 +459,76 @@ def _paper_close(body: dict):
 def _paper_add(body: dict):
     service, position, quote = _paper_order_free_position(body)
     return service, add_plan(body, position, quote), quote, position.quantity
+
+
+def _paper_trailing(body: dict):
+    service, position, quote = _paper_order_free_position(body)
+    return service, trailing_plan(body, position, quote), quote, position.quantity
+
+
+@app.post("/api/paper/position/trailing/preview")
+async def paper_trailing_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, quote, held = await run_in_threadpool(_paper_trailing, await request.json())
+        mark = quote.mark or quote.last
+        distance = intent.trail_price or (mark * intent.trail_percent / 100)
+        initial = (mark - distance if intent.leg.instruction == OrderInstruction.SELL
+                   else mark + distance)
+        return {"ok": True, "symbol": intent.leg.symbol,
+                "side": intent.leg.instruction.value, "quantity": str(held),
+                "unit": "dollar" if intent.trail_price is not None else "percent",
+                "distance": str(intent.trail_price or intent.trail_percent),
+                "indicative_initial_stop": str(initial),
+                "quote": str(mark), "quote_source": quote.source,
+                "protection": "Broker-held standalone trailing stop after Alpaca accepts it; no target is paired"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper position, order, or quote verification failed; no order was sent"}
+
+
+@app.post("/api/paper/position/trailing/submit")
+async def paper_trailing_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_trailing, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper trailing-stop preflight failed; no order was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_trailing(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, intent, _, held = _paper_trailing(body)
+        symbol, instruction = intent.leg.symbol, intent.leg.instruction
+        def preflight(account):
+            positions = [position for position in account.positions if position.symbol == symbol]
+            if (account.status.upper() != "ACTIVE" or len(positions) != 1 or
+                    positions[0].asset_type != AssetType.EQUITY or
+                    positions[0].quantity != held or
+                    (positions[0].side.value == "long") !=
+                    (instruction == OrderInstruction.SELL)):
+                raise ValueError("position changed before trailing stop submission; no order was sent")
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                       statuses=active))
+            if any(symbol == leg.symbol for group in groups for order in group.orders
+                   if order.status in active for leg in order.legs):
+                raise ValueError("another order appeared for this symbol; no trail was sent")
+        return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 
 @app.post("/api/paper/position/add/preview")

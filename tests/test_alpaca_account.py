@@ -143,6 +143,30 @@ def test_oco_root_without_group_role_is_still_a_target():
     assert [order.role for order in group.orders] == [OrderRole.TARGET, OrderRole.STOP]
 
 
+def test_owned_paper_trailing_stop_counts_as_broker_held_coverage():
+    from alpaca.trading.models import Order
+    from companion.brokers.alpaca_paper import _order_group
+    from companion.brokers.canonical_view import _pending
+    from companion.orders import stop_coverage
+    from companion.brokers.models import OrderRole
+
+    def raw(client_id):
+        return Order.model_construct(
+            id="trail-order", group_id=None, order_class="simple", group_role=None,
+            status="new", type="trailing_stop", time_in_force="gtc", legs=[],
+            symbol="AAPL", asset_class="us_equity", qty="2", filled_qty="0",
+            side="sell", position_intent=None, limit_price=None, stop_price=None,
+            trail_price="2", trail_percent=None, submitted_at=None, updated_at=None,
+            client_order_id=client_id)
+
+    group = _order_group(raw("et-trail-client"))
+    assert group.orders[0].role == OrderRole.STOP
+    covered, _ = stop_coverage(_pending((group,)), "AAPL", "LONG", 2)
+    assert covered == 2
+    external = _order_group(raw("outside-entry"))
+    assert external.orders[0].role == OrderRole.ENTRY
+
+
 def test_order_history_pages_with_boundary_overlap_and_uuid_deduplication():
     from datetime import datetime, timedelta, timezone
     from alpaca.trading.models import Order
@@ -297,7 +321,7 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
     paper = broker_info("alpaca-paper")
     assert "option-trading" in paper["capabilities"]
     assert paper["workflows"] == ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
-                                  "equity-oco-adjust", "equity-add")
+                                  "equity-oco-adjust", "equity-add", "equity-trailing")
     assert "option-bracket" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")

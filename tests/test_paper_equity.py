@@ -19,7 +19,8 @@ from companion.brokers.models import (
     SubmitOrder,
 )
 from companion.brokers.order_service import BrokerOrderService
-from companion.brokers.paper_equity import add_plan, close_plan, entry_plan, oco_exit_reprice, oco_plan
+from companion.brokers.paper_equity import (add_plan, close_plan, entry_plan,
+                                             oco_exit_reprice, oco_plan, trailing_plan)
 from companion.store import Store
 from companion.trading import Trader
 
@@ -111,6 +112,69 @@ def test_add_plan_handles_long_and_short_and_refuses_stale_or_fractional():
         add_plan(body, position, quote(now - timedelta(seconds=31)), now)
     with pytest.raises(ValueError, match="whole shares"):
         add_plan({**body, "shares": "1.5"}, position, quote(now), now)
+
+
+def test_trailing_plan_uses_one_broker_held_exit_with_no_target():
+    now = datetime.now(timezone.utc)
+    body = {"symbol": "AAPL", "unit": "dollar", "distance": "2",
+            "request_id": str(uuid4())}
+    for side, instruction in ((PositionSide.LONG, OrderInstruction.SELL),
+                              (PositionSide.SHORT, OrderInstruction.BUY_TO_COVER)):
+        position = Position("AAPL", AssetType.EQUITY, side, Decimal(2), Decimal(100))
+        trail = trailing_plan(body, position, quote(now), now)
+        assert trail.leg.instruction == instruction and trail.leg.quantity == 2
+        assert trail.trail_price == 2 and trail.trail_percent is None
+        assert trail.client_order_id.startswith("et-trail-")
+        pct = trailing_plan({**body, "unit": "percent", "distance": "1.5"},
+                            position, quote(now), now)
+        assert pct.trail_percent == Decimal("1.5") and pct.trail_price is None
+    with pytest.raises(ValueError, match="valid stop"):
+        trailing_plan({**body, "distance": "100"},
+                      Position("AAPL", AssetType.EQUITY, PositionSide.LONG,
+                               Decimal(2), Decimal(100)), quote(now), now)
+    with pytest.raises(ValueError, match="stale"):
+        trailing_plan(body, position, quote(now - timedelta(seconds=31)), now)
+
+
+def test_paper_trailing_route_requires_order_free_position_and_rechecks(monkeypatch, tmp_path):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    held = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, Decimal(2), Decimal(100))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (held,))
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, account, account, account)
+    adapter.given_query(OrdersQuery, (), (), ())
+    adapter.given_query(QuotesQuery, {"AAPL": quote(now)}, {"AAPL": quote(now)})
+    et_day = now.astimezone(timezone(timedelta(hours=-5))).date()
+    adapter.given_query(MarketSessionsQuery, (MarketSession(
+        et_day, now - timedelta(hours=1), now + timedelta(hours=1), True),))
+    adapter.given_command(SubmitOrder, MutationResult(MutationStatus.ACCEPTED, "trail-order"))
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
+    poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
+                     "updated_at": now.isoformat(), "positions": [], "orders": []}}
+    class Selection:
+        def get(self): return "alpaca-paper"
+    monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
+    monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "BrokerSelection", Selection)
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    body = {"symbol": "AAPL", "unit": "dollar", "distance": "2", "request_id": str(uuid4())}
+    try:
+        preview = client.post("/api/paper/position/trailing/preview", json=body, headers=headers).json()
+        assert preview["ok"] and preview["indicative_initial_stop"] == "98"
+        assert "no target" in preview["protection"]
+        poller.order_service.arm(True)
+        sent = client.post("/api/paper/position/trailing/submit", json=body, headers=headers).json()
+        assert sent["status"] == "accepted" and sent["order_id"] == "trail-order"
+        assert len(adapter.commands) == 1
+        assert adapter.commands[0].intent.trail_price == 2
+    finally:
+        store.close()
+        poller.store.close()
 
 
 def test_paper_add_route_previews_and_sends_once_for_short_position(monkeypatch, tmp_path):
