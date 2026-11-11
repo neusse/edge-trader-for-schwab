@@ -1,7 +1,6 @@
 # Edge Trader for Schwab
 
-[![CI](https://github.com/simonro/edge-trader-for-schwab/actions/workflows/ci.yml/badge.svg)](https://github.com/simonro/edge-trader-for-schwab/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/simonro/edge-trader-for-schwab)](https://github.com/simonro/edge-trader-for-schwab/releases/latest)
+[![CI](https://github.com/neusse/edge-trader-for-schwab/actions/workflows/ci.yml/badge.svg)](https://github.com/neusse/edge-trader-for-schwab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Watch the walkthrough on YouTube](https://img.shields.io/badge/YouTube-Watch_the_walkthrough-FF0000?logo=youtube&logoColor=white)](https://youtu.be/41VQNmCN2r4)
 
@@ -62,7 +61,7 @@ These Paper screenshots use invented account data and intercepted browser respon
 - **Honest numbers.** P&L comes from your own fills, and anything incomplete is labeled as such, never shown as complete.
 - **Free and MIT licensed.** No paid tier.
 
-**[Quick start](#quick-start)** · **[Your Schwab app](#your-schwab-app)** · **[Releases](https://github.com/simonro/edge-trader-for-schwab/releases)** · **[Privacy](#privacy-and-your-data)**
+**[Quick start](#quick-start)** · **[Your Schwab app](#your-schwab-app)** · **[Releases](https://github.com/neusse/edge-trader-for-schwab/releases)** · **[Privacy](#privacy-and-your-data)**
 
 **What this is not:** not financial advice, not a signal service, not affiliated with or endorsed by
 Charles Schwab. Every screenshot below is invented demo data, not anyone's real account.
@@ -72,6 +71,28 @@ Charles Schwab. Every screenshot below is invented demo data, not anyone's real 
 [![Watch on YouTube: This Free Tool Is a Game Changer for thinkorswim Day Traders](docs/video-thumbnail.jpg)](https://youtu.be/41VQNmCN2r4)
 
 **[Watch the walkthrough first](https://youtu.be/41VQNmCN2r4)** on the Tape to Edge YouTube channel: a full tour on a live account, from sizing the shares from your risk and sending the bracket to partials that rebuild your stop and target, then the setup and the limits.
+
+## Quick start
+
+On Windows, install Python 3.11 or newer, then run `setup.bat` from this repository. It creates
+`.venv`, installs the packages, and copies `.env.example` to `.env` if that file does not exist.
+Enter your **Alpaca Paper** key and secret as `alpaca_paper_api_key` and `alpaca_paper_secret` in
+`.env`, or provide them in the process environment. Keep `.env` private. Live Alpaca credentials
+and endpoints are not accepted.
+
+Run `launch.bat` and open [http://127.0.0.1:8770](http://127.0.0.1:8770). Alpaca Paper is the
+default; the broker selector also offers Schwab and Demo. Review the selected account, positions,
+and working orders before arming equity orders. `stop.bat` stops the local server; broker-held orders
+remain with the broker. Demo uses invented data and cannot send orders.
+
+## Your Schwab app
+
+To select Schwab, use your Schwab developer app's key and secret in `SCHWAB_APP_KEY` and
+`SCHWAB_APP_SECRET`. Set `SCHWAB_CALLBACK_URL` to the exact callback URL registered for that app;
+the default is `https://127.0.0.1`. Run `login.bat` to complete Schwab's browser sign-in, then
+select Schwab in Edge Trader. The token file defaults to `~/.schwabdev/tokens.db`; use
+`SCHWAB_TOKENS_DB` to choose another location or `SCHWAB_ENV_FILE` to read keys from an existing
+local `.env`. Schwab trading in this app is equities only.
 
 ## Built on Schwabdev
 
@@ -191,6 +212,17 @@ risk before you send.
   screen while showing only today's trades. It only changes what is displayed; orders work as usual.
   `--demo` runs on invented data with no Schwab connection, and refuses every order (the ticket plans on
   invented quotes, so you can try the equity ticket).
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Alpaca Paper stays connecting or reports an authentication error | Check `alpaca_paper_api_key` and `alpaca_paper_secret` in your local `.env` or process environment, then restart the app. Use Paper credentials; live Alpaca credentials and endpoints are refused. Do not paste keys into an issue. |
+| A Paper equity review button is disabled | Select Alpaca Paper, wait for fresh account and order data and regular market hours, arm Paper orders, and check that the symbol has no held position or active order. The entry form accepts whole shares and one target/stop bracket or an explicitly unprotected simple entry. |
+| A Paper equity quote is stale or missing | Paper stock quotes use IEX. Wait for a fresh regular-hours quote and refresh the app; an order cannot be sent from stale or incomplete data. Check the symbol and market clock before trying again. |
+| A submit, cancel, or replacement says its outcome is unknown | Check the order directly in Alpaca Paper before using the app's reconcile control. Do not send another order or reuse the request while its outcome is uncertain; the app does not retry automatically. |
+| Broker selection changes or order controls remain disarmed | Check the active broker and account shown in the app. Switching brokers disarms orders; arm only after reviewing the new account, positions, and working orders. If the app requests a restart, restart before ordering. |
+| An existing option position or order appears | It is read-only here. Option and spread trading are disabled for both brokers; manage existing option orders directly with the broker. |
 
 ## Contributing
 
