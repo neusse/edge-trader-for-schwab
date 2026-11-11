@@ -1679,7 +1679,9 @@ def test_quote_reads_the_option_fields(tmp_path):
             return JsonResp(200, {
                 OPT: {"assetMainType": "OPTION", "realtime": True,
                       "quote": {"bidPrice": 0.55, "askPrice": 0.6, "lastPrice": 0.57, "mark": 0.575},
-                      "reference": {"underlying": "AAPL", "isPennyPilot": True, "multiplier": 100.0}},
+                      "reference": {"underlying": "AAPL", "isPennyPilot": True, "multiplier": 100.0,
+                                    "deliverables": "100 AAPL", "expirationYear": 2026,
+                                    "expirationMonth": 11, "expirationDay": 20, "strikePrice": 232.5}},
                 "XYZ   261120P00050000": {"assetMainType": "OPTION", "quote": {"bidPrice": 3.1, "askPrice": 3.3},
                                          "reference": {"underlying": "XYZ", "isPennyPilot": False}},
                 "SPY   261120C00600000": {"assetMainType": "OPTION", "quote": {"bidPrice": 4.0, "askPrice": 4.02},
@@ -1688,6 +1690,7 @@ def test_quote_reads_the_option_fields(tmp_path):
     t._client, t._hash = Q(), "H" * 64
     q = t.quote(OPT)
     assert q["mark"] == 0.575 and q["multiplier"] == 100.0 and q["underlying"] == "AAPL" and q["ticks"] == OPT_PENNY
+    assert q["deliverables"] == "100 AAPL" and q["expiration"] == "2026-11-20" and q["strike"] == 232.5
     assert t.quote("XYZ   261120P00050000")["ticks"] == OPT_NICKEL
     assert t.quote("SPY   261120C00600000")["ticks"] == OPT_PENNY_ALL     # underlying from the OCC root
     assert t.quote("MXR")["ticks"] == EQUITY

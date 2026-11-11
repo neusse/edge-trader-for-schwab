@@ -321,6 +321,14 @@ def normalize_quotes(raw: dict, symbols: tuple[str, ...],
         last_observed = (datetime.fromtimestamp(trade_at / 1000, timezone.utc)
                          if isinstance(trade_at, (int, float)) else None)
         penny = (item.get("reference") or {}).get("isPennyPilot")
+        reference = item.get("reference") or {}
+        asset = _ASSET.get(item.get("assetMainType"), asset_type)
+        expiration = None
+        try:
+            expiration = date(reference["expirationYear"], reference["expirationMonth"],
+                              reference["expirationDay"])
+        except (KeyError, TypeError, ValueError):
+            pass
         greeks = OptionGreeks(
             delta=_decimal(quote.get("delta")), gamma=_decimal(quote.get("gamma")),
             theta=_decimal(quote.get("theta")), vega=_decimal(quote.get("vega")),
@@ -333,6 +341,11 @@ def normalize_quotes(raw: dict, symbols: tuple[str, ...],
             timestamp_verified=isinstance(at, (int, float)),
             last_observed_at=last_observed,
             penny_pilot=penny if isinstance(penny, bool) else None,
+            asset_type=asset, underlying=reference.get("underlying"),
+            multiplier=_decimal(reference.get("multiplier")),
+            description=reference.get("description"), exchange=reference.get("exchangeName"),
+            deliverables=reference.get("deliverables"), expiration=expiration,
+            strike=_decimal(reference.get("strikePrice")),
         )
     return out
 

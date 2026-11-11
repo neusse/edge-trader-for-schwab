@@ -303,6 +303,14 @@ class Quote:
     timestamp_verified: bool = False
     last_observed_at: datetime | None = None
     penny_pilot: bool | None = None
+    asset_type: AssetType | None = None
+    underlying: str | None = None
+    multiplier: Decimal | None = None
+    description: str | None = None
+    exchange: str | None = None
+    deliverables: object | None = None
+    expiration: date | None = None
+    strike: Decimal | None = None
 
 
 @dataclass(frozen=True)

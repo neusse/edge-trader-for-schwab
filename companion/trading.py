@@ -27,7 +27,7 @@ from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_intent, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .brokers.models import (
     AssetType, CancelOrder, MutationResult, MutationStatus, OcoOrderIntent, OrderInstruction,
-    OrderLegIntent, OrderQuery, OrderRole, OrderType, PreviewOrderQuery, ReplaceOrder, SimpleOrderIntent,
+    OrderLegIntent, OrderQuery, OrderRole, OrderType, PreviewOrderQuery, QuotesQuery, ReplaceOrder, SimpleOrderIntent,
     StopLossIntent, SubmitOrder, TimeInForce,
     TrailingOrderIntent, TrailingStopSpec,
 )
@@ -548,24 +548,25 @@ class Trader:
         hit = self._quote_cache.get(sym)
         if hit and time.monotonic() - hit[0] < max_age:
             return hit[1]
-        r = self._logged("ticket_quote", lambda: self._ensure().quotes([sym]))
-        r.raise_for_status()
-        entry = (r.json() or {}).get(sym) or {}
-        q, ref = entry.get("quote") or {}, entry.get("reference") or {}
-        asset = entry.get("assetMainType")
-        underlying = ref.get("underlying") or (_occ_root(sym) if asset == "OPTION" else None)
-        penny = ref.get("isPennyPilot")
-        out = {"symbol": sym, "found": bool(q), "bid": q.get("bidPrice"), "ask": q.get("askPrice"),
-               "last": q.get("lastPrice"), "mark": q.get("mark"), "change_pct": q.get("netPercentChange"),
-               "name": ref.get("description"), "exchange": ref.get("exchangeName"),
-               "asset_type": asset, "underlying": underlying, "multiplier": ref.get("multiplier"),
-               "is_penny": penny if isinstance(penny, bool) else None, "realtime": entry.get("realtime"),
-               "deliverables": ref.get("deliverables"), "put_call": put_call(sym) if asset == "OPTION" else None,
-               "expiration": (f"{ref['expirationYear']:04d}-{ref['expirationMonth']:02d}-{ref['expirationDay']:02d}"
-                              if all(isinstance(ref.get(k), int) for k in ("expirationYear", "expirationMonth",
-                                                                         "expirationDay")) else None),
-               "strike": ref.get("strikePrice"),
-               "ticks": ticks_for(asset, underlying, penny if isinstance(penny, bool) else None)}
+        asset_hint = AssetType.OPTION if put_call(sym) else AssetType.EQUITY
+        q = self._broker_query("ticket_quote", QuotesQuery((sym,), asset_hint)).get(sym)
+        asset = q.asset_type.value.upper() if q and q.asset_type else None
+        underlying = (q.underlying or _occ_root(sym)) if q and asset == "OPTION" else None
+        penny = q.penny_pilot if q else None
+        num = lambda value: float(value) if value is not None else None
+        out = {"symbol": sym, "found": q is not None, "bid": num(q.bid) if q else None,
+               "ask": num(q.ask) if q else None, "last": num(q.last) if q else None,
+               "mark": num(q.mark) if q else None,
+               "change_pct": num(q.change_percent) if q else None,
+               "name": q.description if q else None, "exchange": q.exchange if q else None,
+               "asset_type": asset, "underlying": underlying,
+               "multiplier": num(q.multiplier) if q else None,
+               "is_penny": penny, "realtime": q.realtime if q else None,
+               "deliverables": q.deliverables if q else None,
+               "put_call": put_call(sym) if asset == "OPTION" else None,
+               "expiration": q.expiration.isoformat() if q and q.expiration else None,
+               "strike": num(q.strike) if q else None,
+               "ticks": ticks_for(asset, underlying, penny)}
         self._quote_cache[sym] = (time.monotonic(), out)
         return out
 
