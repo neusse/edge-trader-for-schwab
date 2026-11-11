@@ -44,7 +44,9 @@ A level-1-or-higher Paper account can also review a covered call or cash-secured
 limit order. Covered calls require 100 uncommitted underlying shares per contract; cash-secured
 puts require options buying power for the full strike value of the underlying shares. The app
 refuses conflicting active orders on that underlying during review and final preflight. Short
-options can be assigned, and no stop or target is attached automatically.
+options can be assigned, and no stop or target is attached automatically. While a short call is
+held, the Paper equity close, OCO, and trailing exit controls refuse to sell its underlying
+shares; close the call first.
 A held Paper option position with no active order can be closed in whole or in part using a
 confirmed limit order. The app rechecks the position before sending; any remaining contracts
 receive no new broker-held exit from that close.

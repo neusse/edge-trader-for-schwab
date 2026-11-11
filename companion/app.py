@@ -38,7 +38,7 @@ from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_re
 from .brokers.paper_options import (chain_query, chain_response, expirations_query,
                                     expirations_response, long_entry_plan,
                                     option_close_plan, option_fixed_exit_plan,
-                                    short_entry_plan, OCC)
+                                    short_entry_plan, covered_call_reserved_shares, OCC)
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -908,26 +908,37 @@ def _paper_order_free_position(body: dict):
            if order.status in active for leg in order.legs):
         raise ValueError("an active order already touches this symbol; resolve it before another action")
     quote = service.adapter.query(QuotesQuery((symbol,), AssetType.EQUITY)).get(symbol)
-    return service, positions[0], quote
+    return service, positions[0], quote, account
+
+
+def _refuse_covered_share_exit(account, symbol: str) -> None:
+    if covered_call_reserved_shares(account, symbol):
+        raise ValueError("held short calls reserve these shares; close the calls before an equity exit")
 
 
 def _paper_oco(body: dict):
-    service, position, quote = _paper_order_free_position(body)
+    service, position, quote, account = _paper_order_free_position(body)
+    if position.side.value == "long":
+        _refuse_covered_share_exit(account, position.symbol)
     return service, oco_plan(body, position, quote), quote
 
 
 def _paper_close(body: dict):
-    service, position, quote = _paper_order_free_position(body)
+    service, position, quote, account = _paper_order_free_position(body)
+    if position.side.value == "long":
+        _refuse_covered_share_exit(account, position.symbol)
     return service, close_plan(body, position, quote), quote, position.quantity
 
 
 def _paper_add(body: dict):
-    service, position, quote = _paper_order_free_position(body)
+    service, position, quote, _ = _paper_order_free_position(body)
     return service, add_plan(body, position, quote), quote, position.quantity
 
 
 def _paper_trailing(body: dict):
-    service, position, quote = _paper_order_free_position(body)
+    service, position, quote, account = _paper_order_free_position(body)
+    if position.side.value == "long":
+        _refuse_covered_share_exit(account, position.symbol)
     return service, trailing_plan(body, position, quote), quote, position.quantity
 
 
@@ -985,6 +996,8 @@ def _send_paper_trailing(body: dict, request_id: str):
                     (positions[0].side.value == "long") !=
                     (instruction == OrderInstruction.SELL)):
                 raise ValueError("position changed before trailing stop submission; no order was sent")
+            if instruction == OrderInstruction.SELL:
+                _refuse_covered_share_exit(account, symbol)
             now = datetime.now(timezone.utc)
             active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
                                 OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
@@ -1109,6 +1122,8 @@ def _send_paper_close(body: dict, request_id: str):
                     (positions[0].side.value == "long") !=
                     (instruction == OrderInstruction.SELL)):
                 raise ValueError("position changed before close submission; no order was sent")
+            if instruction == OrderInstruction.SELL:
+                _refuse_covered_share_exit(account, symbol)
             now = datetime.now(timezone.utc)
             active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
                                 OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
@@ -1170,6 +1185,8 @@ def _send_paper_oco(body: dict, request_id: str):
                     (positions[0].side.value == "long") !=
                     (instruction == OrderInstruction.SELL)):
                 raise ValueError("position changed before OCO submission; no order was sent")
+            if instruction == OrderInstruction.SELL:
+                _refuse_covered_share_exit(account, symbol)
             now = datetime.now(timezone.utc)
             active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
                                 OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))

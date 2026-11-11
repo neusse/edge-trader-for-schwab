@@ -152,6 +152,20 @@ def long_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
         OrderType.LIMIT, TimeInForce.DAY, f"et-opt-{request_id.hex}", limit_price=limit)
 
 
+def covered_call_reserved_shares(account: AccountSnapshot, underlying: str) -> Decimal:
+    """Shares already pledged to held short calls across all expirations."""
+    reserved = Decimal(0)
+    for position in account.positions:
+        if position.asset_type != AssetType.OPTION or position.side != PositionSide.SHORT:
+            continue
+        match = OCC.fullmatch(position.symbol)
+        if match and match.group(1) == underlying and match.group(5) == "C":
+            reserved += position.quantity * 100
+        elif match is None and position.symbol.startswith(underlying):
+            raise ValueError("unrecognized held short option; covered shares cannot be verified")
+    return reserved
+
+
 def short_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
                      now: datetime | None = None) -> SimpleOrderIntent:
     """One covered call or cash-secured put; uncovered calls are never planned."""
@@ -195,13 +209,7 @@ def short_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
         shares = sum((position.quantity if position.side == PositionSide.LONG else
                       -position.quantity) for position in account.positions
                      if position.asset_type == AssetType.EQUITY and position.symbol == query.underlying)
-        reserved = Decimal(0)
-        for position in account.positions:
-            if position.asset_type != AssetType.OPTION or position.side != PositionSide.SHORT:
-                continue
-            match = OCC.fullmatch(position.symbol)
-            if match and match.group(1) == query.underlying and match.group(5) == "C":
-                reserved += position.quantity * 100
+        reserved = covered_call_reserved_shares(account, query.underlying)
         if shares - reserved < quantity * 100:
             raise ValueError("covered call requires 100 uncommitted underlying shares per contract")
     else:

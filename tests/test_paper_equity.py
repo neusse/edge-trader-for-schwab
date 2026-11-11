@@ -1,6 +1,7 @@
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -21,6 +22,7 @@ from companion.brokers.models import (
 from companion.brokers.order_service import BrokerOrderService
 from companion.brokers.paper_equity import (add_plan, close_plan, entry_plan,
                                              oco_exit_reprice, oco_plan, trailing_plan)
+from companion.brokers.paper_options import covered_call_reserved_shares
 from companion.store import Store
 from companion.trading import Trader
 
@@ -28,6 +30,61 @@ from companion.trading import Trader
 def quote(now, symbol="AAPL"):
     return Quote(symbol, Decimal("99.95"), Decimal("100.05"), Decimal("100"),
                  Decimal("100"), now, True, "Alpaca IEX")
+
+
+def test_held_short_call_reserves_equity_shares_from_exit_workflows(monkeypatch):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    shares = Position("AAPL", AssetType.EQUITY, PositionSide.LONG,
+                      Decimal(200), Decimal(100))
+    call = Position("AAPL261120C00110000", AssetType.OPTION, PositionSide.SHORT,
+                    Decimal(1), Decimal(2))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (shares, call))
+    assert covered_call_reserved_shares(account, "AAPL") == 100
+    def query(value):
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return ()
+        if isinstance(value, QuotesQuery): return {"AAPL": quote(now)}
+        raise AssertionError(type(value))
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query), account_ref="paper-account")
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    for path in ("/api/paper/position/close/preview", "/api/paper/oco/preview",
+                 "/api/paper/position/trailing/preview"):
+        result = client.post(path, json={"symbol": "AAPL"}, headers=headers).json()
+        assert not result["ok"] and "short calls reserve" in result["error"]
+
+
+def test_new_short_call_before_equity_submit_blocks_share_sale(monkeypatch):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    shares = Position("AAPL", AssetType.EQUITY, PositionSide.LONG,
+                      Decimal(200), Decimal(100))
+    call = Position("AAPL261120C00110000", AssetType.OPTION, PositionSide.SHORT,
+                    Decimal(1), Decimal(2))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (shares,))
+    def query(value):
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return ()
+        if isinstance(value, QuotesQuery): return {"AAPL": quote(now)}
+        raise AssertionError(type(value))
+    def execute(command, request_id, preflight):
+        nonlocal account
+        account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(),
+                                  (shares, call))
+        preflight(account)
+        raise AssertionError("a covered-share sale must not reach the adapter")
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query),
+                              account_ref="paper-account", execute=execute)
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    body = {"symbol": "AAPL", "shares": "1", "request_id": str(uuid4())}
+    result = client.post("/api/paper/position/close/submit", json=body,
+                         headers={"X-Companion": "1"}).json()
+    assert not result["ok"] and "short calls reserve" in result["error"]
 
 
 def entry(**changes):
