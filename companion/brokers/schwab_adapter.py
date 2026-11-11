@@ -174,6 +174,7 @@ def normalize_order(raw: dict) -> OrderGroup:
     else:
         order_class = OrderClass.SIMPLE
     members = []
+    unreadable_live_exit = False
     closing = {OrderInstruction.SELL, OrderInstruction.BUY_TO_COVER,
                OrderInstruction.BUY_TO_CLOSE, OrderInstruction.SELL_TO_CLOSE}
     root_instructions = set()
@@ -191,6 +192,7 @@ def normalize_order(raw: dict) -> OrderGroup:
 
     def visit(node: dict, parent_id: str | None, role: OrderRole,
               oco_id: str | None) -> None:
+        nonlocal unreadable_live_exit
         node_id = str(node.get("orderId") or root_id)
         order_qty = _decimal(node.get("quantity"))
         remaining = _decimal(node.get("remainingQuantity"))
@@ -216,6 +218,10 @@ def normalize_order(raw: dict) -> OrderGroup:
                 position_effect=row.get("positionEffect"),
             ))
         status = _STATUS.get(node.get("status"), OrderStatus.UNKNOWN)
+        if parent_id is not None and not legs and not node.get("childOrderStrategies") and node.get("status") in (
+                "WORKING", "PARTIALLY_FILLED", "PENDING_ACTIVATION", "ACCEPTED", "QUEUED",
+                "AWAITING_STOP_CONDITION", "AWAITING_CONDITION", "AWAITING_RELEASE_TIME", "NEW"):
+            unreadable_live_exit = True
         if legs:
             kind = node.get("orderType") or "LIMIT"
             executions = []
@@ -252,6 +258,9 @@ def normalize_order(raw: dict) -> OrderGroup:
                 trail_link=node.get("stopPriceLinkType"),
                 trail_basis=node.get("stopPriceLinkBasis"),
                 executions=tuple(executions),
+                reported_filled_quantity=_decimal(node.get("filledQuantity")),
+                has_fill_activity=any(activity.get("executionType") == "FILL"
+                                      for activity in node.get("orderActivityCollection") or ()),
             ))
         child_oco = node_id if node.get("orderStrategyType") == "OCO" else oco_id
         for child in node.get("childOrderStrategies") or ():
@@ -264,7 +273,8 @@ def normalize_order(raw: dict) -> OrderGroup:
     visit(raw, None, root_role, None)
     return OrderGroup(root_id, order_class,
                       _STATUS.get(raw.get("status"), OrderStatus.UNKNOWN), tuple(members),
-                      strategy_detail=strategy or "SINGLE")
+                      strategy_detail=strategy or "SINGLE",
+                      has_unreadable_live_exit=unreadable_live_exit)
 
 
 _TERMINAL_STATUSES = {OrderStatus.FILLED, OrderStatus.CANCELED,
@@ -438,7 +448,7 @@ class SchwabAdapter(BrokerAdapter):
             return tuple(group for group in groups if not query.statuses or
                          any(order.status in query.statuses for order in group.orders))
         if isinstance(query, OrderQuery):
-            return normalize_order(_response(client.order_details(account_hash, query.order_id)))
+            return normalize_order(_response(client.order_details(account_hash, int(query.order_id))))
         if isinstance(query, FillsQuery):
             rows = SchwabReadPolicy().complete_transactions(
                 lambda start, end: _response(client.transactions(account_hash, start, end, "TRADE")),
