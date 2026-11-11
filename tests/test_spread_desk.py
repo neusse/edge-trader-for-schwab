@@ -226,6 +226,22 @@ def test_cancel_cancels_the_working_entry(desk):
     assert c["ok"] and desk.t._client.cancelled == [700]
 
 
+def test_cancel_unknown_outcome_keeps_spread_unresolved(desk):
+    r = send(desk)
+    desk.t._client.orders[700] = {"orderId": 700, "status": "WORKING", "filledQuantity": 0,
+                                  "orderLegCollection": [{"instrument": {"symbol": HI_P}},
+                                                         {"instrument": {"symbol": LO_P}}]}
+
+    def lost_reply(_hash, oid):
+        desk.t._client.cancelled.append(oid)
+        raise TimeoutError("lost reply")
+
+    desk.t._client.cancel_order = lost_reply
+    result = desk.cancel(r["spread_id"])
+    assert not result["ok"] and "outcome unknown" in result["error"]
+    assert desk.t._client.cancelled == [700]
+
+
 def filled_entry(n=1, oid=700, status="FILLED", qty=None, prices=(13.40, 12.20)):
     return {"orderId": oid, "status": status, "filledQuantity": n, "quantity": qty or n,
             "orderLegCollection": [{"legId": 1, "instrument": {"symbol": HI_P}}, {"legId": 2, "instrument": {"symbol": LO_P}}],
