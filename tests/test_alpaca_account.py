@@ -555,3 +555,25 @@ def test_option_expirations_query_paginates_without_market_snapshot():
     assert dates == (date(2026, 11, 13), date(2026, 11, 20))
     assert len(requests) == 2 and requests[1].page_token == "next"
     assert requests[0].expiration_date_lte == date(2027, 3, 11)
+
+
+def test_option_quote_request_separates_indicative_display_from_opra_stop_feed():
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from companion.brokers.models import AssetType, QuotesQuery
+
+    symbol = "AAPL261113C00100000"
+    feeds = []
+    def latest(request):
+        feeds.append(request.feed.value)
+        return {symbol: SimpleNamespace(bid_price=1.0, ask_price=1.2,
+                                        timestamp=datetime.now(timezone.utc))}
+    adapter = AlpacaPaperAdapter(SimpleNamespace(), option_data=SimpleNamespace(
+        get_option_latest_quote=latest))
+    indicative = adapter.query(QuotesQuery((symbol,), AssetType.OPTION))[symbol]
+    opra = adapter.query(QuotesQuery((symbol,), AssetType.OPTION,
+                                    realtime_required=True))[symbol]
+    assert feeds == ["indicative", "opra"]
+    assert indicative.source == "Alpaca indicative options" and not indicative.realtime
+    assert opra.source == "Alpaca OPRA options" and opra.realtime
+    assert opra.timestamp_verified and opra.mark == Decimal("1.1")

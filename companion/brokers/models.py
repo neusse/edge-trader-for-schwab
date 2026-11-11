@@ -376,6 +376,7 @@ class FillsQuery:
 class QuotesQuery:
     symbols: tuple[str, ...]
     asset_type: AssetType
+    realtime_required: bool = False
 
     def __post_init__(self) -> None:
         if not self.symbols:
