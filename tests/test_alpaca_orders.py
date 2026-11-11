@@ -10,7 +10,7 @@ from companion.brokers.models import (
     AssetType, BracketOrderIntent, CancelOrder, MultiLegOrderIntent,
     MutationStatus, OcoOrderIntent, OrderInstruction, OrderLegIntent, OrderType,
     ReplaceOrder, SimpleOrderIntent, StopLossIntent, SubmitOrder, TimeInForce,
-    TrailingOrderIntent,
+    TrailingOrderIntent, TrailingStopSpec,
 )
 
 
@@ -45,6 +45,17 @@ def test_equity_request_shapes_include_broker_held_protection():
         equity(OrderInstruction.SELL), TimeInForce.GTC, "trail-key", trail_price=D("2")))
     assert trail.trail_price == 2
     assert trail.order_class is None
+
+
+def test_alpaca_rejects_linked_trails_and_non_mark_basis():
+    with pytest.raises(ValueError, match="cannot attach a trailing stop"):
+        build_order_request(OcoOrderIntent(
+            equity(OrderInstruction.SELL), D("110"), TrailingStopSpec(trail_price=D("2")),
+            TimeInForce.GTC, "linked-trail"))
+    with pytest.raises(ValueError, match="quote basis"):
+        build_order_request(TrailingOrderIntent(
+            equity(OrderInstruction.SELL), TimeInForce.GTC, "bid-trail",
+            trail_price=D("2"), basis="BID"))
 
 
 def test_single_option_and_spread_requests_preserve_position_intent():

@@ -16,7 +16,8 @@ from .models import (
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery, OrderRole,
     OrderExecution, OrdersQuery, OrderStatus, OrderType, Position, PositionSide,
     PreviousSessionPosition, ReplaceOrder, SubmitOrder,
-    TimeInForce, MultiLegOrderIntent, TrailingOrderIntent,
+    TimeInForce, BracketOrderIntent, MultiLegOrderIntent, OcoOrderIntent,
+    TrailingOrderIntent, TrailingStopSpec,
 )
 
 
@@ -420,8 +421,11 @@ class SchwabAdapter(BrokerAdapter):
                                   message="Schwab account is unavailable; no action was sent")
         if intent is not None and (
                 isinstance(intent, MultiLegOrderIntent) or
-                isinstance(intent, TrailingOrderIntent) and
-                intent.leg.asset_type == AssetType.OPTION):
+                isinstance(intent, TrailingOrderIntent) and intent.leg.asset_type == AssetType.OPTION or
+                isinstance(intent, OcoOrderIntent) and intent.leg.asset_type == AssetType.OPTION and
+                isinstance(intent.stop_loss, TrailingStopSpec) or
+                isinstance(intent, BracketOrderIntent) and intent.entry.leg.asset_type == AssetType.OPTION and
+                isinstance(intent.stop_loss, TrailingStopSpec)):
             try:
                 preview = client.preview_order(account_hash, body)
                 if preview.status_code == 429:
@@ -440,8 +444,13 @@ class SchwabAdapter(BrokerAdapter):
                 if not isinstance(rejects, list):
                     raise ValueError("unreadable preview")
                 if rejects:
+                    reasons = [str(item.get("message") or item.get("activityMessage") or
+                                   item.get("validationRuleName") or "")
+                               for item in rejects if isinstance(item, dict)]
                     return MutationResult(MutationStatus.REJECTED,
-                                          message="Schwab preview rejected the order; nothing was sent")
+                                          message="Schwab preview rejected the order: " +
+                                          ("; ".join(reason for reason in reasons if reason)[:200] or
+                                           "no reason given") + "; nothing was sent")
             except Exception:
                 return MutationResult(MutationStatus.REJECTED,
                                       message="Schwab preview could not be verified; nothing was sent")

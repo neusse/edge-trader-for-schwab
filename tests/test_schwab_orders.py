@@ -4,7 +4,7 @@ from dataclasses import replace
 from companion.brokers.models import (
     AssetType, BracketOrderIntent, CancelOrder, MultiLegOrderIntent, MutationStatus,
     OrderInstruction, OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent, StopLossIntent,
-    SubmitOrder, TimeInForce,
+    SubmitOrder, TimeInForce, OcoOrderIntent, TrailingStopSpec, TrailingOrderIntent,
 )
 from companion.brokers.schwab_adapter import SchwabAdapter
 from companion.brokers.schwab_orders import build_schwab_order
@@ -52,6 +52,20 @@ def test_schwab_simple_equity_preserves_fractional_quantity():
     intent = SimpleOrderIntent(OrderLegIntent("AAPL", AssetType.EQUITY, OrderInstruction.SELL, D("0.5")),
                                OrderType.MARKET, TimeInForce.DAY, "fractional-close")
     assert build_schwab_order(intent)["orderLegCollection"][0]["quantity"] == 0.5
+
+
+def test_schwab_trailing_intents_preserve_quote_basis_and_oco_shape():
+    leg = OrderLegIntent("AAPL", AssetType.EQUITY, OrderInstruction.SELL, D("2"))
+    standalone = build_schwab_order(TrailingOrderIntent(
+        leg, TimeInForce.GTC, "trail", trail_price=D("1.25"), basis="BID"))
+    assert standalone["stopPriceLinkBasis"] == "BID"
+    assert standalone["stopPriceOffset"] == 1.25
+    linked = build_schwab_order(OcoOrderIntent(
+        leg, D("110"), TrailingStopSpec(trail_percent=D("2"), basis="ASK"), TimeInForce.GTC, "oco"))
+    target, stop = linked["childOrderStrategies"]
+    assert target["duration"] == "GOOD_TILL_CANCEL"
+    assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceLinkBasis"] == "ASK"
+    assert stop["stopPriceLinkType"] == "PERCENT" and stop["stopPriceOffset"] == 2.0
 
 
 def credit_spread():
