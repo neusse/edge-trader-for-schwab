@@ -26,9 +26,9 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_intent, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .brokers.models import (
-    AssetType, CancelOrder, MutationResult, MutationStatus, OcoOrderIntent, OrderInstruction,
+    AccountQuery, AssetType, CancelOrder, MutationResult, MutationStatus, OcoOrderIntent, OrderInstruction,
     OrderLegIntent, OrderType, PreviewOrderQuery, ReplaceOrder, SimpleOrderIntent,
-    StopLossIntent, SubmitOrder, TimeInForce,
+    PositionSide, StopLossIntent, SubmitOrder, TimeInForce,
     TrailingOrderIntent, TrailingStopSpec,
 )
 from .brokers.schwab_adapter import SchwabAdapter
@@ -1081,9 +1081,16 @@ class Trader:
             self._send_lock.release()
 
     def _positions(self, client) -> list[dict]:
-        r = self._logged("account_details", lambda: client.account_details(self._hash, fields="positions"))
-        r.raise_for_status()
-        return ((r.json() or {}).get("securitiesAccount") or {}).get("positions") or []
+        account = self._broker_query("account_details", AccountQuery())
+        # Existing position actions consume this compact view while they migrate to Position.
+        return [{"instrument": {"symbol": position.symbol,
+                                "assetType": position.asset_type.value.upper(),
+                                **({"underlyingSymbol": position.underlying}
+                                   if position.underlying and position.underlying != position.symbol else {})},
+                 "longQuantity": float(position.quantity) if position.side == PositionSide.LONG else 0.0,
+                 "shortQuantity": float(position.quantity) if position.side == PositionSide.SHORT else 0.0,
+                 "averagePrice": float(position.average_price) if position.average_price is not None else None}
+                for position in account.positions]
 
     def _held_with_exits(self, symbol: str, orders: list[dict], known_terminal: set[int]) -> str | None:
         """Why a new ticket must not go in on `symbol`, or None: the account holds it AND it has working
