@@ -1,6 +1,7 @@
 """The Paper evidence file must preserve order state without disclosing broker IDs."""
 
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -9,8 +10,9 @@ import pytest
 
 from companion.brokers.models import (AssetType, OrderClass, OrderInstruction,
                                       OrderRole, OrderStatus, PositionSide)
-from scripts.capture_paper_evidence import (PreflightRefused, collect, ref,
-                                            require_clean_market)
+from scripts.capture_paper_evidence import (PreflightRefused, RuntimeMismatch,
+                                            collect, ref, require_clean_market,
+                                            require_matching_runtime)
 
 
 def test_capture_redacts_account_order_fill_and_symbol_identifiers():
@@ -92,3 +94,25 @@ def test_clean_market_preflight_requires_independent_open_paper_clock_and_empty_
         require_clean_market({**record, "paper": {**record["paper"],
                                                     "working_orders": [{"order_ref": "opaque"}]}},
                              clock, now)
+
+
+def test_evidence_refuses_stale_app_before_any_broker_read(monkeypatch):
+    import scripts.capture_paper_evidence as capture
+
+    checkout = {"commit": "current-commit", "clean": True}
+    assert require_matching_runtime(checkout, checkout) == "current-commit"
+    with pytest.raises(RuntimeMismatch, match="clean Git checkout"):
+        require_matching_runtime(checkout, {**checkout, "clean": False})
+    with pytest.raises(RuntimeMismatch, match="restart Edge Trader"):
+        require_matching_runtime({"commit": "old-commit", "clean": True}, checkout)
+
+    monkeypatch.setattr(sys, "argv", ["capture_paper_evidence.py", "baseline"])
+    monkeypatch.setattr(capture, "checkout_identity", lambda root: checkout)
+    monkeypatch.setattr(capture, "_json", lambda port, path: (
+        {"commit": "old-commit", "clean": True} if path == "/api/build" else
+        pytest.fail("app state was read after a runtime mismatch")))
+    monkeypatch.setattr(capture, "AlpacaPaperAdapter", lambda: pytest.fail(
+        "Paper broker was read after a runtime mismatch"))
+    with pytest.raises(SystemExit) as refused:
+        capture.main()
+    assert refused.value.code == 2

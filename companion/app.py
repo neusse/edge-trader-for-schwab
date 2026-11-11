@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import __version__
+from .build_info import checkout_identity
 from .brokers.capabilities import BROKERS
 from .brokers.configuration import BrokerSelection
 from .brokers.bootstrap import AlpacaBootstrapPoller
@@ -46,6 +47,7 @@ from .trading import OCC_RE, Trader
 from .view import private_view
 
 STATIC = Path(__file__).resolve().parent / "static"
+RUNTIME_IDENTITY = checkout_identity(STATIC.parent.parent)
 PORT = int(os.environ.get("COMPANION_PORT", "8770"))
 ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
 DEMO_OVERRIDE = os.environ.get("EDGE_TRADER_DEMO") == "1"
@@ -277,6 +279,12 @@ def state():
                          "broker": broker_info(BROKER_KEY),
                          "pending_broker": selected_broker if selected_broker != BROKER_KEY else None,
                          "version": __version__, "features": FEATURES}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/build")
+def build():
+    """Report the process-start checkout, without account or credential details."""
+    return JSONResponse(RUNTIME_IDENTITY, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/brokers")
