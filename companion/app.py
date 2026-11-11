@@ -35,6 +35,7 @@ from .brokers.models import (AccountQuery, AssetType, BracketOrderIntent, Cancel
                              SubmitOrder)
 from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_reprice,
                                    oco_plan, trailing_plan)
+from .brokers.paper_auto_be import oco_auto_be_plan
 from .brokers.paper_options import (chain_query, chain_response, expirations_query,
                                     expirations_response, long_entry_plan,
                                     option_close_plan, option_fixed_exit_plan,
@@ -81,7 +82,7 @@ BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
     "alpaca-paper": ("equity-bracket", "equity-simple", "equity-oco", "equity-close", "equity-partial",
-                     "equity-oco-adjust", "equity-add", "equity-trailing",
+                     "equity-oco-adjust", "equity-auto-be", "equity-add", "equity-trailing",
                      "option-long-entry", "option-close", "option-cancel",
                      "option-fixed-exit", "option-covered-short", "vertical-entry",
                      "vertical-close", "vertical-target", "vertical-cancel",
@@ -90,7 +91,7 @@ APP_WORKFLOWS = {
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order; an exact held vertical can be closed or given one broker-held target. Held options can be closed or given one fixed stop, stop-limit, or target. Spread stops are app-watched and require fresh OPRA option quotes; the indicative feed never triggers one.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. An existing app-created OCO can opt into app-watched Auto B/E with fresh IEX quotes. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order; an exact held vertical can be closed or given one broker-held target. Held options can be closed or given one fixed stop, stop-limit, or target. Spread stops are app-watched and require fresh OPRA option quotes; the indicative feed never triggers one.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -1787,6 +1788,150 @@ def _send_paper_oco_adjust(body: dict, request_id: str):
                     position != original_position):
                 raise ValueError("OCO changed before replacement; no replace was sent")
         return service.execute(command, request_id, preflight=preflight)
+
+
+def _paper_oco_auto_be_plan(body: dict):
+    service, _ = _paper_service()
+    if (not isinstance(body, dict) or not isinstance(body.get("symbol"), str) or
+            not body["symbol"]):
+        raise ValueError("Choose a held Paper equity position for Auto B/E")
+    symbol = body["symbol"]
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref or account.status.upper() != "ACTIVE":
+        raise ValueError("Paper account changed or is inactive")
+    positions = [position for position in account.positions if position.symbol == symbol]
+    if len(positions) != 1:
+        raise ValueError("Exactly one held equity position is required")
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                               statuses=active))
+    touching = [group for group in groups if any(
+        leg.symbol == symbol for order in group.orders
+        if order.status in active for leg in order.legs)]
+    if len(touching) != 1:
+        raise ValueError("Exactly one active OCO group must protect this symbol")
+    plan = oco_auto_be_plan(positions[0], touching[0])
+    owned = service.store.get_mutation_by_client_id(plan["oco_client_id"])
+    if owned is None or owned["status"] != "accepted" or owned["command"] != "SubmitOrder":
+        raise ValueError("Auto B/E requires an OCO accepted through this app")
+    quote = service.adapter.query(QuotesQuery((symbol,), AssetType.EQUITY)).get(symbol)
+    if (quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or
+            not quote.realtime or not quote.timestamp_verified or
+            quote.observed_at.tzinfo is None or
+            not 0 <= (now - quote.observed_at).total_seconds() <= 15 or
+            (quote.mark or quote.last) is None or (quote.mark or quote.last) <= 0):
+        raise ValueError("Fresh verified IEX quote is required to set Auto B/E")
+    watch = getattr(poller, "auto_be", None)
+    if watch is None or watch.store is not service.store:
+        raise ValueError("Paper Auto B/E monitor is not active for this account")
+    return service, watch, plan, quote
+
+
+@app.post("/api/paper/oco/auto-be/preview")
+async def paper_oco_auto_be_preview(request: Request):
+    _guard(request)
+    try:
+        _, watch, plan, quote = await run_in_threadpool(
+            _paper_oco_auto_be_plan, await request.json())
+        existing = watch.get(plan["symbol"])
+        if existing and existing["status"] in ("watching", "sending", "unknown"):
+            raise ValueError("An earlier Paper Auto B/E watch is still active or unresolved")
+        return {"ok": True, **{key: str(value) if isinstance(value, Decimal) else value
+                               for key, value in plan.items()},
+                "quote": str(quote.mark or quote.last),
+                "warning": "APP-WATCHED: at +1R the app attempts one fixed-stop replacement. The current OCO stop is broker-held; replacement protection is unconfirmed until Alpaca verifies the new OCO. Auto B/E needs this app running and fresh IEX quotes."}
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Paper Auto B/E preview failed; no watch was set"}
+
+
+@app.post("/api/paper/oco/auto-be/set")
+async def paper_oco_auto_be_set(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        result = await run_in_threadpool(_set_paper_oco_auto_be, body)
+        return {"ok": True, **result}
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Paper Auto B/E setup failed; no watch was set"}
+
+
+def _set_paper_oco_auto_be(body: dict) -> dict:
+    with BROKER_ACTION_LOCK:
+        service, watch, plan, _ = _paper_oco_auto_be_plan(body)
+        if not service._market_open(datetime.now(timezone.utc)) or service.store.open_mutations():
+            raise ValueError("Regular hours and resolved order outcomes are required for Auto B/E setup")
+        reviewed = body.get("reviewed")
+        if reviewed != {key: str(plan[key]) for key in
+                        ("quantity", "basis", "initial_stop", "target", "trigger",
+                         "new_stop", "group_id", "stop_id", "target_id")}:
+            raise ValueError("OCO or Auto B/E risk changed since preview; review again")
+        row = watch.set(plan)
+        return {"symbol": row["symbol"], "status": row["status"],
+                "trigger": str(row["trigger"]), "new_stop": str(row["new_stop"])}
+
+
+@app.post("/api/paper/oco/auto-be/clear")
+async def paper_oco_auto_be_clear(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        symbol = body.get("symbol") if isinstance(body, dict) else None
+        if not isinstance(symbol, str) or len(symbol) > 10:
+            raise ValueError("Paper Auto B/E symbol is required")
+        def clear():
+            with BROKER_ACTION_LOCK:
+                service, _ = _paper_service()
+                watch = getattr(poller, "auto_be", None)
+                if watch is None or watch.store is not service.store:
+                    raise ValueError("Paper Auto B/E monitor is unavailable")
+                row = watch.get(symbol)
+                if row and row["status"] == "unknown":
+                    if body.get("acknowledge") is not True or not watch.acknowledge_unknown(symbol):
+                        raise ValueError("Check Alpaca Paper and reconcile the unknown replacement before clearing")
+                if not watch.clear(symbol):
+                    raise ValueError("Auto B/E replacement is in progress; check Alpaca Paper")
+                return {"ok": True, "symbol": symbol}
+        return await run_in_threadpool(clear)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/paper/oco/auto-be/reconcile")
+async def paper_oco_auto_be_reconcile(request: Request):
+    _guard(request)
+    try:
+        request_id = str(UUID(str((await request.json()).get("request_id"))))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(400, "request_id must be a UUID") from None
+    def reconcile():
+        with BROKER_ACTION_LOCK:
+            service, _ = _paper_service()
+            watch = getattr(poller, "auto_be", None)
+            if watch is None or watch.store is not service.store or not any(
+                    row["request_id"] == request_id for row in watch.list()):
+                raise ValueError("Auto B/E request is not active for this Paper account")
+            result = service.reconcile_replace(request_id)
+            if result.status.value in ("accepted", "rejected"):
+                watch.resolve_request(request_id, result.accepted,
+                                      result.message or "Paper stop replacement reconciled")
+            return result
+    try:
+        result = await run_in_threadpool(reconcile)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
 
 
 @app.post("/api/paper/entry/cancel")

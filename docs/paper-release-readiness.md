@@ -20,7 +20,7 @@ Use a small, disposable Paper position during regular market hours. Record date,
 | Broker selection | Default Paper, switch to Schwab and Demo, then back; each switch disarms | Pending |
 | Equity entry | Long and short market/limit simple and bracket; fill, target and stop children | Pending |
 | Equity management | Unfilled cancel/reprice, partial fill, held OCO, fixed stop/target adjust, trail, partial/full close, add shares | Pending |
-| Equity Auto B/E | One +1R move, no loosening, restart and unknown replacement handling | Pending implementation (#8) |
+| Equity Auto B/E | One +1R move, no loosening, restart and unknown replacement handling | Existing OCO path implemented; bracket entry and Paper E2E pending (#8) |
 | Single-leg options | Long entry, covered call or cash-secured put, fixed stop/stop-limit/target, partial/full close, cancel remainder | Pending |
 | Vertical spreads | Debit and credit MLEG entry, target/reprice, cancel remainder, exact held pair close | Pending |
 | Vertical stop | OPRA hit twice, one atomic close attempt, stale/403 suspension, unknown outcome, external position change | Blocked by OPRA entitlement on the current Paper account |

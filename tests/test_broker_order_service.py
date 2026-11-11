@@ -291,3 +291,37 @@ def test_vertical_submit_reconciliation_requires_exact_atomic_pair(tmp_path):
         assert service.reconcile_submit("vertical-submit").status == MutationStatus.ACCEPTED
     finally:
         store.close()
+
+
+def test_auto_be_replacement_reconciliation_requires_paired_equity_target(tmp_path):
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT, ACCOUNT)
+    adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, "replacement"))
+    service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
+    leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL, Decimal(2))
+    new_stop = BrokerOrder("new-stop", OrderStatus.WORKING, OrderType.STOP,
+                           TimeInForce.GTC, (leg,), OrderRole.STOP,
+                           client_order_id="et-autobe-test", stop_price=Decimal(100))
+    bad_target = BrokerOrder("target", OrderStatus.WORKING, OrderType.LIMIT,
+                             TimeInForce.GTC,
+                             (OrderLeg("AAPL", AssetType.EQUITY,
+                                       OrderInstruction.SELL, Decimal(3)),),
+                             OrderRole.TARGET, limit_price=Decimal(110))
+    good_target = BrokerOrder("target", OrderStatus.WORKING, OrderType.LIMIT,
+                              TimeInForce.GTC, (leg,), OrderRole.TARGET,
+                              limit_price=Decimal(110))
+    try:
+        command = ReplaceOrder("old-stop", stop_price=Decimal(100),
+                               client_order_id="et-autobe-test")
+        assert service.execute(command, "be-replace").status == MutationStatus.UNKNOWN
+        adapter.given_query(ClientOrderQuery,
+                            OrderGroup("oco", OrderClass.OCO, OrderStatus.WORKING,
+                                       (bad_target, new_stop)),
+                            OrderGroup("oco", OrderClass.OCO, OrderStatus.WORKING,
+                                       (good_target, new_stop)))
+        assert service.reconcile_replace("be-replace").status == MutationStatus.UNKNOWN
+        assert service.reconcile_replace("be-replace").status == MutationStatus.ACCEPTED
+        assert store.open_mutations() == []
+    finally:
+        store.close()

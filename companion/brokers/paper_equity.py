@@ -216,33 +216,22 @@ def trailing_plan(body: dict, position: Position, quote,
     )
 
 
-def oco_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
-                     now: datetime | None = None) -> ReplaceOrder:
-    """Review one broker-held OCO leg change without canceling the paired exit."""
-    if not isinstance(body, dict) or position.asset_type != AssetType.EQUITY or group.order_class != OrderClass.OCO:
-        raise ValueError("Only an equity OCO exit can be repriced here")
-    symbol = body.get("symbol")
-    if symbol != position.symbol or not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol):
+def verified_oco_pair(position: Position, group: OrderGroup):
+    """Return the exact, fully working target and fixed stop for one held equity position."""
+    if position.asset_type != AssetType.EQUITY or group.order_class != OrderClass.OCO:
+        raise ValueError("Only an equity OCO exit can be managed here")
+    symbol = position.symbol
+    if not SYMBOL.fullmatch(symbol):
         raise ValueError("OCO symbol must match the held position")
     quantity = position.quantity
     if quantity <= 0 or quantity != quantity.to_integral_value() or quantity > 10000:
         raise ValueError("OCO adjustment requires 1 to 10000 whole shares")
-    try:
-        request_id = UUID(str(body.get("request_id")))
-        order_id = str(UUID(str(body.get("order_id"))))
-    except (ValueError, TypeError, AttributeError):
-        raise ValueError("order_id and request_id must be UUIDs") from None
-    role = body.get("role")
-    if role not in ("stop", "target"):
-        raise ValueError("role must be stop or target")
     if len(group.orders) != 2:
         raise ValueError("OCO must have exactly one target and one stop")
-    selected = next((order for order in group.orders if order.order_id == order_id), None)
     stop = next((order for order in group.orders if order.role == OrderRole.STOP), None)
     target = next((order for order in group.orders if order.role == OrderRole.TARGET), None)
-    if (selected is None or stop is None or target is None or
-            selected.role != (OrderRole.STOP if role == "stop" else OrderRole.TARGET)):
-        raise ValueError("OCO exit order no longer matches the reviewed leg")
+    if stop is None or target is None:
+        raise ValueError("OCO exit no longer has exactly one target and one stop")
     exit_instruction = (OrderInstruction.SELL if position.side == PositionSide.LONG else
                         OrderInstruction.BUY)
     for order in (stop, target):
@@ -255,6 +244,28 @@ def oco_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
             raise ValueError("OCO exit is not fully working for the current position")
     if stop.stop_price is None or target.limit_price is None:
         raise ValueError("OCO target or stop price is unavailable")
+    return stop, target
+
+
+def oco_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
+                     now: datetime | None = None) -> ReplaceOrder:
+    """Review one broker-held OCO leg change without canceling the paired exit."""
+    if not isinstance(body, dict) or body.get("symbol") != position.symbol:
+        raise ValueError("OCO symbol must match the held position")
+    stop, target = verified_oco_pair(position, group)
+    try:
+        request_id = UUID(str(body.get("request_id")))
+        order_id = str(UUID(str(body.get("order_id"))))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("order_id and request_id must be UUIDs") from None
+    role = body.get("role")
+    if role not in ("stop", "target"):
+        raise ValueError("role must be stop or target")
+    selected = next((order for order in group.orders if order.order_id == order_id), None)
+    if (selected is None or selected.role !=
+            (OrderRole.STOP if role == "stop" else OrderRole.TARGET)):
+        raise ValueError("OCO exit order no longer matches the reviewed leg")
+    symbol = position.symbol
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
