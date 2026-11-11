@@ -198,6 +198,8 @@ class AlpacaBootstrapPoller:
                                 "price": str(fill.price), "time": fill.occurred_at.isoformat()}
                                for fill in sorted(fills, key=lambda f: f.occurred_at, reverse=True)[:100]],
                      "alpaca": {"account_status": account.status,
+                                "options_trading_level": account.options_trading_level,
+                                "options_approved_level": account.options_approved_level,
                                 "equity": str(account.balances.equity) if account.balances.equity is not None else None,
                                 "cash": str(account.balances.available_funds) if account.balances.available_funds is not None else None,
                                 "buying_power": str(account.balances.buying_power) if account.balances.buying_power is not None else None,

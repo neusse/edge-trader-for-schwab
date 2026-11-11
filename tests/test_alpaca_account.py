@@ -25,7 +25,8 @@ def test_paper_account_read_normalizes_positions_without_sdk_objects():
         def get_account(self):
             return SimpleNamespace(id="account-uuid", status="ACTIVE", equity="10000.00",
                                    buying_power="20000", daytrading_buying_power=None,
-                                   cash="5000", maintenance_margin="200")
+                   cash="5000", maintenance_margin="200",
+                   options_trading_level=3, options_approved_level=3)
 
         def get_all_positions(self):
             return [SimpleNamespace(symbol="AAPL", asset_class="us_equity", qty="-3",
@@ -37,6 +38,7 @@ def test_paper_account_read_normalizes_positions_without_sdk_objects():
     assert snapshot.positions[0].asset_type == AssetType.EQUITY
     assert snapshot.positions[0].side == PositionSide.SHORT
     assert snapshot.positions[0].quantity == 3
+    assert snapshot.options_trading_level == 3 and snapshot.options_approved_level == 3
 
 
 def test_paper_clock_is_canonical_and_account_bound():
@@ -321,7 +323,8 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
     paper = broker_info("alpaca-paper")
     assert "option-trading" in paper["capabilities"]
     assert paper["workflows"] == ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
-                                  "equity-oco-adjust", "equity-add", "equity-trailing")
+                                  "equity-oco-adjust", "equity-add", "equity-trailing",
+                                  "option-long-entry")
     assert "option-bracket" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")

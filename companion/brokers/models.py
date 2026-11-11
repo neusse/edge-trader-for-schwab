@@ -192,6 +192,8 @@ class AccountSnapshot:
     positions: tuple[Position, ...] = ()
     observed_at: datetime | None = None
     previous_session_positions: tuple[PreviousSessionPosition, ...] = ()
+    options_trading_level: int | None = None
+    options_approved_level: int | None = None
 
 
 @dataclass(frozen=True)

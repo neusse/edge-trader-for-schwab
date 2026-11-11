@@ -27,6 +27,16 @@ def _decimal(value) -> Decimal | None:
     return None if value is None else Decimal(str(value))
 
 
+def _option_level(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        level = int(getattr(value, "value", value))
+    except (TypeError, ValueError):
+        return None
+    return level if 0 <= level <= 3 else None
+
+
 def _enum_value(value) -> str:
     return str(getattr(value, "value", value))
 
@@ -342,6 +352,8 @@ class AlpacaPaperAdapter(BrokerAdapter):
                 maintenance_requirement=_decimal(account.maintenance_margin),
             ),
             positions=tuple(positions), observed_at=datetime.now(timezone.utc),
+            options_trading_level=_option_level(getattr(account, "options_trading_level", None)),
+            options_approved_level=_option_level(getattr(account, "options_approved_level", None)),
         )
 
     def _execute(self, command: BrokerCommand) -> MutationResult:
