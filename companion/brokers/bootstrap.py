@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .alpaca_paper import AlpacaPaperAdapter
+from .alpaca_paper import AlpacaPaperAdapter, prefer_complete_order_groups
 from .canonical_view import build_canonical_state
 from .errors import read_health
 from .models import (AccountQuery, AssetType, FillsQuery, MarketClockQuery,
@@ -106,7 +106,7 @@ class AlpacaBootstrapPoller:
             stage = "orders_sweep"
             working = self._adapter.query(OrdersQuery(now - timedelta(days=3650), now,
                                                         statuses=active))
-            groups = tuple({group.group_id: group for group in (*recent, *working)}.values())
+            groups = prefer_complete_order_groups(recent, working)
             health_errors = []
             stage = "market_hours"
             try:

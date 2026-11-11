@@ -153,7 +153,8 @@ def test_oco_root_without_group_role_is_still_a_target():
 
 def test_bracket_children_without_group_role_keep_stop_and_target():
     from alpaca.trading.models import Order
-    from companion.brokers.alpaca_paper import _order_group
+    from companion.brokers.alpaca_paper import (_order_group,
+                                                prefer_complete_order_groups)
 
     def raw(order_id, order_type, price=None, stop=None, legs=None, status="new",
             filled="0", intent=None):
@@ -179,6 +180,9 @@ def test_bracket_children_without_group_role_keep_stop_and_target():
     from companion.brokers.canonical_view import _pending
     from companion.orders import stop_coverage
     assert stop_coverage(_pending((group,)), "AAPL", "LONG", 2)[0] == 2
+    active_target_only = _order_group(target)
+    assert len(active_target_only.orders) == 1
+    assert prefer_complete_order_groups((group,), (active_target_only,)) == (group,)
     unfilled = raw("entry", "market", legs=[target, stop])
     unfilled_group = _order_group(unfilled)
     assert unfilled_group.orders[2].status == OrderStatus.UNKNOWN

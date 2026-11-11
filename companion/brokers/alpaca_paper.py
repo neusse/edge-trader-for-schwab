@@ -158,6 +158,17 @@ def _order_group(raw) -> OrderGroup:
                       orders=tuple(members))
 
 
+def prefer_complete_order_groups(*batches: tuple[OrderGroup, ...]) -> tuple[OrderGroup, ...]:
+    """Retain nested exits when Alpaca also returns a single active child row."""
+    found: dict[str, OrderGroup] = {}
+    for batch in batches:
+        for group in batch:
+            previous = found.get(group.group_id)
+            if previous is None or len(group.orders) >= len(previous.orders):
+                found[group.group_id] = group
+    return tuple(found.values())
+
+
 class AlpacaPaperAdapter(BrokerAdapter):
     def __init__(self, client=None, stock_data=None, option_data=None):
         super().__init__(ALPACA_PAPER)
