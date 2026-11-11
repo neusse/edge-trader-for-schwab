@@ -27,7 +27,8 @@ from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_intent, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .brokers.models import (
     AssetType, CancelOrder, MutationResult, MutationStatus, OcoOrderIntent, OrderInstruction,
-    OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent, StopLossIntent, SubmitOrder, TimeInForce,
+    OrderLegIntent, OrderType, PreviewOrderQuery, ReplaceOrder, SimpleOrderIntent,
+    StopLossIntent, SubmitOrder, TimeInForce,
     TrailingOrderIntent, TrailingStopSpec,
 )
 from .brokers.schwab_adapter import SchwabAdapter
@@ -63,14 +64,6 @@ def _dec(v) -> Decimal | None:
     except Exception:
         return None
     return d if d.is_finite() else None
-
-
-def _mask_account(obj):
-    if isinstance(obj, dict):
-        return {k: ("***" if k == "accountNumber" else _mask_account(v)) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_mask_account(v) for v in obj]
-    return obj
 
 
 OPENING_INSTRUCTIONS = {"SELL_SHORT", "BUY_TO_OPEN", "SELL_TO_OPEN"}
@@ -532,6 +525,24 @@ class Trader:
                                None if result.accepted else (result.message or "")[:300])
         return result
 
+    def _broker_query(self, endpoint: str, query):
+        """Read one canonical result through the selected Schwab adapter and log it."""
+        started = now_iso()
+        if self.on_request:
+            self.on_request(None)
+        try:
+            result = SchwabAdapter(self._ensure(), self._hash).query(query)
+        except Exception as exc:
+            self.store.log_request(endpoint, started, False, None, repr(exc)[:300])
+            raise
+        accepted = result.accepted if isinstance(query, PreviewOrderQuery) else True
+        if isinstance(query, PreviewOrderQuery) and result.message and "rate limited" in result.message:
+            if self.on_request:
+                self.on_request(f"{result.retry_after_seconds:g}" if result.retry_after_seconds is not None else "30")
+        self.store.log_request(endpoint, started, accepted, None,
+                               None if accepted else (result.message or "")[:300])
+        return result
+
     def quote(self, symbol: str, max_age: float = 1.0) -> dict:
         sym = symbol.upper().strip()
         hit = self._quote_cache.get(sym)
@@ -645,9 +656,11 @@ class Trader:
         order = bracket_order(p)
         out["order"] = order
         try:
-            r = self._logged("preview_order", lambda: self._ensure().preview_order(self._hash, order))
-            body = r.json() if r.content and "json" in r.headers.get("Content-Type", "") else r.text[:2000]
-            out["schwab_preview"] = {"http": r.status_code, "body": _mask_account(body)}
+            result = self._broker_query("preview_order", PreviewOrderQuery(bracket_intent(p, "preview")))
+            out["schwab_preview"] = {"ok": result.accepted, "rejected": result.rejected,
+                                     "message": result.message,
+                                     "balance": {key: float(value) if value is not None else None
+                                                 for key, value in result.balance.items()}}
         except Exception as e:
             out["schwab_preview"] = {"error": repr(e)[:300]}
         return out
@@ -803,11 +816,11 @@ class Trader:
         canonical = bracket_intent(p, ticket_id)
         if p.option and p.trail:
             # Schwab does not document trailing stops on options: its preview decides first.
-            refused = self._preview_refusal(self._ensure(), order)
-            if refused:
-                rejected, why = refused
-                head = (f"Schwab does not accept a trailing stop on this option: {why}" if rejected else
-                        f"Schwab's preview did not confirm the trailing stop ({why})")
+            preview = self._broker_query("preview_order", PreviewOrderQuery(canonical))
+            if not preview.accepted:
+                head = (f"Schwab does not accept a trailing stop on this option: {preview.message}"
+                        if preview.rejected else
+                        f"Schwab's preview did not confirm the trailing stop ({preview.message})")
                 return {"ok": False, "error": head.rstrip(".") + ". Nothing was sent: use a fixed stop or Auto B/E.",
                         "plan": now.as_dict()}
         intent = {"ticket_id": ticket_id, "symbol": p.symbol, "side": p.side, "qty": p.qty,
@@ -2751,51 +2764,6 @@ class Trader:
             q = sum(float(e.get("quantity") or 0) for e in legs)
             avg = sum(float(e["price"]) * float(e["quantity"]) for e in legs) / q if q else None
             return filled, avg
-        return None
-
-    def _preview_refusal(self, client, order: dict) -> tuple[bool, str] | None:
-        """Ask Schwab's order preview about `order`. None = Schwab would accept it; otherwise
-        (rejected, reason): rejected=True when Schwab said no, False when the preview gave no clear
-        answer (no reply, a rate limit, a server error, an unreadable body). Either way nothing is
-        sent: when unsure, refuse."""
-        return self._preview_answer(client, order)[0]
-
-    def _preview_answer(self, client, order: dict) -> tuple[tuple[bool, str] | None, dict | None]:
-        """One previewOrder call: (refusal as in _preview_refusal, the preview body when Schwab
-        accepted the order, else None)."""
-        try:
-            r = self._logged("preview_order", lambda: client.preview_order(self._hash, order))
-        except Exception as e:
-            return (False, f"no answer: {type(e).__name__}"), None
-        refused = self._read_preview(r)
-        return refused, (r.json() if refused is None else None)
-
-    @staticmethod
-    def _read_preview(r) -> tuple[bool, str] | None:
-        if isinstance(r, _Throttled) or r.status_code == 429:
-            return False, "rate limit; try again in a few seconds"
-        if 400 <= r.status_code < 500:
-            return True, f"HTTP {r.status_code} {r.text[:200]}".strip()
-        if r.status_code not in (200, 201):
-            return False, f"HTTP {r.status_code}"
-        try:
-            body = r.json() or {}
-        except Exception:
-            return False, "its answer could not be read"
-        # Only a body shaped like Schwab's preview counts as an answer: {}, null, a list or an
-        # unrelated object is unclear, never "no rejects".
-        if not isinstance(body, dict):
-            return False, "its answer was not a preview"
-        result = body.get("orderValidationResult")
-        if not isinstance(result, dict) and not isinstance(body.get("orderStrategy"), dict):
-            return False, "its answer was not a preview"
-        rejects = result.get("rejects", []) if isinstance(result, dict) else []
-        if not isinstance(rejects, list):         # "rejects": null or a string is unreadable, not "none"
-            return False, "its answer could not be read"
-        if rejects:
-            msgs = [str(x.get("message") or x.get("activityMessage") or x.get("validationRuleName") or "")
-                    for x in rejects if isinstance(x, dict)]
-            return True, "; ".join(m for m in msgs if m)[:300] or "the preview lists a rejection"
         return None
 
     def resolve(self, ticket_id: str) -> None:
