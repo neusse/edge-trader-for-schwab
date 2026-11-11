@@ -6,12 +6,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from companion.brokers.models import (
-    AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot,
+    AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerOrder,
     MutationResult, MutationStatus, OptionChain, OptionChainQuery,
-    OptionContract, OptionType, OrderInstruction, OrderType, OrdersQuery,
-    Quote, TimeInForce,
+    OptionContract, OptionType, OrderClass, OrderGroup, OrderInstruction,
+    OrderLeg, OrderRole, OrderStatus, OrderType, OrdersQuery,
+    Position, PositionSide, Quote, QuotesQuery, TimeInForce,
 )
-from companion.brokers.paper_vertical import vertical_entry_plan
+from companion.brokers.paper_vertical import vertical_close_plan, vertical_entry_plan
 from companion.brokers.alpaca_orders import build_order_request
 
 NOW = datetime(2026, 11, 11, 17, tzinfo=timezone.utc)
@@ -42,6 +43,19 @@ def _account(level=3, power="10000"):
     return AccountSnapshot("paper-account", "ACTIVE",
                            BalanceSnapshot(options_buying_power=D(power)), (),
                            options_trading_level=level, options_approved_level=3)
+
+
+def _held_account(long_strike=100, short_strike=105, kind="call", quantity="2"):
+    body = _body(long_strike, short_strike, kind)
+    positions = (Position(body["long_contract"], AssetType.OPTION, PositionSide.LONG,
+                          D(quantity), D("2")),
+                 Position(body["short_contract"], AssetType.OPTION, PositionSide.SHORT,
+                          D(quantity), D("1")))
+    return AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), positions)
+
+
+def _quotes(kind=OptionType.CALL):
+    return {contract.symbol: contract.quote for contract in _chain(kind).contracts}
 
 
 def test_vertical_entry_plans_atomic_debit_and_credit_call_spreads():
@@ -79,6 +93,25 @@ def test_vertical_entry_rejects_wrong_sign_level_and_collateral():
         vertical_entry_plan(_body(100, 100), _account(), _chain(), NOW)
 
 
+def test_vertical_close_uses_opposite_intents_and_exact_held_quantity():
+    plan = vertical_close_plan(_body(net="-1.30"), _held_account(), _quotes(), NOW)
+    assert plan.limit_price == D("-1.30") and plan.time_in_force == TimeInForce.DAY
+    assert [leg.instruction for leg in plan.legs] == [OrderInstruction.SELL_TO_CLOSE,
+                                                     OrderInstruction.BUY_TO_CLOSE]
+    assert [leg.quantity for leg in plan.legs] == [D(2), D(2)]
+    credit = vertical_close_plan(_body(105, 100, net="1.30"),
+                                 _held_account(105, 100), _quotes(), NOW)
+    assert credit.limit_price == D("1.30")
+    with pytest.raises(ValueError, match="credit or debit"):
+        vertical_close_plan(_body(net="1.30"), _held_account(), _quotes(), NOW)
+    with pytest.raises(ValueError, match="equal whole"):
+        unequal = _held_account()
+        positions = (unequal.positions[0], Position(unequal.positions[1].symbol,
+                     AssetType.OPTION, PositionSide.SHORT, D(1), D(1)))
+        vertical_close_plan(_body(net="-1.30"), AccountSnapshot(
+            "paper-account", "ACTIVE", BalanceSnapshot(), positions), _quotes(), NOW)
+
+
 def test_vertical_entry_route_sends_one_mleg_and_rechecks_account(monkeypatch):
     import companion.app as appmod
 
@@ -111,3 +144,47 @@ def test_vertical_entry_route_sends_one_mleg_and_rechecks_account(monkeypatch):
     account = _account(power="100")
     rejected = client.post("/api/paper/vertical/entry/submit", json=_body(), headers=headers)
     assert not rejected.json()["ok"] and len(commands) == 1
+
+
+def test_vertical_close_route_rechecks_exact_pair_and_one_mleg(monkeypatch):
+    import companion.app as appmod
+
+    account = _held_account()
+    groups = ()
+    commands = []
+    def query(value):
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return groups
+        if isinstance(value, QuotesQuery): return _quotes()
+        raise AssertionError(type(value))
+    def execute(command, request_id, preflight):
+        preflight(account)
+        commands.append(command)
+        return MutationResult(MutationStatus.ACCEPTED, "paper-vertical-close")
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query),
+                              account_ref="paper-account", execute=execute)
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    monkeypatch.setattr("companion.brokers.paper_vertical.datetime", SimpleNamespace(
+        now=lambda _tz: NOW))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    body = _body(net="-1.30")
+    preview = client.post("/api/paper/vertical/close/preview", json=body, headers=headers)
+    assert preview.json()["ok"], preview.json()
+    assert preview.json()["quantity"] == "2"
+    sent = client.post("/api/paper/vertical/close/submit", json=body, headers=headers)
+    assert sent.json()["ok"] and len(commands) == 1
+    assert [leg.instruction for leg in commands[0].intent.legs] == [
+        OrderInstruction.SELL_TO_CLOSE, OrderInstruction.BUY_TO_CLOSE]
+    account = _held_account(quantity="1")
+    later = client.post("/api/paper/vertical/close/preview", json=body, headers=headers)
+    assert later.json()["ok"] and later.json()["quantity"] == "1"
+    pending = BrokerOrder("active", OrderStatus.PARTIALLY_FILLED, OrderType.LIMIT,
+                          TimeInForce.DAY,
+                          (OrderLeg(body["long_contract"], AssetType.OPTION,
+                                    OrderInstruction.SELL_TO_CLOSE, D(2), D(1)),),
+                          OrderRole.EXIT)
+    groups = (OrderGroup("active", OrderClass.MULTI_LEG,
+                         OrderStatus.PARTIALLY_FILLED, (pending,)),)
+    blocked = client.post("/api/paper/vertical/close/preview", json=body, headers=headers)
+    assert not blocked.json()["ok"] and "active order" in blocked.json()["error"]

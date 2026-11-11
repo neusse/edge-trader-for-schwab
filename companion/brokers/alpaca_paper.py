@@ -99,7 +99,7 @@ def _order_group(raw) -> OrderGroup:
     def add(member, role: OrderRole, parent_id: str | None = None) -> None:
         if group_class == OrderClass.MULTI_LEG and member is raw:
             legs = tuple(leg for child in raw.legs or ()
-                         if (leg := leg_from(child, OrderRole.ENTRY)) is not None)
+                         if (leg := leg_from(child, role)) is not None)
         else:
             leg = leg_from(member, role)
             legs = (leg,) if leg else ()
@@ -125,7 +125,8 @@ def _order_group(raw) -> OrderGroup:
         OrderRole.STOP if (_enum_value(raw.type or raw.order_type) == "trailing_stop" and
                            str(raw.client_order_id or "").startswith("et-trail-")) else
         OrderRole.EXIT if (_enum_value(raw.position_intent) in ("buy_to_close", "sell_to_close") or
-                           str(raw.client_order_id or "").startswith(("et-close-", "et-opt-close-")))
+                           str(raw.client_order_id or "").startswith(("et-close-", "et-opt-close-",
+                                                                          "et-vertical-close-")))
         else OrderRole.ENTRY)
     add(raw, root_role)
     return OrderGroup(group_id=group_id, order_class=group_class,

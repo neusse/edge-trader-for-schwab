@@ -413,6 +413,15 @@
     <button class="btn" type="submit" id="paper-vertical-submit" disabled>Review vertical order</button>
   </form>
   <p id="paper-vertical-msg" class="mut" role="status">Load one option chain, then select two strikes.</p>
+  <h3>Close held Paper vertical</h3>
+  <p class="mut">Choose the exact held long and short legs. A reviewed limit closes both in one multi-leg order. Active orders or unequal leg quantities block it; there is no automatic retry.</p>
+  <form id="paper-vertical-close-form" class="paper-fields">
+    <label>Held long leg<select class="in" name="long_contract" required><option value="">No held long options</option></select></label>
+    <label>Held short leg<select class="in" name="short_contract" required><option value="">No held short options</option></select></label>
+    <label>Signed net close limit / share<input class="in" name="net_price" type="number" step="0.01" required placeholder="- credit / + debit"></label>
+    <button class="btn" type="submit" id="paper-vertical-close-submit" disabled>Review vertical close</button>
+  </form>
+  <p id="paper-vertical-close-msg" class="mut" role="status">Choose two held legs during a fresh Paper session.</p>
 </section>
 <div class="stats">
   <div class="stat"><div class="k" id="k-real-l">Realized today · net</div><div class="v" id="k-real">-</div><div class="s" id="k-real-s"></div></div>
@@ -1354,6 +1363,13 @@ function render(st) {
     paperOptionCancelSentIds.clear();
     paperOptionExitSentKeys.clear();
     paperVerticalSentKeys.clear();
+    paperVerticalCloseSentKeys.clear();
+    for (const name of ["long_contract", "short_contract"]) {
+      const select = $("paper-vertical-close-form").elements[name];
+      select.innerHTML = '<option value="">No held options</option>';
+      select.dataset.signature = "";
+    }
+    $("paper-vertical-close-form").elements.net_price.value = "";
     TV.pos = null; TV.closed = null; TV.flat = {}; TV.said = {};
     if ("speechSynthesis" in window) speechSynthesis.cancel();
   }
@@ -1499,6 +1515,7 @@ const paperOptionCloseSentKeys = new Set();
 const paperOptionCancelSentIds = new Set();
 const paperOptionExitSentKeys = new Set();
 const paperVerticalSentKeys = new Set();
+const paperVerticalCloseSentKeys = new Set();
 const paperOptionsForm = $("paper-options-form");
 const paperExpirySelect = paperOptionsForm.elements.expiration;
 function resetPaperOptionSelection() {
@@ -1735,6 +1752,89 @@ $("paper-vertical-entry-form").addEventListener("submit", async e => {
     }
   } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
 });
+function renderVerticalCloseControls(st) {
+  const form = $("paper-vertical-close-form"), positions = st.positions || [];
+  for (const [name, side] of [["long_contract", "LONG"], ["short_contract", "SHORT"]]) {
+    const select = form.elements[name];
+    const held = positions.filter(p => p.asset_type === "OPTION" && p.side === side);
+    const signature = JSON.stringify(held.map(p => [p.symbol, p.qty]));
+    if (select.dataset.signature !== signature) {
+      const previous = select.value;
+      select.innerHTML = '<option value="">Choose held leg</option>' + held.map(p =>
+        `<option value="${esc(p.symbol)}">${esc(p.symbol)} · ${esc(p.qty)}</option>`).join("");
+      if (held.some(p => p.symbol === previous)) select.value = previous;
+      select.dataset.signature = signature;
+    }
+  }
+  const long = positions.find(p => p.symbol === form.elements.long_contract.value && p.side === "LONG");
+  const short = positions.find(p => p.symbol === form.elements.short_contract.value && p.side === "SHORT");
+  const terms = symbol => symbol?.replaceAll(" ", "").match(/^([A-Z0-9.]{1,6}\d{6}[CP])\d{8}$/)?.[1];
+  const pair = long && short && terms(long.symbol) && terms(long.symbol) === terms(short.symbol) &&
+    Number(long.qty) === Number(short.qty) && Number(long.qty) > 0;
+  $("paper-vertical-close-submit").disabled = !pair || long.quote_stale || short.quote_stale ||
+    st?.broker?.key !== "alpaca-paper" || !st.broker.workflows?.includes("vertical-close") ||
+    !paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy ||
+    paperOutcome === "unknown" || (st.orders || []).some(o =>
+      o.symbol === long.symbol || o.symbol === short.symbol);
+}
+$("paper-vertical-close-form").addEventListener("change", e => {
+  if (["long_contract", "short_contract"].includes(e.target.name)) {
+    const form = e.currentTarget, positions = lastState?.positions || [];
+    const long = positions.find(p => p.symbol === form.elements.long_contract.value);
+    const short = positions.find(p => p.symbol === form.elements.short_contract.value);
+    const net = long?.quote?.bid != null && short?.quote?.ask != null ?
+      Number(short.quote.ask) - Number(long.quote.bid) : NaN;
+    form.elements.net_price.value = Number.isFinite(net) && net !== 0 ? net.toFixed(2) : "";
+  }
+  renderVerticalCloseControls(lastState);
+});
+$("paper-vertical-close-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  if ($("paper-vertical-close-submit").disabled) return;
+  const form = new FormData(e.currentTarget);
+  const payload = {long_contract:form.get("long_contract"),
+    short_contract:form.get("short_contract"), net_price:form.get("net_price"),
+    request_id:crypto.randomUUID()};
+  const key = JSON.stringify([payload.long_contract,payload.short_contract,payload.net_price]);
+  const message = $("paper-vertical-close-msg");
+  if (paperVerticalCloseSentKeys.has(key)) {
+    message.textContent = "This exact vertical close was already sent. Verify broker status first."; return;
+  }
+  if (!Number.isFinite(Number(payload.net_price)) || Number(payload.net_price) === 0) {
+    message.textContent = "Enter a nonzero signed net close limit."; return;
+  }
+  paperBusy = true; paperRequestId = payload.request_id; paperCommand = "SubmitOrder";
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const preview = await post("/api/paper/vertical/close/preview", payload, 45000);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Vertical close preview refused");
+    if (!window.confirm(`Close all ${preview.quantity} held verticals: sell ${preview.long_contract}, buy ${preview.short_contract} at signed net ${preview.net_price} per share? ` +
+        `Indicative close cost ${preview.indicative_close_cost}. ${preview.protection}`)) {
+      message.textContent = "Paper vertical close review canceled."; return;
+    }
+    message.textContent = "Sending one Paper multi-leg close…";
+    sent = true;
+    const result = await post("/api/paper/vertical/close/submit", payload, 45000);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown"; paperVerticalCloseSentKeys.add(key);
+      message.textContent = result.message || "Vertical close outcome unknown. Reconcile before another action.";
+    } else {
+      paperRequestId = null; paperOutcome = null;
+      if (result.ok) paperVerticalCloseSentKeys.add(key);
+      message.textContent = result.ok ? `Alpaca Paper accepted vertical close ${result.order_id}. Verify both leg fills and remaining positions.` :
+        result.message || result.error || result.detail || "Vertical close refused";
+    }
+  } catch (err) {
+    if (sent) {
+      paperOutcome = "unknown"; paperVerticalCloseSentKeys.add(key);
+      message.textContent = `Vertical close may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`;
+    } else {
+      paperRequestId = null;
+      message.textContent = String(err.message || err);
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
 let paperArmed = false, paperRequestId = null, paperIntentKey = null, paperOutcome = null, paperBusy = false;
 let paperCommand = "SubmitOrder";
 const paperForm = $("paper-form");
@@ -1757,6 +1857,7 @@ function renderPaperControls(st) {
   $("paper-reconcile").style.display = paperOutcome === "unknown" ? "" : "none";
   renderOptionEntryControls(st);
   renderVerticalEntryControls(st);
+  renderVerticalCloseControls(st);
 }
 async function refreshPaperStatus() {
   if (lastState?.broker?.key !== "alpaca-paper") return;
