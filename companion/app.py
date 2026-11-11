@@ -29,7 +29,7 @@ from . import __version__
 from .brokers.capabilities import BROKERS
 from .brokers.configuration import BrokerSelection
 from .brokers.bootstrap import AlpacaBootstrapPoller
-from .brokers.models import (AccountQuery, AssetType, BracketOrderIntent, CancelOrder,
+from .brokers.models import (AccountQuery, AssetType, BracketOrderIntent, BrokerCapability, CancelOrder,
                              OrderClass, OrderInstruction, OrderQuery, OrderRole,
                              OrderStatus, OrderType, OrdersQuery, QuotesQuery, ReplaceOrder,
                              SubmitOrder)
@@ -80,29 +80,33 @@ POLLERS = {"demo": DemoPoller, "schwab": Poller, "alpaca-paper": AlpacaBootstrap
 BROKER_ACTION_LOCK = threading.RLock()
 BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
-    "schwab": ("schwab-ticket", "schwab-spreads"),
+    "schwab": ("schwab-ticket",),
     "alpaca-paper": ("equity-bracket", "equity-simple", "equity-oco", "equity-close", "equity-partial",
-                     "equity-oco-adjust", "equity-auto-be", "equity-add", "equity-trailing",
-                     "option-long-entry", "option-close", "option-cancel",
-                     "option-fixed-exit", "option-covered-short", "vertical-entry",
-                     "vertical-close", "vertical-target", "vertical-cancel",
-                     "vertical-target-reprice", "vertical-stop"),
+                     "equity-oco-adjust", "equity-auto-be", "equity-add", "equity-trailing"),
     "demo": (),
 }
 BROKER_HELP = {
-    "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A filled app-created bracket or existing OCO can opt into app-watched Auto B/E with fresh IEX quotes. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order; an exact held vertical can be closed or given one broker-held target. Held options can be closed or given one fixed stop, stop-limit, or target. Spread stops are app-watched and require fresh OPRA option quotes; the indicative feed never triggers one.",
+    "schwab": "Schwab equity ticket and position management are available when account data is fresh. Option trading is disabled.",
+    "alpaca-paper": "Paper equity orders and held-position management are available. A filled app-created bracket or existing OCO can opt into app-watched Auto B/E with fresh IEX quotes. Option trading is disabled.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
 
+OPTIONS_TRADING_ENABLED = False  # Product authorization: equities only on both brokers.
+
+
 def broker_info(key: str) -> dict:
     broker = BROKERS[key]
-    workflows = tuple(workflow for workflow in APP_WORKFLOWS[key]
-                      if workflow != "schwab-spreads" or globals().get("_feature_routes"))
+    workflows = APP_WORKFLOWS[key]
+    disabled = {BrokerCapability.OPTION_TRADING, BrokerCapability.MULTI_LEG_OPTIONS,
+                BrokerCapability.OPTION_BRACKET, BrokerCapability.OPTION_OCO,
+                BrokerCapability.OPTION_TRAILING_STOP, BrokerCapability.OPTION_STOP}
+    supported = broker.capabilities.supported - disabled
+    unsupported = {c.value: reason for c, reason in broker.capabilities.unsupported.items()}
+    unsupported.update({c.value: "Option trading is disabled in this app." for c in disabled})
     return {"key": broker.key, "name": broker.display_name, "mode": broker.mode.value,
-            "capabilities": sorted(c.value for c in broker.capabilities.supported),
-            "unsupported": {c.value: reason for c, reason in broker.capabilities.unsupported.items()},
+            "capabilities": sorted(c.value for c in supported),
+            "unsupported": unsupported,
             "workflows": workflows, "help": BROKER_HELP[key]}
 
 
@@ -118,6 +122,7 @@ def make_poller(broker_key: str):
 
 poller = make_poller(BROKER_KEY)
 trader = Trader(poller.store)
+trader.options_trading_enabled = False
 poller.trader = trader
 trader.on_request = poller.note_external_request
 trader.cooldown_left = poller.cooldown_left
@@ -148,6 +153,18 @@ async def only_local_host(request: Request, call_next):
     header: refuse it, so no other site can read positions or balances."""
     if request.headers.get("host") not in HOSTS:
         return JSONResponse({"error": "unexpected host"}, status_code=403)
+    path = request.url.path
+    if not OPTIONS_TRADING_ENABLED and path.startswith(("/api/paper/options/", "/api/paper/vertical/", "/api/spread/")):
+        return JSONResponse({"ok": False, "error": "Option trading is disabled for both brokers."}, status_code=403)
+    if not OPTIONS_TRADING_ENABLED and request.method == "POST" and path.startswith(("/api/ticket/", "/api/position/")):
+        if path in ("/api/ticket/preview", "/api/ticket/submit") or path.startswith("/api/position/"):
+            try:
+                payload = await request.json()
+            except (ValueError, UnicodeDecodeError):
+                payload = {}
+            if isinstance(payload, dict) and (str(payload.get("asset") or payload.get("asset_type") or "").upper() == "OPTION" or
+                                              OCC_RE.fullmatch(str(payload.get("symbol") or "").upper().strip())):
+                return JSONResponse({"ok": False, "error": "Option trading is disabled for both brokers."}, status_code=403)
     broker_mutation = request.url.path.startswith(
         ("/api/ticket/", "/api/position/", "/api/spread/", "/api/paper/"))
     if (request.method == "POST" and broker_mutation and not DEMO_OVERRIDE and
@@ -303,6 +320,7 @@ def _switch_broker(key: str) -> None:
             old_poller.store.close()
         next_poller = make_poller(key)
         next_trader = Trader(next_poller.store)
+        next_trader.options_trading_enabled = False
         next_poller.trader = next_trader
         next_trader.on_request = next_poller.note_external_request
         next_trader.cooldown_left = next_poller.cooldown_left
@@ -2386,7 +2404,7 @@ except ImportError:
     _feature_routes = None
 FEATURES = (_journal_routes.register(app, poller.store, _guard, demo=DEMO) if _journal_routes else []) + (
     _feature_routes.register(app, trader, poller, _guard, demo=DEMO,
-                             action_lock=BROKER_ACTION_LOCK) if _feature_routes else [])
+                             action_lock=BROKER_ACTION_LOCK) if _feature_routes and OPTIONS_TRADING_ENABLED else [])
 
 
 @app.post("/api/position/resolve_close")

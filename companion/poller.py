@@ -502,6 +502,8 @@ class Poller:
                 and self._orders_fresh() and market_open())
         now = datetime.now(timezone.utc)
         for p in st.get("positions") or []:
+            if p.get("asset_type") == "OPTION" and not getattr(self.trader, "options_trading_enabled", True):
+                continue
             r = p.get("r")
             ab = self.trader.store.auto_be(r["ticket_id"]) if r else None
             if not ab:

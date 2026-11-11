@@ -5,6 +5,12 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+
+@pytest.fixture(autouse=True)
+def exercise_dormant_option_routes(monkeypatch):
+    import companion.app as appmod
+    monkeypatch.setattr(appmod, "OPTIONS_TRADING_ENABLED", True)
+
 from companion.brokers.models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerOrder,
     CancelOrder,

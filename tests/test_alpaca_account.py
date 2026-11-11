@@ -147,6 +147,26 @@ def test_oco_root_without_group_role_is_still_a_target():
     assert [order.role for order in group.orders] == [OrderRole.TARGET, OrderRole.STOP]
 
 
+def test_bracket_children_without_group_role_keep_stop_and_target():
+    from alpaca.trading.models import Order
+    from companion.brokers.alpaca_paper import _order_group
+
+    def raw(order_id, order_type, price=None, stop=None, legs=None):
+        return Order.model_construct(
+            id=order_id, group_id="bracket-id", order_class="bracket", group_role=None,
+            status="new", type=order_type, time_in_force="gtc", legs=legs or [],
+            symbol="AAPL", asset_class="us_equity", qty="2", filled_qty="0",
+            side="sell" if order_id != "entry" else "buy", position_intent=None,
+            limit_price=price, stop_price=stop, trail_price=None, trail_percent=None,
+            submitted_at=None, updated_at=None, client_order_id=order_id)
+
+    target = raw("target", "limit", price="110")
+    stop = raw("stop", "stop", stop="95")
+    entry = raw("entry", "market", legs=[target, stop])
+    assert [order.role for order in _order_group(entry).orders] == [
+        OrderRole.ENTRY, OrderRole.TARGET, OrderRole.STOP]
+
+
 def test_owned_paper_trailing_stop_counts_as_broker_held_coverage():
     from alpaca.trading.models import Order
     from companion.brokers.alpaca_paper import _order_group
@@ -336,18 +356,14 @@ def test_broker_selection_replaces_runtime_and_clears_cached_state(monkeypatch, 
     new.store.close()
 
 
-def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
+def test_broker_metadata_reports_equities_only_product_scope():
     from companion.app import broker_info
 
     paper = broker_info("alpaca-paper")
-    assert "option-trading" in paper["capabilities"]
+    assert "option-trading" not in paper["capabilities"]
     assert paper["workflows"] == ("equity-bracket", "equity-simple", "equity-oco", "equity-close", "equity-partial",
-                                  "equity-oco-adjust", "equity-auto-be", "equity-add", "equity-trailing",
-                                  "option-long-entry", "option-close", "option-cancel",
-                                  "option-fixed-exit", "option-covered-short", "vertical-entry",
-                                  "vertical-close", "vertical-target", "vertical-cancel",
-                                  "vertical-target-reprice", "vertical-stop")
-    assert "option-bracket" in paper["unsupported"]
+                                  "equity-oco-adjust", "equity-auto-be", "equity-add", "equity-trailing")
+    assert "option-trading" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")
     assert demo["workflows"] == ()

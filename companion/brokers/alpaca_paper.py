@@ -116,7 +116,12 @@ def _order_group(raw) -> OrderGroup:
             ))
         for child in () if group_class == OrderClass.MULTI_LEG else member.legs or ():
             child_role = {"take_profit": OrderRole.TARGET, "stop_loss": OrderRole.STOP,
-                          "entry": OrderRole.ENTRY}.get(_enum_value(child.group_role), OrderRole.EXIT)
+                          "entry": OrderRole.ENTRY}.get(_enum_value(child.group_role))
+            if child_role is None and group_class in (OrderClass.BRACKET, OrderClass.OCO):
+                child_type = _enum_value(child.type or child.order_type)
+                child_role = (OrderRole.STOP if child_type in ("stop", "stop_limit", "trailing_stop")
+                              else OrderRole.TARGET if child_type == "limit" else OrderRole.EXIT)
+            child_role = child_role or OrderRole.EXIT
             add(child, child_role, str(member.id))
 
     root_role = {"take_profit": OrderRole.TARGET, "stop_loss": OrderRole.STOP}.get(
