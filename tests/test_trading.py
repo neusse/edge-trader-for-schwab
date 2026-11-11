@@ -294,8 +294,8 @@ class JsonResp(Resp):
 
 def _entry(status="WORKING", filled=0, effect="OPENING", instr="SELL_SHORT", strategy="TRIGGER"):
     return {"orderId": 9, "orderStrategyType": strategy, "status": status, "filledQuantity": filled,
-            "orderLegCollection": [{"instruction": instr, "positionEffect": effect,
-                                    "instrument": {"symbol": "MXR"}}]}
+            "orderLegCollection": [{"instruction": instr, "positionEffect": effect, "quantity": 70,
+                                    "instrument": {"symbol": "MXR", "assetType": "EQUITY"}}]}
 
 
 def test_unfilled_entry_rules():
@@ -377,6 +377,31 @@ def test_missing_fill_count_or_live_children_refuse():
     assert trading.unfilled_entry(waiting)[0]      # a normal unfilled bracket stays cancellable
 
 
+def test_canonical_cancel_read_keeps_missing_fills_and_live_children_unsafe():
+    from companion.brokers.schwab_adapter import normalize_order
+    from companion.orders import cancellable_unfilled_entry
+
+    missing = _entry()
+    del missing["filledQuantity"]
+    assert not cancellable_unfilled_entry(normalize_order(missing))[0]
+    child = {"orderId": 11, "orderType": "STOP", "status": "WORKING", "stopPrice": "900.00",
+             "orderLegCollection": [{"instruction": "BUY_TO_COVER", "quantity": 70,
+                                     "instrument": {"symbol": "MXR", "assetType": "EQUITY"}}]}
+    linked = {**_entry(), "childOrderStrategies": [
+        {"orderStrategyType": "OCO", "childOrderStrategies": [child]}]}
+    assert not cancellable_unfilled_entry(normalize_order(linked))[0]
+    unreadable = {**linked, "childOrderStrategies": [
+        {"orderStrategyType": "OCO", "childOrderStrategies": [
+            {"orderId": 11, "orderType": "STOP", "status": "WORKING"}]}]}
+    safe, reason = cancellable_unfilled_entry(normalize_order(unreadable))
+    assert not safe and "could not be read" in reason
+    unknown_strategy = {**_entry(), "orderStrategyType": "UNKNOWN"}
+    assert not cancellable_unfilled_entry(normalize_order(unknown_strategy))[0]
+    waiting = {**linked, "childOrderStrategies": [
+        {"orderStrategyType": "OCO", "childOrderStrategies": [{**child, "status": "AWAITING_PARENT_ORDER"}]}]}
+    assert cancellable_unfilled_entry(normalize_order(waiting))[0]
+
+
 def test_pending_cancel_is_not_reported_as_done(trader, monkeypatch):
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
     trader._client = CancelClient([_entry()] + [{**_entry(), "status": "PENDING_CANCEL"}] * 10)
@@ -387,7 +412,10 @@ def test_pending_cancel_is_not_reported_as_done(trader, monkeypatch):
 def test_fill_racing_the_cancel_reports_stop_state(trader, monkeypatch):
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
     raced = {**_entry(), "status": "CANCELED", "filledQuantity": 20, "childOrderStrategies": [
-        {"orderStrategyType": "OCO", "childOrderStrategies": [{"orderType": "STOP", "status": "CANCELED"}]}]}
+        {"orderStrategyType": "OCO", "childOrderStrategies": [{
+            "orderId": 11, "orderType": "STOP", "status": "CANCELED", "stopPrice": "900.00",
+            "orderLegCollection": [{"instruction": "BUY_TO_COVER", "quantity": 70,
+                                    "instrument": {"symbol": "MXR", "assetType": "EQUITY"}}]}]}]}
     trader._client = CancelClient([_entry(), raced])
     r = trader.cancel_entry(9)
     assert not r["ok"] and "NO LIVE STOP" in r["error"]

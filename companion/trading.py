@@ -27,12 +27,12 @@ from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_intent, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .brokers.models import (
     AssetType, CancelOrder, MutationResult, MutationStatus, OcoOrderIntent, OrderInstruction,
-    OrderLegIntent, OrderType, PreviewOrderQuery, ReplaceOrder, SimpleOrderIntent,
+    OrderLegIntent, OrderQuery, OrderRole, OrderType, PreviewOrderQuery, ReplaceOrder, SimpleOrderIntent,
     StopLossIntent, SubmitOrder, TimeInForce,
     TrailingOrderIntent, TrailingStopSpec,
 )
 from .brokers.schwab_adapter import SchwabAdapter
-from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
+from .orders import LIVE, TERMINAL, PendingOrder, cancellable_unfilled_entry, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
 
@@ -880,16 +880,18 @@ class Trader:
             self._send_lock.release()
 
     def _cancel_locked(self, order_id: int) -> dict:
-        client = self._ensure()
-        r = self._logged("order_details", lambda: client.order_details(self._hash, order_id))
-        if r.status_code != 200:
-            return {"ok": False, "order_id": order_id, "error": f"Could not read the order (HTTP {r.status_code})."}
-        o = r.json()
-        sym = _symbol(o)
-        gate = self._spread_gate(_all_symbols(o), order_id=order_id, symbol=sym)
+        try:
+            group = self._broker_query("order_details", OrderQuery(str(order_id)))
+        except Exception:
+            return {"ok": False, "order_id": order_id, "error": "Could not read the order."}
+        root = next((order for order in group.orders if order.parent_id is None and
+                     order.order_id == group.group_id), None)
+        symbols = {leg.symbol for order in group.orders for leg in order.legs}
+        sym = root.legs[0].symbol if root and root.legs else next(iter(symbols), None)
+        gate = self._spread_gate(symbols, order_id=order_id, symbol=sym)
         if gate:
             return gate
-        ok, why = unfilled_entry(o)
+        ok, why = cancellable_unfilled_entry(group)
         if not ok:
             self.store.log_action("cancel_entry", sym, order_id, "REFUSED", why)
             return {"ok": False, "order_id": order_id, "symbol": sym, "error": f"Not cancelled: {why}."}
@@ -912,24 +914,25 @@ class Trader:
             return {"ok": False, "order_id": order_id, "symbol": sym,
                     "error": "Schwab refused the cancel. It may have filled: check positions."}
         # Confirm: only CANCELED with zero fills counts as done. Up to ~3 s of read-only checks.
-        status, filled, final = "UNCONFIRMED", None, {}
+        status, filled, final = "UNCONFIRMED", None, None
         for _ in range(10):
             time.sleep(0.25)
-            after = self._logged("order_details", lambda: client.order_details(self._hash, order_id))
-            if after.status_code != 200:
+            try:
+                final = self._broker_query("order_details", OrderQuery(str(order_id)))
+            except Exception:
                 continue
-            final = after.json()
-            status = final.get("status", "UNCONFIRMED")
-            fq = final.get("filledQuantity")
-            filled = float(fq) if isinstance(fq, (int, float)) else None
+            current = next((order for order in final.orders if order.parent_id is None and
+                            order.order_id == final.group_id), None)
+            status = (current.status_detail or current.status.value.upper().replace("-", "_")) if current else "UNCONFIRMED"
+            fq = current.reported_filled_quantity if current else None
+            filled = float(fq) if fq is not None else None
             if status in ("CANCELED", "FILLED", "REJECTED", "EXPIRED") or (filled or 0) > 0:
                 break
         self.store.log_action("cancel_entry", sym, order_id, status, f"filled {filled}")
         if (filled or 0) > 0:
             # A fill beat the cancel. Say whether the filled shares still have a live stop.
-            stops = [k for oco in final.get("childOrderStrategies") or []
-                     for k in oco.get("childOrderStrategies") or [] if k.get("orderType") == "STOP"]
-            live_stop = any(k.get("status") in LIVE for k in stops)
+            stops = [order for order in final.orders if order.role == OrderRole.STOP]
+            live_stop = any(order.status_detail in LIVE for order in stops)
             what = ("Its stop is live." if live_stop else
                     "NO LIVE STOP on those shares: fix it in thinkorswim now." if stops else
                     "It had no attached stop: check the position.")

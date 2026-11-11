@@ -26,8 +26,10 @@ def entry(oid=700, status="WORKING", fills=(), qty=2):
                                                          {"legId": 2, "quantity": b, "price": 7.0}]}
             for a, b in fills]
     return {"orderId": oid, "status": status, "orderType": "NET_CREDIT", "quantity": qty,
-            "orderLegCollection": [{"legId": 1, "instruction": "SELL_TO_OPEN", "instrument": {"symbol": SHORT_P}},
-                                   {"legId": 2, "instruction": "BUY_TO_OPEN", "instrument": {"symbol": LONG_P}}],
+            "orderLegCollection": [{"legId": 1, "instruction": "SELL_TO_OPEN", "quantity": qty,
+                                    "instrument": {"symbol": SHORT_P, "assetType": "OPTION"}},
+                                   {"legId": 2, "instruction": "BUY_TO_OPEN", "quantity": qty,
+                                    "instrument": {"symbol": LONG_P, "assetType": "OPTION"}}],
             "orderActivityCollection": acts}
 
 
