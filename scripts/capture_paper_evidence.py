@@ -125,8 +125,9 @@ def collect(scenario: str, app: dict, status: dict, account, groups, fills,
 def require_clean_market(record: dict, broker_clock, now: datetime) -> None:
     """Verify an empty, open Paper session before the first controlled order."""
     app, paper = record["app"], record["paper"]
+    # Alpaca's server clock can be slightly ahead of the local machine.
     if (not broker_clock.is_open or broker_clock.observed_at.tzinfo is None or
-            not 0 <= (now - broker_clock.observed_at).total_seconds() <= 60 or
+            not -5 <= (now - broker_clock.observed_at).total_seconds() <= 60 or
             broker_clock.next_close <= now or not app["market_open"]):
         raise PreflightRefused("the app and Alpaca Paper must both report a fresh open session")
     if not app["ready"]:
