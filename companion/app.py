@@ -29,7 +29,7 @@ from . import __version__
 from .brokers.capabilities import BROKERS
 from .brokers.configuration import BrokerSelection
 from .brokers.bootstrap import AlpacaBootstrapPoller
-from .brokers.models import (AccountQuery, AssetType, CancelOrder,
+from .brokers.models import (AccountQuery, AssetType, BracketOrderIntent, CancelOrder,
                              OrderClass, OrderInstruction, OrderQuery, OrderRole,
                              OrderStatus, OrderType, OrdersQuery, QuotesQuery, ReplaceOrder,
                              SubmitOrder)
@@ -80,7 +80,7 @@ BROKER_ACTION_LOCK = threading.RLock()
 BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
-    "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
+    "alpaca-paper": ("equity-bracket", "equity-simple", "equity-oco", "equity-close", "equity-partial",
                      "equity-oco-adjust", "equity-add", "equity-trailing",
                      "option-long-entry", "option-close", "option-cancel",
                      "option-fixed-exit", "option-covered-short", "vertical-entry",
@@ -1084,14 +1084,18 @@ async def paper_entry_preview(request: Request):
     _guard(request)
     try:
         _, intent, quote = await run_in_threadpool(_paper_entry, await request.json())
-        return {"ok": True, "symbol": intent.entry.leg.symbol,
-                "side": intent.entry.leg.instruction.value,
-                "quantity": str(intent.entry.leg.quantity),
-                "entry": intent.entry.order_type.value,
-                "limit_price": str(intent.entry.limit_price) if intent.entry.limit_price else None,
+        entry = intent.entry if isinstance(intent, BracketOrderIntent) else intent
+        bracket = isinstance(intent, BracketOrderIntent)
+        return {"ok": True, "symbol": entry.leg.symbol,
+                "side": entry.leg.instruction.value,
+                "quantity": str(entry.leg.quantity),
+                "entry": entry.order_type.value,
+                "limit_price": str(entry.limit_price) if entry.limit_price else None,
                 "quote": str(quote.mark or quote.last), "quote_source": quote.source,
-                "target": str(intent.take_profit_price), "stop": str(intent.stop_loss.stop_price),
-                "protection": "Broker-held bracket target and stop after entry fills"}
+                "target": str(intent.take_profit_price) if bracket else None,
+                "stop": str(intent.stop_loss.stop_price) if bracket else None,
+                "protection": ("Broker-held bracket target and stop after entry fills" if bracket else
+                               "UNPROTECTED simple entry: no stop or target is attached")}
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     except HTTPException:
@@ -1540,13 +1544,17 @@ def _cancel_paper_entry(order_id: str, request_id: str):
         group = service.adapter.query(OrderQuery(order_id))
         order = next((item for item in group.orders if item.order_id == order_id), None)
         active = {OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED}
-        if (order is None or group.order_class != OrderClass.BRACKET or
+        if (order is None or group.order_class not in (OrderClass.BRACKET, OrderClass.SIMPLE) or
                 order.role != OrderRole.ENTRY or order.parent_id is not None or
                 order.status not in active or order.status_detail in ("PENDING_CANCEL", "PENDING_REPLACE") or
                 len(order.legs) != 1 or
                 order.legs[0].asset_type != AssetType.EQUITY or
                 order.legs[0].filled_quantity != 0):
             raise ValueError("Only an unfilled Alpaca Paper equity entry can be canceled here")
+        if group.order_class == OrderClass.SIMPLE and (
+                not str(order.client_order_id or "").startswith("et-") or
+                service.store.get_mutation_by_client_id(order.client_order_id) is None):
+            raise ValueError("Only an app-created Paper simple entry can be canceled here")
         return service.execute(CancelOrder(order_id), request_id)
 
 
@@ -1576,33 +1584,43 @@ def _paper_reprice_check(order_id: str, price: Decimal):
     service, _ = _paper_service()
     group = service.adapter.query(OrderQuery(order_id))
     entry = next((item for item in group.orders if item.order_id == order_id), None)
-    if (entry is None or group.order_class != OrderClass.BRACKET or
+    if (entry is None or group.order_class not in (OrderClass.BRACKET, OrderClass.SIMPLE) or
             entry.role != OrderRole.ENTRY or entry.parent_id is not None or
             entry.order_type != OrderType.LIMIT or entry.status != OrderStatus.WORKING or
             entry.status_detail not in (None, "NEW", "WORKING") or
             len(entry.legs) != 1 or entry.legs[0].asset_type != AssetType.EQUITY or
             entry.legs[0].filled_quantity != 0 or entry.limit_price is None):
-        raise ValueError("Only a working, unfilled Alpaca Paper equity bracket limit entry can be repriced")
-    targets = [order.limit_price for order in group.orders if order.role == OrderRole.TARGET
-               and order.limit_price is not None]
-    stops = [order.stop_price for order in group.orders if order.role == OrderRole.STOP
-             and order.stop_price is not None]
-    if len(targets) != 1 or len(stops) != 1:
-        raise ValueError("Bracket target and stop could not be verified; nothing was sent")
-    instruction = entry.legs[0].instruction
-    if instruction in (OrderInstruction.BUY, OrderInstruction.BUY_TO_OPEN):
-        valid = stops[0] < price < targets[0]
-    elif instruction in (OrderInstruction.SELL, OrderInstruction.SELL_SHORT):
-        valid = targets[0] < price < stops[0]
+        raise ValueError("Only a working, unfilled Alpaca Paper equity limit entry can be repriced")
+    if group.order_class == OrderClass.SIMPLE:
+        if (len(group.orders) != 1 or
+                not str(entry.client_order_id or "").startswith("et-") or
+                service.store.get_mutation_by_client_id(entry.client_order_id) is None):
+            raise ValueError("Only an app-created Paper simple entry can be repriced here")
+        stop = target = None
     else:
-        valid = False
-    if not valid or price == entry.limit_price:
-        raise ValueError("New entry price must differ and stay between this bracket's stop and target")
+        targets = [order.limit_price for order in group.orders if order.role == OrderRole.TARGET
+                   and order.limit_price is not None]
+        stops = [order.stop_price for order in group.orders if order.role == OrderRole.STOP
+                 and order.stop_price is not None]
+        if len(targets) != 1 or len(stops) != 1:
+            raise ValueError("Bracket target and stop could not be verified; nothing was sent")
+        stop, target = stops[0], targets[0]
+        instruction = entry.legs[0].instruction
+        if instruction in (OrderInstruction.BUY, OrderInstruction.BUY_TO_OPEN):
+            valid = stop < price < target
+        elif instruction in (OrderInstruction.SELL, OrderInstruction.SELL_SHORT):
+            valid = target < price < stop
+        else:
+            valid = False
+        if not valid:
+            raise ValueError("New entry price must stay between this bracket's stop and target")
+    if price == entry.limit_price:
+        raise ValueError("New entry price must differ from the current price")
     account = service.adapter.query(AccountQuery())
     if account.account_ref != service.account_ref or any(
             position.symbol == entry.legs[0].symbol for position in account.positions):
         raise ValueError("Account or position changed; no replace was sent")
-    return service, entry, stops[0], targets[0]
+    return service, entry, stop, target
 
 
 @app.post("/api/paper/entry/reprice/preview")
@@ -1619,7 +1637,8 @@ async def paper_entry_reprice_preview(request: Request):
                 _, entry, stop, target = _paper_reprice_check(order_id, price)
                 return {"ok": True, "order_id": order_id, "symbol": entry.legs[0].symbol,
                         "old_price": str(entry.limit_price), "new_price": str(price),
-                        "stop": str(stop), "target": str(target)}
+                        "stop": str(stop) if stop is not None else None,
+                        "target": str(target) if target is not None else None}
         return await run_in_threadpool(check)
     except (ValueError, TypeError, AttributeError, InvalidOperation) as exc:
         return {"ok": False, "error": str(exc)}

@@ -14,12 +14,13 @@ target, take partials, cancel or close. It runs on your own computer, next to th
 **Alpaca Paper preview:** New installations select Alpaca Paper by default. Its account overview shows
 balances, positions, recent and working orders, recent fills, market hours, stop coverage, and P&L
 coverage from paper fills and IEX/indicative quotes. Stale or incomplete data is labeled. The Paper
-equity bracket form accepts a flat symbol with no active order, whole-share long or short market/limit
-entry, one target, and one fixed stop. Arm entries for the market day, review the plan, then confirm
-the Paper order. The target and stop are broker-held after the entry fills. An unfilled Paper bracket
+equity form accepts a flat symbol with no active order and a whole-share long or short market/limit
+entry. Choose a broker-held bracket with one target and fixed stop, or explicitly choose an unprotected
+simple entry with no attached exits. Arm entries for the market day, review the protection choice, then
+confirm the Paper order. Bracket target and stop are broker-held after the entry fills. An unfilled app-created Paper
 entry can be canceled, or its limit price replaced, from the working-order list after a fresh broker
 check. A replacement keeps the same stop and target and remains blocked until Alpaca confirms the
-new order ID and reviewed price. A held whole-share equity position with no active order can receive
+new order ID and reviewed price; a simple entry remains unprotected. A held whole-share equity position with no active order can receive
 one broker-held OCO target and fixed stop after a fresh position, order, and IEX quote check. The same
 OCO's working target can be moved, and its fixed stop can only be tightened, after a fresh broker
 read and an exact-price replacement confirmation. Replacement outcomes block further order actions
@@ -117,7 +118,7 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, OCO exits with target and tighter fixed-stop adjustments, a standalone trailing stop, a full or partial market close or add shares for an order-free whole-share equity position, reviewed long call/put, covered-call/cash-secured-put, and defined-risk vertical limit entries, an exact held vertical multi-leg limit close or GTC profit target, a full or partial held-option limit close, one fixed option stop, stop-limit, or target, and cancellation of the unfilled remainder of an app-created option or vertical order. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, confirmed equity bracket or explicitly unprotected simple market/limit entry from the Paper form, cancellation or limit repricing of an unfilled app-created entry, OCO exits with target and tighter fixed-stop adjustments, a standalone trailing stop, a full or partial market close or add shares for an order-free whole-share equity position, reviewed long call/put, covered-call/cash-secured-put, and defined-risk vertical limit entries, an exact held vertical multi-leg limit close or GTC profit target, a full or partial held-option limit close, one fixed option stop, stop-limit, or target, and cancellation of the unfilled remainder of an app-created option or vertical order. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
