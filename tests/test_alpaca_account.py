@@ -162,9 +162,9 @@ def test_bracket_children_without_group_role_keep_stop_and_target():
     from companion.brokers.models import OrdersQuery
 
     def raw(order_id, order_type, price=None, stop=None, legs=None, status="new",
-            filled="0", intent=None):
+            filled="0", intent=None, group_role=None):
         return Order.model_construct(
-            id=order_id, group_id="bracket-id", order_class="bracket", group_role=None,
+            id=order_id, group_id="bracket-id", order_class="bracket", group_role=group_role,
             status=status, type=order_type, time_in_force="gtc", legs=legs or [],
             symbol="AAPL", asset_class="us_equity", qty="2", filled_qty=filled,
             side="sell" if order_id != "entry" else "buy", position_intent=intent,
@@ -195,6 +195,10 @@ def test_bracket_children_without_group_role_keep_stop_and_target():
     unfilled_group = _order_group(unfilled)
     assert unfilled_group.orders[2].status == OrderStatus.UNKNOWN
     assert stop_coverage(_pending((unfilled_group,)), "AAPL", "LONG", 2)[0] == 0
+    replaced_stop_only = raw("et-exit-replacement", "stop", stop="97", status="held",
+                             intent="sell_to_close", group_role="stop_loss")
+    assert _order_group(replaced_stop_only).orders[0].status == OrderStatus.WORKING
+    assert _order_group(stop).orders[0].status == OrderStatus.UNKNOWN
 
 
 def test_owned_paper_trailing_stop_counts_as_broker_held_coverage():
