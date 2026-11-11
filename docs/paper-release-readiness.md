@@ -5,7 +5,7 @@ This is the validation record for [issue #12](https://github.com/neusse/edge-tra
 ## Automated gate
 
 - [x] Run `\.venv\Scripts\python.exe -m pytest -q` from a clean checkout with no broker credentials loaded; record the commit and result. On 2026-11-10, detached clean worktree at merged commit `b3ed911`, with no `.env` and Alpaca/Schwab environment variables removed in the test process: 593 passed, 1 Starlette deprecation warning (Windows). The worktree was removed after the run.
-- [ ] Run CI on the final release candidate on Windows and Linux. Interim equities-only PR #81 passed both platforms at `4dbb1e1`; repeat after the controlled Paper equity scenarios and final changes.
+- [ ] Run CI on the final release candidate on Windows and Linux. PR #96 passed both platforms after controlled Paper bracket testing. PR #97 passed Linux and the local suite (609 passed); its Windows run and this documentation change still require a final result.
 - [x] Exercise the same canonical account, order, and mutation contract against Schwab fixtures, Alpaca fixtures, and the in-memory fake (`tests/test_shared_broker_contract.py`; 9 passing cases).
 - [x] Verify that live Alpaca credentials and any endpoint other than `https://paper-api.alpaca.markets` are rejected before a network request (`tests/test_broker_configuration.py`: live-only credentials fail, live selection fails, fixed Paper client mode, and invalid endpoint fails before client construction).
 - [x] Verify that changing brokers disarms the previous ticket, closes its poller, activates the selected broker's store, and does not carry over position or order state. `tests/test_broker_switch.py` exercises the HTTP selector from a Paper runtime with an armed order service and a marked old store; it observes both disarms, old poller stop, new poller start, and an unmarked disarmed store. `tests/test_store_scope.py` covers broker/account storage isolation.
@@ -22,17 +22,21 @@ Before the first controlled order, run `\.venv\Scripts\python.exe scripts\captur
 | Workflow | Evidence required | Status |
 | --- | --- | --- |
 | Broker selection | Default Paper, switch to Schwab and Demo, then back; each switch disarms | Passed 2026-11-10 on local running app; all three modes selected and Paper reselected, disarmed throughout |
-| Equity entry | Long and short market/limit simple and bracket; fill, target and stop children | Pending |
-| Equity management | Unfilled cancel/reprice, partial fill, held OCO, fixed stop/target adjust on OCO and filled bracket exits, trail, partial/full close, add shares | Pending |
-| Equity Auto B/E | One +1R move, no loosening, restart and unknown replacement handling | Filled bracket and existing OCO paths implemented; Paper E2E pending (#8) |
+| Equity entry | Long and short market/limit simple and bracket; fill, target and stop children | Controlled Paper: long and short market fills, unfilled limit/reprice/cancel, filled bracket and both held exits. A filled short bracket and filled limit entry were not separately exercised. |
+| Equity management | Unfilled cancel/reprice, partial fill, held OCO, fixed stop/target adjust on OCO and filled bracket exits, trail, partial/full close, add shares | Controlled Paper: two-share long filled in two executions; partial close, add, full close, short cover, unfilled cancel/reprice, held bracket and OCO, both exit adjustments on each, and a standalone trailing stop. All test positions and working orders were cleaned up. |
+| Equity Auto B/E | One +1R move, no loosening, restart and unknown replacement handling | Watch set on a filled bracket and observed while armed. AAPL did not reach +1R; no automatic stop move occurred. Automated tests cover trigger, no loosening, restart and unknown handling. Real Paper trigger remains open in #12. |
 | Options and verticals | Trading is disabled for both brokers because this project has no options authorization | Excluded from release scope |
-| Failure cases | Broker rejection, partial and unknown outcomes, rate limit, stale data, restart, external changes | Pending |
+| Failure cases | Broker rejection, partial and unknown outcomes, rate limit, stale data, restart, external changes | Real Paper partial fills, unknown replace followed by exact reconciliation, and externally canceled exits observed. Automated tests cover rejection, rate limit, stale data, restart and external changes; those faults were not deliberately induced against Paper. |
 
 Alpaca Paper simulates fills, so these checks establish API and app behavior, not live execution quality. Stock quotes in the Paper workflow use IEX, which is not the full market. Option and vertical order routes are disabled, and the background spread-stop sender cannot run. OPRA entitlement is therefore outside this release gate.
+
+Read-only option quotes for Paper holdings use Schwab. The local Schwab authorization is expired, so a real read-only quote remains unverified in [issue #86](https://github.com/neusse/edge-trader-for-schwab/issues/86); missing quotes leave option holdings stale or unpriced and do not enable options trading.
 
 On 2026-11-10 the configured Paper endpoint authenticated successfully and reported an active account with no open orders. This was a read-only readiness check; it does not count as workflow end-to-end evidence. The US equity session was closed during this check.
 
 On the same date, a read-only 365-day Paper order query at `b3ed911` found 50 historical bracket groups that normalized to ENTRY, TARGET, and STOP, and 48 OCO groups that normalized to TARGET and STOP. No historical order carried an Edge Trader `et-` client ID, so these records cannot stand in for a controlled app order test. No order mutation was sent. At the merged app runtime, switching Paper → Schwab → Paper succeeded and left Paper disarmed. Paper option submit and Schwab option ticket requests were refused with HTTP 403.
+
+On 2026-11-11, controlled Paper equity tests ran from the clean merged app at `34d16fd`. The independent open-session baseline had no positions, working orders, or fills. The redacted local evidence includes `f-simple-filled`, `f-oco-accepted`, `f-oco-target-adjusted`, `f-oco-stop-adjusted`, `f-oco-canceled`, `f-closed`, `f-trail-entry-filled`, `f-trail-accepted`, `f-trail-canceled`, `f-trail-closed`, `aapl-bracket-canceled`, and `final-test-cleanup`, alongside the earlier long/short and bracket labels. The final independent Paper read showed **0 positions and 0 working orders**, with 14 same-day fills from these tests; the app was disarmed with no unresolved mutation. Raw IDs and account details remain only in ignored local `data/` files. See the redacted [issue #8 record](https://github.com/neusse/edge-trader-for-schwab/issues/8) for action results. The Paper account is also used by the swing trader, so further controlled orders require an isolated account or a coordinated test window that preserves its activity.
 
 ## Documentation and release gate
 
@@ -44,7 +48,7 @@ On the same date, a read-only 365-day Paper order query at `b3ed911` found 50 hi
 - [x] README troubleshooting covers Paper connection, disabled reviews, stale IEX quotes, uncertain order outcomes, broker switching, and read-only option holdings.
 - [x] Demo broker selector, Paper overview, and Paper entry screenshots exist under `docs/`; they use invented data.
 - [x] Capture invented-data screenshots for the Paper overview and equity entry. `docs/screenshot-alpaca-paper-demo.png` and `docs/screenshot-paper-entry-demo.png` were visually checked on 2026-11-10; no real account data was used. The older option screenshot is historical and excluded from the release.
-- [ ] Complete every applicable controlled Paper scenario above and attach redacted evidence to #12.
+- [ ] Complete the remaining controlled Paper scenarios above and attach a final redacted result to #12. A real Auto B/E +1R trigger was not observed; further order tests need account isolation or coordination with the swing trader.
 - [ ] Re-run the automated gate on the final commit and record the results in #12.
 - [x] Confirm Schwab is selectable and its regression suite passes. The merged app switched Paper → Schwab → Paper on 2026-11-10; PR #81 passed Linux and Windows CI and the credential-free suite passed 593 tests.
 - [x] Confirm no live Alpaca endpoint or mode is reachable. `tests/test_broker_configuration.py` verifies live-only credentials, live selection, and non-Paper endpoints fail before client construction; the merged runtime selected the fixed Paper endpoint.
