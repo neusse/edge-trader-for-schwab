@@ -7,12 +7,49 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .brokers.models import OrderClass, OrderGroup, OrderInstruction, OrderRole, OrderStatus
+
 TERMINAL = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "REPLACED"}
 # Resting at the broker and able to execute now: the only states that protect a position.
 LIVE = {"WORKING", "PARTIALLY_FILLED", "PENDING_ACTIVATION", "ACCEPTED", "QUEUED", "AWAITING_STOP_CONDITION",
         "AWAITING_CONDITION", "AWAITING_RELEASE_TIME", "NEW"}
 SELLS = {"SELL", "SELL_TO_CLOSE", "SELL_SHORT", "SELL_TO_OPEN"}
 BUYS = {"BUY", "BUY_TO_COVER", "BUY_TO_CLOSE", "BUY_TO_OPEN"}
+
+
+def cancellable_unfilled_entry(group: OrderGroup) -> tuple[bool, str]:
+    """Only a clearly unfilled top-level entry may have its attached exits canceled."""
+    if group.order_class not in (OrderClass.SIMPLE, OrderClass.BRACKET) or group.strategy_detail not in ("SINGLE", "TRIGGER"):
+        return False, f"not a single entry or bracket ({group.strategy_detail})"
+    root = next((order for order in group.orders
+                 if order.parent_id is None and order.order_id == group.group_id), None)
+    if root is None:
+        return False, "order has no readable entry"
+    status = root.status_detail or root.status.value.upper().replace("-", "_")
+    if status not in LIVE:
+        return False, f"not working ({status})"
+    if not root.legs:
+        return False, "order has no legs"
+    opening = {OrderInstruction.SELL_SHORT, OrderInstruction.BUY_TO_OPEN,
+               OrderInstruction.SELL_TO_OPEN}
+    for leg in root.legs:
+        if leg.position_effect == "CLOSING" or (leg.position_effect != "OPENING" and
+                                                leg.instruction not in opening):
+            return False, "not an entry (it closes or reduces a position)"
+    filled = root.reported_filled_quantity
+    if filled is None or not filled.is_finite() or filled < 0:
+        return False, "broker did not report a fill count, so it cannot be shown unfilled"
+    if filled > 0:
+        return False, f"already {filled:g} filled: cancel the rest in the broker"
+    if root.has_fill_activity:
+        return False, "broker shows executions on it"
+    if group.has_unreadable_live_exit:
+        return False, "a live exit could not be read completely"
+    if any(order.role != OrderRole.ENTRY and
+           (order.status_detail in LIVE or order.status in (OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED))
+           for order in group.orders if order.order_id != root.order_id):
+        return False, "its stop or target is already live, so part of it filled"
+    return True, ""
 
 
 @dataclass

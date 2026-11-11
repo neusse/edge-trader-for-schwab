@@ -249,6 +249,8 @@ class BrokerOrder:
     trail_link: str | None = None
     trail_basis: str | None = None
     executions: tuple[OrderExecution, ...] = ()
+    reported_filled_quantity: Decimal | None = None
+    has_fill_activity: bool = False
 
 
 @dataclass(frozen=True)
@@ -258,6 +260,7 @@ class OrderGroup:
     status: OrderStatus
     orders: tuple[BrokerOrder, ...]
     strategy_detail: str | None = None
+    has_unreadable_live_exit: bool = False
 
 
 @dataclass(frozen=True)
