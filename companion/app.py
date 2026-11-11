@@ -80,12 +80,12 @@ APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
     "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
                      "equity-oco-adjust", "equity-add", "equity-trailing",
-                     "option-long-entry", "option-close"),
+                     "option-long-entry", "option-close", "option-cancel"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put with a reviewed limit order, and an order-free held option can be closed with a reviewed limit order. Other option and spread workflows are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put with a reviewed limit order; held options can be closed, and unfilled Paper option quantities canceled. Other option and spread workflows are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -533,6 +533,68 @@ def _send_paper_option_close(body: dict, request_id: str):
                    for order in group.orders if order.status in active for leg in order.legs):
                 raise ValueError("another option order appeared; no close was sent")
         return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
+
+
+def _paper_option_cancel_check(order_id: str):
+    service, _ = _paper_service()
+    group = service.adapter.query(OrderQuery(order_id))
+    order = next((item for item in group.orders if item.order_id == order_id), None)
+    if (order is None or group.order_class != OrderClass.SIMPLE or
+            order.parent_id is not None or len(order.legs) != 1 or
+            order.legs[0].asset_type != AssetType.OPTION or
+            not str(order.client_order_id or "").startswith("et-opt-") or
+            order.status not in (OrderStatus.PENDING, OrderStatus.WORKING,
+                                 OrderStatus.PARTIALLY_FILLED) or
+            order.status_detail in ("PENDING_CANCEL", "PENDING_REPLACE")):
+        raise ValueError("Only an active Edge Trader Paper single-option order can be canceled here")
+    leg = order.legs[0]
+    remaining = leg.remaining_quantity if leg.remaining_quantity is not None else leg.quantity - leg.filled_quantity
+    if remaining <= 0:
+        raise ValueError("No unfilled option contracts remain to cancel")
+    return service, order, leg, remaining
+
+
+@app.post("/api/paper/options/cancel/preview")
+async def paper_option_cancel_preview(request: Request):
+    _guard(request)
+    try:
+        order_id = str(UUID(str((await request.json()).get("order_id"))))
+        _, order, leg, remaining = await run_in_threadpool(_paper_option_cancel_check, order_id)
+        return {"ok": True, "order_id": order_id, "contract": leg.symbol,
+                "instruction": leg.instruction.value,
+                "filled": str(leg.filled_quantity), "remaining": str(remaining),
+                "warning": "Cancellation only requests that unfilled contracts stop; filled contracts remain in the account"}
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option cancel preview failed; no cancel was sent"}
+
+
+@app.post("/api/paper/options/cancel/submit")
+async def paper_option_cancel_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        order_id = str(UUID(str(body.get("order_id"))))
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_cancel_paper_option, order_id, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option cancel preflight failed; no cancel was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _cancel_paper_option(order_id: str, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, _, _, _ = _paper_option_cancel_check(order_id)
+        return service.execute(CancelOrder(order_id), request_id)
 
 
 def _paper_entry(body: dict, for_submit: bool = False):
