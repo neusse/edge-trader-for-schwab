@@ -6,10 +6,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from companion.brokers.models import (AccountQuery, AccountSnapshot, AssetType,
-                                      BalanceSnapshot, MutationResult, MutationStatus,
+                                      BalanceSnapshot, BrokerOrder, CancelOrder,
+                                      MutationResult, MutationStatus, OrderClass,
                                       OptionChain, OptionChainQuery, OptionContract,
-                                      OptionGreeks, OptionType, OrderInstruction,
-                                      OrdersQuery, Position, PositionSide, Quote,
+                                      OptionGreeks, OptionType, OrderGroup,
+                                      OrderInstruction, OrderLeg, OrderQuery,
+                                      OrderRole, OrderStatus, OrderType, OrdersQuery,
+                                      Position, PositionSide, Quote, TimeInForce,
                                       QuotesQuery)
 from companion.brokers.paper_options import chain_query, chain_response
 from companion.brokers.paper_options import (expirations_query, expirations_response,
@@ -217,4 +220,41 @@ def test_option_close_route_previews_and_rechecks_held_quantity(monkeypatch):
     assert commands[0].intent.leg.instruction == OrderInstruction.SELL_TO_CLOSE
     refused = client.post("/api/paper/options/close/preview",
                           json={**body, "quantity": "4"}, headers=headers)
+    assert not refused.json()["ok"]
+
+
+def test_option_cancel_previews_only_remaining_owned_contracts(monkeypatch):
+    import companion.app as appmod
+
+    order_id = "e74ad353-4d70-4705-b046-c5bde18bb55f"
+    order = BrokerOrder(order_id, OrderStatus.PARTIALLY_FILLED, OrderType.LIMIT,
+                        TimeInForce.DAY,
+                        (OrderLeg("AAPL261113C00225000", AssetType.OPTION,
+                                  OrderInstruction.BUY_TO_OPEN, D("3"), D("1")),),
+                        OrderRole.ENTRY, client_order_id="et-opt-owned")
+    group = OrderGroup(order_id, OrderClass.SIMPLE, OrderStatus.PARTIALLY_FILLED,
+                       (order,))
+    commands = []
+    adapter = SimpleNamespace(query=lambda query: group if isinstance(query, OrderQuery)
+                              else _account())
+    service = SimpleNamespace(adapter=adapter, account_ref="paper-account",
+                              execute=lambda command, request_id: (
+                                  commands.append(command),
+                                  MutationResult(MutationStatus.ACCEPTED, order_id))[1])
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    body = {"order_id": order_id, "request_id": _entry_body()["request_id"]}
+    headers = {"X-Companion": "1"}
+    preview = client.post("/api/paper/options/cancel/preview", json=body, headers=headers)
+    assert preview.json()["ok"] and preview.json()["remaining"] == "2"
+    assert preview.json()["filled"] == "1"
+    result = client.post("/api/paper/options/cancel/submit", json=body, headers=headers)
+    assert result.json()["ok"] and len(commands) == 1
+    assert isinstance(commands[0], CancelOrder)
+    external = BrokerOrder(order_id, OrderStatus.WORKING, OrderType.LIMIT,
+                           TimeInForce.DAY, order.legs, OrderRole.ENTRY,
+                           client_order_id="external-order")
+    adapter.query = lambda query: OrderGroup(order_id, OrderClass.SIMPLE,
+                                             OrderStatus.WORKING, (external,))
+    refused = client.post("/api/paper/options/cancel/preview", json=body, headers=headers)
     assert not refused.json()["ok"]

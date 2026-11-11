@@ -123,7 +123,10 @@ def _order_group(raw) -> OrderGroup:
         _enum_value(raw.group_role),
         OrderRole.TARGET if group_class == OrderClass.OCO else
         OrderRole.STOP if (_enum_value(raw.type or raw.order_type) == "trailing_stop" and
-                           str(raw.client_order_id or "").startswith("et-trail-")) else OrderRole.ENTRY)
+                           str(raw.client_order_id or "").startswith("et-trail-")) else
+        OrderRole.EXIT if (_enum_value(raw.position_intent) in ("buy_to_close", "sell_to_close") or
+                           str(raw.client_order_id or "").startswith(("et-close-", "et-opt-close-")))
+        else OrderRole.ENTRY)
     add(raw, root_role)
     return OrderGroup(group_id=group_id, order_class=group_class,
                       status=_ORDER_STATUS.get(_enum_value(raw.status), OrderStatus.UNKNOWN),

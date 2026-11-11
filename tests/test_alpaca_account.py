@@ -169,6 +169,23 @@ def test_owned_paper_trailing_stop_counts_as_broker_held_coverage():
     assert external.orders[0].role == OrderRole.ENTRY
 
 
+def test_simple_option_close_order_is_normalized_as_an_exit():
+    from alpaca.trading.models import Order
+    from companion.brokers.alpaca_paper import _order_group
+    from companion.brokers.models import OrderRole, OrderInstruction
+
+    raw = Order.model_construct(
+        id="option-close", group_id=None, order_class="simple", group_role=None,
+        status="new", type="limit", time_in_force="day", legs=[],
+        symbol="AAPL261113C00225000", asset_class="us_option", qty="3", filled_qty="1",
+        side="sell", position_intent="sell_to_close", limit_price="1.40", stop_price=None,
+        trail_price=None, trail_percent=None, submitted_at=None, updated_at=None,
+        client_order_id="et-opt-close-client")
+    group = _order_group(raw)
+    assert group.orders[0].role == OrderRole.EXIT
+    assert group.orders[0].legs[0].instruction == OrderInstruction.SELL_TO_CLOSE
+
+
 def test_order_history_pages_with_boundary_overlap_and_uuid_deduplication():
     from datetime import datetime, timedelta, timezone
     from alpaca.trading.models import Order
@@ -324,7 +341,7 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
     assert "option-trading" in paper["capabilities"]
     assert paper["workflows"] == ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
                                   "equity-oco-adjust", "equity-add", "equity-trailing",
-                                  "option-long-entry", "option-close")
+                                  "option-long-entry", "option-close", "option-cancel")
     assert "option-bracket" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")
