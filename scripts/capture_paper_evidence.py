@@ -27,7 +27,8 @@ sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 
 from companion.build_info import checkout_identity  # noqa: E402
-from companion.brokers.alpaca_paper import AlpacaPaperAdapter  # noqa: E402
+from companion.brokers.alpaca_paper import (AlpacaPaperAdapter,
+                                           prefer_complete_order_groups)  # noqa: E402
 from companion.brokers.models import (AccountQuery, FillsQuery, MarketClockQuery,
                                       OrderStatus, OrdersQuery)  # noqa: E402
 
@@ -172,7 +173,9 @@ def main() -> None:
         adapter = AlpacaPaperAdapter()
         now = datetime.now(timezone.utc)
         account = adapter.query(AccountQuery())
-        groups = adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=ACTIVE))
+        recent = adapter.query(OrdersQuery(now - timedelta(days=30), now))
+        working = adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=ACTIVE))
+        groups = prefer_complete_order_groups(recent, working)
         et_midnight = now.astimezone(ET).replace(hour=0, minute=0, second=0, microsecond=0)
         fills = adapter.query(FillsQuery(et_midnight.astimezone(timezone.utc), now))
         salt_path = DATA / ".paper-e2e-salt"
