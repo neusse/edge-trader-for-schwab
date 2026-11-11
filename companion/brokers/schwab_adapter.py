@@ -12,7 +12,7 @@ from .models import (
     AccountQuery, AccountSnapshot, AssetType, BalanceSnapshot, BrokerCommand, CancelOrder,
     BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery,
     MarketSession, MarketSessionsQuery, MutationResult, MutationStatus,
-    OptionGreeks, Quote, QuotesQuery,
+    OptionGreeks, OrderPreview, PreviewOrderQuery, Quote, QuotesQuery,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery, OrderRole,
     OrderExecution, OrdersQuery, OrderStatus, OrderType, Position, PositionSide,
     PreviousSessionPosition, ReplaceOrder, SubmitOrder,
@@ -29,6 +29,59 @@ def _response(response):
     if response.status_code != 200:
         raise RuntimeError(f"Schwab read failed (HTTP {response.status_code})")
     return response.json()
+
+
+def _order_preview(client, account_hash: str, body: dict) -> OrderPreview:
+    try:
+        response = client.preview_order(account_hash, body)
+    except Exception:
+        return OrderPreview(False, False, "Schwab preview gave no answer")
+    code = response.status_code
+    if code == 429:
+        raw = (getattr(response, "headers", {}) or {}).get("Retry-After")
+        try:
+            retry = float(raw) if raw is not None else None
+        except ValueError:
+            retry = None
+        return OrderPreview(False, False, "Schwab rate limited the order preview",
+                            retry_after_seconds=retry)
+    if 400 <= code < 500:
+        detail = str(getattr(response, "text", "") or "")[:200]
+        return OrderPreview(False, True,
+                            f"Schwab preview rejected the order (HTTP {code}): {detail}".rstrip())
+    if code not in (200, 201):
+        return OrderPreview(False, False, f"Schwab preview gave HTTP {code}")
+    try:
+        answer = response.json()
+        if not isinstance(answer, dict):
+            raise ValueError("unreadable preview")
+        validation = answer.get("orderValidationResult")
+        strategy = answer.get("orderStrategy")
+        if not isinstance(validation, dict) and not isinstance(strategy, dict):
+            raise ValueError("unreadable preview")
+        rejects = validation.get("rejects", []) if isinstance(validation, dict) else []
+        if not isinstance(rejects, list):
+            raise ValueError("unreadable preview")
+        if rejects:
+            reasons = [str(item.get("message") or item.get("activityMessage") or
+                           item.get("validationRuleName") or "")
+                       for item in rejects if isinstance(item, dict)]
+            return OrderPreview(False, True, "Schwab preview rejected the order: " +
+                                ("; ".join(reason for reason in reasons if reason)[:200] or "no reason given"))
+        raw_balance = (strategy or {}).get("orderBalance") or {}
+        keys = {"order_value": "orderValue", "projected_buying_power": "projectedBuyingPower",
+                "projected_available_funds": "projectedAvailableFund",
+                "projected_commission": "projectedCommission"}
+        balance = {}
+        for name, source in keys.items():
+            value = raw_balance.get(source) if isinstance(raw_balance, dict) else None
+            try:
+                balance[name] = Decimal(str(value)) if value is not None else None
+            except Exception:
+                balance[name] = None
+        return OrderPreview(True, False, balance=balance)
+    except Exception:
+        return OrderPreview(False, False, "Schwab preview could not be read")
 
 
 _ASSET = {"EQUITY": AssetType.EQUITY, "OPTION": AssetType.OPTION,
@@ -370,6 +423,12 @@ class SchwabAdapter(BrokerAdapter):
 
     def _query(self, query: BrokerQuery) -> BrokerQueryResult:
         client, account_hash = self._ready()
+        if isinstance(query, PreviewOrderQuery):
+            try:
+                body = build_schwab_order(query.intent)
+            except (TypeError, ValueError) as exc:
+                return OrderPreview(False, True, str(exc))
+            return _order_preview(client, account_hash, body)
         if isinstance(query, AccountQuery):
             return normalize_account(_response(client.account_details(account_hash, fields="positions")),
                                      account_hash)
@@ -431,34 +490,12 @@ class SchwabAdapter(BrokerAdapter):
                     isinstance(exit_intent, OcoOrderIntent) and
                     isinstance(exit_intent.stop_loss, TrailingStopSpec)
                     for exit_intent in intent.exits)):
-            try:
-                preview = client.preview_order(account_hash, body)
-                if preview.status_code == 429:
-                    return MutationResult(MutationStatus.RATE_LIMITED,
-                                          message="Schwab rate limited the order preview; nothing was sent")
-                if preview.status_code not in (200, 201):
-                    return MutationResult(MutationStatus.REJECTED,
-                                          message="Schwab did not confirm the order preview; nothing was sent")
-                answer = preview.json()
-                if not isinstance(answer, dict):
-                    raise ValueError("unreadable preview")
-                validation = answer.get("orderValidationResult")
-                if not isinstance(validation, dict) and not isinstance(answer.get("orderStrategy"), dict):
-                    raise ValueError("unreadable preview")
-                rejects = validation.get("rejects", []) if isinstance(validation, dict) else []
-                if not isinstance(rejects, list):
-                    raise ValueError("unreadable preview")
-                if rejects:
-                    reasons = [str(item.get("message") or item.get("activityMessage") or
-                                   item.get("validationRuleName") or "")
-                               for item in rejects if isinstance(item, dict)]
-                    return MutationResult(MutationStatus.REJECTED,
-                                          message="Schwab preview rejected the order: " +
-                                          ("; ".join(reason for reason in reasons if reason)[:200] or
-                                           "no reason given") + "; nothing was sent")
-            except Exception:
-                return MutationResult(MutationStatus.REJECTED,
-                                      message="Schwab preview could not be verified; nothing was sent")
+            preview = _order_preview(client, account_hash, body)
+            if not preview.accepted:
+                status = (MutationStatus.RATE_LIMITED if preview.message and "rate limited" in preview.message
+                          else MutationStatus.REJECTED)
+                return MutationResult(status, message=(preview.message or "Schwab preview was unclear") +
+                                      "; nothing was sent", retry_after_seconds=preview.retry_after_seconds)
         try:
             if isinstance(command, SubmitOrder):
                 response = client.place_order(account_hash, body)

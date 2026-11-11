@@ -408,6 +408,20 @@ class OptionExpirationsQuery:
     end: date
 
 
+@dataclass(frozen=True)
+class PreviewOrderQuery:
+    intent: OrderIntent
+
+
+@dataclass(frozen=True)
+class OrderPreview:
+    accepted: bool
+    rejected: bool
+    message: str | None = None
+    balance: Mapping[str, Decimal | None] = field(default_factory=dict)
+    retry_after_seconds: float | None = None
+
+
 BrokerQuery: TypeAlias = (
     AccountQuery
     | OrdersQuery
@@ -419,6 +433,7 @@ BrokerQuery: TypeAlias = (
     | MarketClockQuery
     | OptionChainQuery
     | OptionExpirationsQuery
+    | PreviewOrderQuery
 )
 BrokerQueryResult: TypeAlias = (
     AccountSnapshot
@@ -431,6 +446,7 @@ BrokerQueryResult: TypeAlias = (
     | MarketClock
     | OptionChain
     | tuple[date, ...]
+    | OrderPreview
 )
 
 

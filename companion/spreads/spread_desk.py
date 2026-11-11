@@ -21,7 +21,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from ..bracket import PENNY_ALL_ROOTS, put_call
 from ..brokers.models import (
     AssetType, CancelOrder, MultiLegOrderIntent, MutationStatus, OrderInstruction,
-    OrderLegIntent, OrderType, SubmitOrder, TimeInForce,
+    OrderLegIntent, OrderType, PreviewOrderQuery, SubmitOrder, TimeInForce,
 )
 from ..orders import TERMINAL
 from ..pnl import ET
@@ -326,15 +326,18 @@ class SpreadDesk:
     def plan(self, req: dict, fresh: bool = False) -> dict:
         return make_plan(self.t.quote, req, fresh)
 
-    def _preview(self, client, order: dict) -> dict:
-        refused, body = self.t._preview_answer(client, order)
-        if refused:
-            rejected, why = refused
-            return {"ok": False, "rejected": rejected,
-                    "error": (plain_refusal(why) if rejected else f"Schwab's preview gave no clear answer ({why})")}
-        bal = ((body or {}).get("orderStrategy") or {}).get("orderBalance") or {}
-        return {"ok": True, "balance": {k: bal.get(k) for k in ("orderValue", "projectedBuyingPower",
-                                                                 "projectedAvailableFund", "projectedCommission")}}
+    def _preview(self, intent: MultiLegOrderIntent) -> dict:
+        result = self.t._broker_query("preview_order", PreviewOrderQuery(intent))
+        if not result.accepted:
+            why = result.message or "no clear answer"
+            return {"ok": False, "rejected": result.rejected,
+                    "error": (plain_refusal(why) if result.rejected else
+                              f"Schwab's preview gave no clear answer ({why})")}
+        names = {"orderValue": "order_value", "projectedBuyingPower": "projected_buying_power",
+                 "projectedAvailableFund": "projected_available_funds",
+                 "projectedCommission": "projected_commission"}
+        return {"ok": True, "balance": {key: float(result.balance[value]) if result.balance.get(value) is not None
+                                         else None for key, value in names.items()}}
 
     def preview(self, req: dict) -> dict:
         """Schwab's preview of the ticket's entry (places nothing): accepted or why not, and the
@@ -342,8 +345,10 @@ class SpreadDesk:
         p = self.plan(req, fresh=True)
         if not p["ok"]:
             return {"ok": False, "plan": p, "error": "; ".join(p["errors"])}
-        order = entry_order(p["legs"], p["kind"] == "DEBIT", Decimal(p["limit"]), p["qty"])
-        return {**self._preview(self.t._ensure(), order), "plan": p}
+        intent = vertical_intent(p["legs"], opening=True, net_debit=p["kind"] == "DEBIT",
+                                 price=Decimal(p["limit"]), qty=p["qty"], duration=TimeInForce.DAY,
+                                 client_order_id="preview")
+        return {**self._preview(intent), "plan": p}
 
     # ---- entry ------------------------------------------------------------------------------
 
@@ -424,13 +429,13 @@ class SpreadDesk:
             return {"ok": False, "error": f"Working order(s) {', '.join(map(str, working))} already touch these "
                                           "contracts. Nothing was sent."}
         order = entry_order(legs, p["kind"] == "DEBIT", exp_limit, exp_qty)
-        pv = self._preview(client, order)
-        if not pv["ok"]:
-            return {"ok": False, "error": f"Schwab's preview refused it: {pv['error']}. Nothing was sent."
-                    if pv.get("rejected") else f"{pv['error']}. Nothing was sent.", "plan": p}
         intent = vertical_intent(legs, opening=True, net_debit=p["kind"] == "DEBIT",
                                  price=exp_limit, qty=exp_qty, duration=TimeInForce.DAY,
                                  client_order_id=ticket_id)
+        pv = self._preview(intent)
+        if not pv["ok"]:
+            return {"ok": False, "error": f"Schwab's preview refused it: {pv['error']}. Nothing was sent."
+                    if pv.get("rejected") else f"{pv['error']}. Nothing was sent.", "plan": p}
         ticket = {"put_call": p["put_call"], "width": float(p["width"]), "entry_limit": float(exp_limit),
                   "max_loss": float(p["max_loss"]), "max_gain": float(p["max_gain"]),
                   "breakeven": float(p["breakeven"]), "request": order, "preview": pv["balance"]}
@@ -790,13 +795,13 @@ class SpreadDesk:
             if exp_limit is None:
                 return {"ok": False, "spread_id": sid, "error": "no valid quote to price the close; nothing was sent"}
         order = close_order(sp["legs"], debit, exp_limit, qty)
-        pv = self._preview(client, order)
-        if not pv["ok"]:
-            return {"ok": False, "spread_id": sid, "error": (f"Schwab's preview refused the close: {pv['error']}"
-                                                             if pv.get("rejected") else pv["error"]) + ". Nothing was sent."}
         intent = vertical_intent(sp["legs"], opening=False, net_debit=not debit,
                                  price=exp_limit, qty=qty, duration=TimeInForce.DAY,
                                  client_order_id=f"{sid}-close")
+        pv = self._preview(intent)
+        if not pv["ok"]:
+            return {"ok": False, "spread_id": sid, "error": (f"Schwab's preview refused the close: {pv['error']}"
+                                                             if pv.get("rejected") else pv["error"]) + ". Nothing was sent."}
         log.warning("CLOSE spread %s %s x%s of %s @ %s", sid, sp["kind"], qty, units, exp_limit)
         self.t.store.log_action("spread_close", sp["underlying"], None, "SENDING", sid)
         # Held BEFORE the POST: if the app stops between Schwab's answer and recording it, the spread
@@ -1124,13 +1129,13 @@ class SpreadDesk:
         sid = sp["spread_id"]
         debit = sp["kind"].endswith("DEBIT")
         order = close_order(sp["legs"], debit, price, units, duration="GOOD_TILL_CANCEL")
-        pv = self._preview(client, order)
-        if not pv["ok"]:
-            return {"ok": False, "spread_id": sid, "error": (f"Schwab's preview refused the target: {pv['error']}"
-                                                             if pv.get("rejected") else pv["error"]) + f". Nothing was sent.{moved}"}
         intent = vertical_intent(sp["legs"], opening=False, net_debit=not debit,
                                  price=price, qty=units, duration=TimeInForce.GTC,
                                  client_order_id=f"{sid}-target")
+        pv = self._preview(intent)
+        if not pv["ok"]:
+            return {"ok": False, "spread_id": sid, "error": (f"Schwab's preview refused the target: {pv['error']}"
+                                                             if pv.get("rejected") else pv["error"]) + f". Nothing was sent.{moved}"}
         log.warning("TARGET spread %s %s x%s @ %s GTC", sid, sp["kind"], units, price)
         self.t.store.log_action("spread_target", sp["underlying"], None, "SENDING", sid)
         self.book.hold(sid, "target being sent: if this stays, check thinkorswim, then Resolve")

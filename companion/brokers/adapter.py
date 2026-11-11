@@ -25,6 +25,7 @@ from .models import (
     OrderQuery,
     OrdersQuery,
     QuotesQuery,
+    PreviewOrderQuery,
     ReplaceOrder,
     SimpleOrderIntent,
     SubmitOrder,
@@ -55,6 +56,8 @@ def required_query_capability(query: BrokerQuery) -> BrokerCapability:
         return BrokerCapability.MARKET_CLOCK
     if isinstance(query, (OptionChainQuery, OptionExpirationsQuery)):
         return BrokerCapability.OPTION_MARKET_DATA
+    if isinstance(query, PreviewOrderQuery):
+        return BrokerCapability.ORDER_PREVIEW
     raise TypeError(f"unknown broker query: {type(query).__name__}")
 
 

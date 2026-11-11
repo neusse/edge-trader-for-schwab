@@ -4,7 +4,8 @@ from dataclasses import replace
 from companion.brokers.models import (
     AssetType, BracketOrderIntent, CancelOrder, MultiLegOrderIntent, MutationStatus,
     OrderInstruction, OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent, StopLossIntent,
-    SubmitOrder, TimeInForce, OcoOrderIntent, TrailingStopSpec, TrailingOrderIntent,
+    SubmitOrder, TimeInForce, OcoOrderIntent, PreviewOrderQuery,
+    TrailingStopSpec, TrailingOrderIntent,
 )
 from companion.brokers.schwab_adapter import SchwabAdapter
 from companion.brokers.schwab_orders import build_schwab_order
@@ -66,6 +67,42 @@ def test_schwab_trailing_intents_preserve_quote_basis_and_oco_shape():
     assert target["duration"] == "GOOD_TILL_CANCEL"
     assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceLinkBasis"] == "ASK"
     assert stop["stopPriceLinkType"] == "PERCENT" and stop["stopPriceOffset"] == 2.0
+
+
+def test_canonical_schwab_preview_keeps_rejection_and_balance_distinct():
+    class Response:
+        def __init__(self, status, body=None, message=""):
+            self.status_code, self.body, self.text = status, body, message
+
+        def json(self):
+            return self.body
+
+    class Client:
+        response = None
+        sent = []
+
+        def preview_order(self, account_hash, body):
+            assert account_hash == "hash" and body["orderStrategyType"] == "TRIGGER"
+            self.sent.append(body)
+            return self.response
+
+    client = Client()
+    adapter = SchwabAdapter(client, "hash")
+    query = PreviewOrderQuery(equity_bracket())
+    client.response = Response(200, {"orderValidationResult": {"rejects": []},
+                                     "orderStrategy": {"orderBalance": {"orderValue": "200.50"}}})
+    accepted = adapter.query(query)
+    assert accepted.accepted and accepted.balance["order_value"] == D("200.50")
+    client.response = Response(200, {"orderValidationResult": {"rejects": [{"message": "insufficient buying power"}]}})
+    rejected = adapter.query(query)
+    assert not rejected.accepted and rejected.rejected and "insufficient buying power" in rejected.message
+    client.response = Response(200, {"orderValidationResult": {"rejects": None}})
+    unclear = adapter.query(query)
+    assert not unclear.accepted and not unclear.rejected
+    client.response = Response(429)
+    limited = adapter.query(query)
+    assert not limited.accepted and not limited.rejected and "rate limited" in limited.message
+    assert len(client.sent) == 4
 
 
 def credit_spread():
