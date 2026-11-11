@@ -345,7 +345,7 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
                                   "equity-oco-adjust", "equity-add", "equity-trailing",
                                   "option-long-entry", "option-close", "option-cancel",
                                   "option-fixed-exit", "option-covered-short", "vertical-entry",
-                                  "vertical-close", "vertical-target")
+                                  "vertical-close", "vertical-target", "vertical-cancel")
     assert "option-bracket" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")

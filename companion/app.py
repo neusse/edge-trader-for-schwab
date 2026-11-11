@@ -84,7 +84,7 @@ APP_WORKFLOWS = {
                      "equity-oco-adjust", "equity-add", "equity-trailing",
                      "option-long-entry", "option-close", "option-cancel",
                      "option-fixed-exit", "option-covered-short", "vertical-entry",
-                     "vertical-close", "vertical-target"),
+                     "vertical-close", "vertical-target", "vertical-cancel"),
     "demo": (),
 }
 BROKER_HELP = {
@@ -863,6 +863,71 @@ async def paper_option_cancel_submit(request: Request):
 def _cancel_paper_option(order_id: str, request_id: str):
     with BROKER_ACTION_LOCK:
         service, _, _, _ = _paper_option_cancel_check(order_id)
+        return service.execute(CancelOrder(order_id), request_id)
+
+
+def _paper_vertical_cancel_check(order_id: str):
+    service, _ = _paper_service()
+    group = service.adapter.query(OrderQuery(order_id))
+    order = next((item for item in group.orders if item.order_id == order_id), None)
+    if (order is None or group.order_class != OrderClass.MULTI_LEG or
+            order.parent_id is not None or len(order.legs) != 2 or
+            any(leg.asset_type != AssetType.OPTION for leg in order.legs) or
+            not str(order.client_order_id or "").startswith("et-vertical-") or
+            order.status not in (OrderStatus.PENDING, OrderStatus.WORKING,
+                                 OrderStatus.PARTIALLY_FILLED) or
+            order.status_detail in ("PENDING_CANCEL", "PENDING_REPLACE")):
+        raise ValueError("Only an active Edge Trader Paper two-leg vertical can be canceled here")
+    if service.store.get_mutation_by_client_id(order.client_order_id) is None:
+        raise ValueError("Vertical order is not owned by this Paper account store")
+    remaining = [leg.remaining_quantity if leg.remaining_quantity is not None else
+                 leg.quantity - leg.filled_quantity for leg in order.legs]
+    if not any(value > 0 for value in remaining):
+        raise ValueError("No unfilled vertical units remain to cancel")
+    return service, order, remaining
+
+
+@app.post("/api/paper/vertical/cancel/preview")
+async def paper_vertical_cancel_preview(request: Request):
+    _guard(request)
+    try:
+        order_id = str(UUID(str((await request.json()).get("order_id"))))
+        _, order, remaining = await run_in_threadpool(_paper_vertical_cancel_check, order_id)
+        return {"ok": True, "order_id": order_id,
+                "legs": [{"contract": leg.symbol, "instruction": leg.instruction.value,
+                          "filled": str(leg.filled_quantity), "remaining": str(rest)}
+                         for leg, rest in zip(order.legs, remaining)],
+                "warning": "Cancellation requests only the unfilled remainder of the one multi-leg order; any filled legs remain held and must be reconciled"}
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper vertical cancel preview failed; no cancel was sent"}
+
+
+@app.post("/api/paper/vertical/cancel/submit")
+async def paper_vertical_cancel_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        order_id = str(UUID(str(body.get("order_id"))))
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_cancel_paper_vertical, order_id, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper vertical cancel preflight failed; no cancel was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _cancel_paper_vertical(order_id: str, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, _, _ = _paper_vertical_cancel_check(order_id)
         return service.execute(CancelOrder(order_id), request_id)
 
 
