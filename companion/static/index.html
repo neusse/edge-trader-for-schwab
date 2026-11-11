@@ -403,6 +403,16 @@
     <button class="btn" type="submit" id="paper-option-submit" disabled>Review option order</button>
   </form>
   <p id="paper-option-entry-msg" class="mut" role="status">Select a tradable contract. Paper orders must be armed above.</p>
+  <h3>Paper vertical entry</h3>
+  <p class="mut">Level 3 only. Choose a long and short contract from the same chain. The signed net limit is positive for a debit and negative for a credit. Both legs are sent as one broker multi-leg order. No spread stop or target is attached after fill.</p>
+  <form id="paper-vertical-entry-form" class="paper-fields">
+    <label>Long leg<select class="in" name="long_contract" required><option value="">Load contracts</option></select></label>
+    <label>Short leg<select class="in" name="short_contract" required><option value="">Load contracts</option></select></label>
+    <label>Spread units<input class="in" name="quantity" type="number" min="1" max="100" step="1" value="1" required></label>
+    <label>Signed net limit / share<input class="in" name="net_price" type="number" step="0.01" required placeholder="+ debit / - credit"></label>
+    <button class="btn" type="submit" id="paper-vertical-submit" disabled>Review vertical order</button>
+  </form>
+  <p id="paper-vertical-msg" class="mut" role="status">Load one option chain, then select two strikes.</p>
 </section>
 <div class="stats">
   <div class="stat"><div class="k" id="k-real-l">Realized today · net</div><div class="v" id="k-real">-</div><div class="s" id="k-real-s"></div></div>
@@ -1343,6 +1353,7 @@ function render(st) {
     paperOptionCloseSentKeys.clear();
     paperOptionCancelSentIds.clear();
     paperOptionExitSentKeys.clear();
+    paperVerticalSentKeys.clear();
     TV.pos = null; TV.closed = null; TV.flat = {}; TV.said = {};
     if ("speechSynthesis" in window) speechSynthesis.cancel();
   }
@@ -1487,14 +1498,19 @@ const paperOptionSentKeys = new Set();
 const paperOptionCloseSentKeys = new Set();
 const paperOptionCancelSentIds = new Set();
 const paperOptionExitSentKeys = new Set();
+const paperVerticalSentKeys = new Set();
 const paperOptionsForm = $("paper-options-form");
 const paperExpirySelect = paperOptionsForm.elements.expiration;
 function resetPaperOptionSelection() {
   paperOptionChain = null;
   paperOptionSelected = null;
   $("paper-option-entry-form").elements.contract.value = "";
+  for (const name of ["long_contract", "short_contract"])
+    $("paper-vertical-entry-form").elements[name].innerHTML = '<option value="">Load contracts</option>';
+  $("paper-vertical-entry-form").elements.net_price.value = "";
+  $("paper-vertical-msg").textContent = "Load one option chain, then select two strikes.";
   $("paper-option-entry-msg").textContent = "Select a tradable contract. Paper orders must be armed above.";
-  if (lastState) renderOptionEntryControls(lastState);
+  if (lastState) { renderOptionEntryControls(lastState); renderVerticalEntryControls(lastState); }
 }
 paperOptionsForm.elements.underlying.addEventListener("input", () => {
   paperExpirySelect.innerHTML = '<option value="">Find expirations</option>';
@@ -1554,7 +1570,12 @@ $("paper-options-form").addEventListener("submit", async e => {
         paperOptionsForm.elements.option_type.value !== body.option_type) return;
     const rows = result.contracts || [];
     paperOptionChain = result;
-    $("paper-options-msg").textContent = `${rows.length} ${result.option_type} contracts for ${result.underlying} ${result.expiration}. Indicative Alpaca data; select a tradable contract to review a long option order.`;
+    $("paper-options-msg").textContent = `${rows.length} ${result.option_type} contracts for ${result.underlying} ${result.expiration}. Indicative Alpaca data; select contracts to review an option or vertical order.`;
+    const choices = '<option value="">Choose contract</option>' + rows.filter(c => c.tradable)
+      .map(c => `<option value="${esc(c.symbol)}">${esc(c.symbol)} · ${esc(c.strike)}</option>`).join("");
+    for (const name of ["long_contract", "short_contract"])
+      $("paper-vertical-entry-form").elements[name].innerHTML = choices;
+    renderVerticalEntryControls(lastState);
     $("paper-options-chain").innerHTML = rows.length ? `<table><thead><tr><th>OCC symbol</th><th>Strike</th><th>Bid</th><th>Ask</th><th>Mark</th><th>Δ</th><th>Γ</th><th>Θ</th><th>Vega</th><th>Rho</th><th>IV (decimal)</th><th>Open interest</th><th>Quote time</th><th></th></tr></thead><tbody>${rows.map(c =>
       `<tr><td>${esc(c.symbol)}${c.tradable ? "" : " <small>(not tradable)</small>"}</td><td>${esc(c.strike)}</td><td>${esc(c.bid ?? "—")}</td><td>${esc(c.ask ?? "—")}</td><td>${esc(c.mark ?? "—")}</td><td>${esc(c.delta ?? "—")}</td><td>${esc(c.gamma ?? "—")}</td><td>${esc(c.theta ?? "—")}</td><td>${esc(c.vega ?? "—")}</td><td>${esc(c.rho ?? "—")}</td><td>${esc(c.implied_volatility ?? "—")}</td><td>${esc(c.open_interest ?? "—")}</td><td>${c.quote_at ? esc(new Date(c.quote_at).toLocaleTimeString()) : "—"}</td><td>${c.tradable ? `<button type="button" class="btn sm ghost" data-paper-option-select="${esc(c.symbol)}">Select</button>` : ""}</td></tr>`).join("")}</tbody></table>` :
       `<p class="mut">No contracts returned for this expiration and type.</p>`;
@@ -1643,6 +1664,77 @@ $("paper-option-entry-form").addEventListener("submit", async e => {
     }
   } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
 });
+function renderVerticalEntryControls(st) {
+  const form = $("paper-vertical-entry-form");
+  const allowed = st?.broker?.key === "alpaca-paper" &&
+    st.broker.workflows?.includes("vertical-entry") &&
+    Number(st.alpaca?.options_trading_level) >= 3 &&
+    Number(st.alpaca?.options_approved_level) >= 3;
+  const long = form.elements.long_contract.value, short = form.elements.short_contract.value;
+  $("paper-vertical-submit").disabled = !allowed || !paperOptionChain || !long || !short || long === short ||
+    !paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown";
+}
+$("paper-vertical-entry-form").addEventListener("change", e => {
+  if (["long_contract", "short_contract"].includes(e.target.name)) {
+    const form = e.currentTarget;
+    const long = paperOptionChain?.contracts?.find(c => c.symbol === form.elements.long_contract.value);
+    const short = paperOptionChain?.contracts?.find(c => c.symbol === form.elements.short_contract.value);
+    const net = long?.ask != null && short?.bid != null ?
+      Number(long.ask) - Number(short.bid) : NaN;
+    form.elements.net_price.value = Number.isFinite(net) && net !== 0 ? net.toFixed(2) : "";
+  }
+  renderVerticalEntryControls(lastState);
+});
+$("paper-vertical-entry-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  if ($("paper-vertical-submit").disabled || !paperOptionChain) return;
+  const form = new FormData(e.currentTarget);
+  const payload = {underlying:paperOptionChain.underlying, expiration:paperOptionChain.expiration,
+    option_type:paperOptionChain.option_type, long_contract:form.get("long_contract"),
+    short_contract:form.get("short_contract"), quantity:form.get("quantity"),
+    net_price:form.get("net_price"), request_id:crypto.randomUUID()};
+  const key = JSON.stringify([payload.long_contract,payload.short_contract,payload.quantity,payload.net_price]);
+  const message = $("paper-vertical-msg");
+  if (paperVerticalSentKeys.has(key)) {
+    message.textContent = "This exact vertical was already sent. Verify its broker state first."; return;
+  }
+  if (!Number.isInteger(Number(payload.quantity)) || Number(payload.quantity) < 1 ||
+      Number(payload.quantity) > 100 || !Number.isFinite(Number(payload.net_price)) ||
+      Number(payload.net_price) === 0) {
+    message.textContent = "Enter 1 to 100 whole spread units and a nonzero signed net limit."; return;
+  }
+  paperBusy = true; paperRequestId = payload.request_id; paperCommand = "SubmitOrder";
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const preview = await post("/api/paper/vertical/entry/preview", payload, 45000);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Vertical preview refused");
+    if (!window.confirm(`Open ${preview.quantity} ${preview.kind} verticals: buy ${preview.long_contract}, sell ${preview.short_contract} at signed net ${preview.net_price} per share? ` +
+        `Strike width ${preview.strike_width}; maximum loss ${preview.maximum_loss}. ${preview.protection}`)) {
+      message.textContent = "Paper vertical review canceled."; return;
+    }
+    message.textContent = "Sending one Paper multi-leg order…";
+    sent = true;
+    const result = await post("/api/paper/vertical/entry/submit", payload, 45000);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown"; paperVerticalSentKeys.add(key);
+      message.textContent = result.message || "Vertical outcome unknown. Reconcile before another action.";
+    } else {
+      paperRequestId = null; paperOutcome = null;
+      if (result.ok) paperVerticalSentKeys.add(key);
+      message.textContent = result.ok ? `Alpaca Paper accepted multi-leg order ${result.order_id}. Verify both leg fills; no spread exit is attached.` :
+        result.message || result.error || result.detail || "Vertical order refused";
+    }
+  } catch (err) {
+    if (sent) {
+      paperOutcome = "unknown"; paperVerticalSentKeys.add(key);
+      message.textContent = `Vertical may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`;
+    } else {
+      paperRequestId = null;
+      message.textContent = String(err.message || err);
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
 let paperArmed = false, paperRequestId = null, paperIntentKey = null, paperOutcome = null, paperBusy = false;
 let paperCommand = "SubmitOrder";
 const paperForm = $("paper-form");
@@ -1664,6 +1756,7 @@ function renderPaperControls(st) {
   $("paper-submit").disabled = paperBusy || !ready || !paperArmed || paperOutcome === "unknown";
   $("paper-reconcile").style.display = paperOutcome === "unknown" ? "" : "none";
   renderOptionEntryControls(st);
+  renderVerticalEntryControls(st);
 }
 async function refreshPaperStatus() {
   if (lastState?.broker?.key !== "alpaca-paper") return;

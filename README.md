@@ -47,6 +47,11 @@ refuses conflicting active orders on that underlying during review and final pre
 options can be assigned, and no stop or target is attached automatically. While a short call is
 held, the Paper equity close, OCO, and trailing exit controls refuse to sell its underlying
 shares; close the call first.
+A level-3 Paper account can open a same-expiration, same-type 1:1 vertical with one multi-leg
+limit order. The signed net limit is positive for a debit and negative for a credit. The preview
+shows strike width and maximum loss, and the app checks options buying power before sending.
+An accepted entry has no attached broker-held spread stop or target; spread management is still
+being connected.
 A held Paper option position with no active order can be closed in whole or in part using a
 confirmed limit order. The app rechecks the position before sending; any remaining contracts
 receive no new broker-held exit from that close.
@@ -103,7 +108,7 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, OCO exits with target and tighter fixed-stop adjustments, a standalone trailing stop, a full or partial market close or add shares for an order-free whole-share equity position, reviewed long call/put or covered-call/cash-secured-put limit entries, a full or partial held-option limit close, one fixed option stop, stop-limit, or target, and cancellation of the unfilled remainder of an app-created option order. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, OCO exits with target and tighter fixed-stop adjustments, a standalone trailing stop, a full or partial market close or add shares for an order-free whole-share equity position, reviewed long call/put, covered-call/cash-secured-put, and defined-risk vertical limit entries, a full or partial held-option limit close, one fixed option stop, stop-limit, or target, and cancellation of the unfilled remainder of an app-created option order. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
