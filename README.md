@@ -192,6 +192,17 @@ risk before you send.
   `--demo` runs on invented data with no Schwab connection, and refuses every order (the ticket plans on
   invented quotes, so you can try the equity ticket).
 
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Alpaca Paper stays connecting or reports an authentication error | Check `alpaca_paper_api_key` and `alpaca_paper_secret` in your local `.env` or process environment, then restart the app. Use Paper credentials; live Alpaca credentials and endpoints are refused. Do not paste keys into an issue. |
+| A Paper equity review button is disabled | Select Alpaca Paper, wait for fresh account and order data and regular market hours, arm Paper orders, and check that the symbol has no held position or active order. The entry form accepts whole shares and one target/stop bracket or an explicitly unprotected simple entry. |
+| A Paper equity quote is stale or missing | Paper stock quotes use IEX. Wait for a fresh regular-hours quote and refresh the app; an order cannot be sent from stale or incomplete data. Check the symbol and market clock before trying again. |
+| A submit, cancel, or replacement says its outcome is unknown | Check the order directly in Alpaca Paper before using the app's reconcile control. Do not send another order or reuse the request while its outcome is uncertain; the app does not retry automatically. |
+| Broker selection changes or order controls remain disarmed | Check the active broker and account shown in the app. Switching brokers disarms orders; arm only after reviewing the new account, positions, and working orders. If the app requests a restart, restart before ordering. |
+| An existing option position or order appears | It is read-only here. Option and spread trading are disabled for both brokers; manage existing option orders directly with the broker. |
+
 ## Contributing
 
 Bug reports and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, tests and

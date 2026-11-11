@@ -36,6 +36,7 @@ On the same date, a read-only 365-day Paper order query at `b3ed911` found 50 hi
 - [x] `requirements.txt` pins `alpaca-py` and the Schwab client.
 - [x] README describes the equities-only scope, broker-held equity brackets/OCO exits, and unprotected orders.
 - [x] README identifies local storage and broker/data outbound calls.
+- [x] README troubleshooting covers Paper connection, disabled reviews, stale IEX quotes, uncertain order outcomes, broker switching, and read-only option holdings.
 - [x] Demo broker selector, Paper overview, and Paper entry screenshots exist under `docs/`; they use invented data.
 - [x] Capture invented-data screenshots for the Paper overview and equity entry. `docs/screenshot-alpaca-paper-demo.png` and `docs/screenshot-paper-entry-demo.png` were visually checked on 2026-11-10; no real account data was used. The older option screenshot is historical and excluded from the release.
 - [ ] Complete every applicable controlled Paper scenario above and attach redacted evidence to #12.
