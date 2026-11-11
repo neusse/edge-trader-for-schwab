@@ -528,6 +528,21 @@ def test_cancel_symbol_orders_cancels_each_live_exit(trader, monkeypatch):
     assert r["ok"] and sorted(trader._client.cancelled) == [51, 52]       # AKMX untouched
 
 
+def test_cancel_symbol_orders_exposes_unknown_adapter_outcome(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_oco()], auto_cancel=False)
+
+    def lost_reply(_hash, oid):
+        trader._client.cancelled.append(oid)
+        raise TimeoutError("lost reply")
+
+    trader._client.cancel_order = lost_reply
+    result = trader.cancel_symbol_orders("MXR", [], set())
+    assert not result["ok"] and sorted(trader._client.cancelled) == [51, 52]
+    assert all(row["mutation_status"] == "unknown" for row in result["results"])
+    assert sorted(result["still_working"]) == [51, 52]
+
+
 def test_close_is_one_market_order_and_schwab_cancels_the_oco(trader, monkeypatch):
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
     trader._client = Broker([_mu_oco()])

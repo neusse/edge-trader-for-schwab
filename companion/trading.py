@@ -25,7 +25,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
-from .brokers.models import CancelOrder, MutationStatus
+from .brokers.models import CancelOrder, MutationResult, MutationStatus
 from .brokers.schwab_adapter import SchwabAdapter
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
@@ -525,7 +525,7 @@ class Trader:
         if result.status == MutationStatus.RATE_LIMITED and self.on_request:
             self.on_request(str(result.retry_after_seconds or 30))
         self.store.log_request(endpoint, started, result.accepted, None,
-                               None if result.accepted else result.message[:300])
+                               None if result.accepted else (result.message or "")[:300])
         return result
 
     def quote(self, symbol: str, max_age: float = 1.0) -> dict:
@@ -985,13 +985,12 @@ class Trader:
     def _cancel_fast(self, client, symbol: str, orders: list[dict], known_terminal: set[int]) -> dict:
         """Send every cancel for the symbol at once, then confirm with one or two fresh reads."""
         targets, mixed = self._cancel_targets(symbol, orders, known_terminal)
-        sent: dict[int, int | None] = {}
+        sent: dict[int, MutationResult] = {}
         for oid in targets:
             try:
-                c = self._logged("cancel_order", lambda o=oid: client.cancel_order(self._hash, o))
-                sent[oid] = c.status_code
+                sent[oid] = self._broker_mutation("cancel_order", CancelOrder(str(oid)))
             except Exception as e:
-                sent[oid] = None
+                sent[oid] = MutationResult(MutationStatus.UNKNOWN, message=repr(e))
                 self.store.log_action("cancel_order", symbol, oid, "UNKNOWN", repr(e))
         status: dict[int, str] = {}
         for _ in range(3):
@@ -1007,10 +1006,12 @@ class Trader:
                 status[oid] = node.get("status", "UNCONFIRMED")
             if all(s in TERMINAL for s in status.values()):
                 break
-        results = [{"order_id": oid, "status": status.get(oid, "UNCONFIRMED"), "http": code}
-                   for oid, code in sent.items()]
+        results = [{"order_id": oid, "status": status.get(oid, "UNCONFIRMED"),
+                    "mutation_status": outcome.status.value}
+                   for oid, outcome in sent.items()]
         for x in results:
-            self.store.log_action("cancel_order", symbol, x["order_id"], x["status"], f"http {x['http']}")
+            self.store.log_action("cancel_order", symbol, x["order_id"], x["status"],
+                                  x["mutation_status"])
         pending = [x for x in results if x["status"] not in TERMINAL]
         return {"ok": not pending and not mixed, "results": results, "pending": pending,
                 "mixed": mixed, "still_working": [x["order_id"] for x in pending]}

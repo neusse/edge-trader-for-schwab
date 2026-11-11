@@ -19,6 +19,7 @@ from datetime import date, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 
 from ..bracket import PENNY_ALL_ROOTS, put_call
+from ..brokers.models import CancelOrder, MutationStatus
 from ..orders import TERMINAL
 from ..pnl import ET
 from ..trading import INDEX_ROOTS, _odd_deliverable, _occ_root, _all_symbols, _nodes, market_open, regular_hours_text, terminal_ids
@@ -513,15 +514,22 @@ class SpreadDesk:
                 return {"ok": False, "spread_id": sid, "error": f"Order {oid} does not match this spread's contracts."}
             self.t.store.log_action("spread_cancel", sp["underlying"], oid, "SENDING", sid)
             try:
-                r = self.t._logged("cancel_order", lambda o=oid: client.cancel_order(self.t._hash, o))
+                result = self.t._broker_mutation("cancel_order", CancelOrder(str(oid)))
             except Exception as e:
                 self.t.store.log_action("spread_cancel", sp["underlying"], oid, "UNKNOWN", repr(e)[:300])
                 return {"ok": False, "spread_id": sid,
                         "error": "No answer from Schwab: the order may or may not be cancelled. Check thinkorswim."}
-            if r.status_code not in (200, 201, 204):
-                self.t.store.log_action("spread_cancel", sp["underlying"], oid, "REJECTED", f"HTTP {r.status_code}")
+            if result.status != MutationStatus.ACCEPTED:
+                self.t.store.log_action("spread_cancel", sp["underlying"], oid,
+                                        result.status.value.upper(), result.message)
+                if result.status == MutationStatus.UNKNOWN:
+                    return {"ok": False, "spread_id": sid,
+                            "error": "Cancel outcome unknown. Check thinkorswim before another action."}
+                if result.status == MutationStatus.RATE_LIMITED:
+                    return {"ok": False, "spread_id": sid,
+                            "error": "Schwab rate limited the cancel. Check the order before another action."}
                 return {"ok": False, "spread_id": sid,
-                        "error": f"Schwab refused the cancel (HTTP {r.status_code}). It may have filled."}
+                        "error": "Schwab refused the cancel. It may have filled."}
             status, filled, final = "UNCONFIRMED", None, None
             for _ in range(10):
                 time.sleep(0.25)
