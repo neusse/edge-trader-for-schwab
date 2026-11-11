@@ -1,4 +1,5 @@
 from decimal import Decimal as D
+from dataclasses import replace
 
 from companion.brokers.models import (
     AssetType, BracketOrderIntent, CancelOrder, MultiLegOrderIntent, MutationStatus,
@@ -40,6 +41,11 @@ def test_credit_spread_keeps_one_paired_net_order():
     assert len(order["orderLegCollection"]) == 2
     assert {leg["instruction"] for leg in order["orderLegCollection"]} == {
         "SELL_TO_OPEN", "BUY_TO_OPEN"}
+
+
+def test_canonical_gtc_translates_to_schwab_duration():
+    order = build_schwab_order(replace(credit_spread(), time_in_force=TimeInForce.GTC))
+    assert order["duration"] == "GOOD_TILL_CANCEL"
 
 
 def credit_spread():

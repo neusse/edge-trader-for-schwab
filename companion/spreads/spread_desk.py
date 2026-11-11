@@ -106,6 +106,21 @@ def close_order(legs: list[dict], debit_spread: bool, price: Decimal, qty: int, 
                                    for l in legs]}
 
 
+def vertical_intent(legs: list[dict], *, opening: bool, net_debit: bool, price: Decimal,
+                    qty: int, duration: TimeInForce, client_order_id: str) -> MultiLegOrderIntent:
+    """Describe one atomic vertical without exposing Schwab's order-tree shape to the send path."""
+    actions = ((OrderInstruction.BUY_TO_OPEN, OrderInstruction.SELL_TO_OPEN) if opening else
+               (OrderInstruction.SELL_TO_CLOSE, OrderInstruction.BUY_TO_CLOSE))
+    return MultiLegOrderIntent(
+        legs=tuple(OrderLegIntent(
+            l["symbol"], AssetType.OPTION, actions[0] if l["side"] == "LONG" else actions[1],
+            Decimal(qty * abs(int(l.get("ratio") or 1))), Decimal(abs(int(l.get("ratio") or 1))),
+        ) for l in legs),
+        order_type=OrderType.LIMIT, time_in_force=duration, client_order_id=client_order_id,
+        limit_price=(price if net_debit else -price).quantize(Decimal("0.01")),
+    )
+
+
 def fill_net(order: dict | None, sp: dict) -> Decimal | None:
     """The spread's net entry price per spread from its entry order's executions (a limit can fill
     better): credit = sold leg minus bought leg, debit the other way. None until both legs show fills."""
@@ -413,17 +428,9 @@ class SpreadDesk:
         if not pv["ok"]:
             return {"ok": False, "error": f"Schwab's preview refused it: {pv['error']}. Nothing was sent."
                     if pv.get("rejected") else f"{pv['error']}. Nothing was sent.", "plan": p}
-        intent = MultiLegOrderIntent(
-            legs=tuple(OrderLegIntent(
-                l["symbol"], AssetType.OPTION,
-                OrderInstruction.BUY_TO_OPEN if l["side"] == "LONG" else OrderInstruction.SELL_TO_OPEN,
-                Decimal(exp_qty),
-            ) for l in legs),
-            order_type=OrderType.LIMIT,
-            time_in_force=TimeInForce.DAY,
-            client_order_id=ticket_id,
-            limit_price=exp_limit if p["kind"] == "DEBIT" else -exp_limit,
-        )
+        intent = vertical_intent(legs, opening=True, net_debit=p["kind"] == "DEBIT",
+                                 price=exp_limit, qty=exp_qty, duration=TimeInForce.DAY,
+                                 client_order_id=ticket_id)
         ticket = {"put_call": p["put_call"], "width": float(p["width"]), "entry_limit": float(exp_limit),
                   "max_loss": float(p["max_loss"]), "max_gain": float(p["max_gain"]),
                   "breakeven": float(p["breakeven"]), "request": order, "preview": pv["balance"]}
@@ -787,6 +794,9 @@ class SpreadDesk:
         if not pv["ok"]:
             return {"ok": False, "spread_id": sid, "error": (f"Schwab's preview refused the close: {pv['error']}"
                                                              if pv.get("rejected") else pv["error"]) + ". Nothing was sent."}
+        intent = vertical_intent(sp["legs"], opening=False, net_debit=not debit,
+                                 price=exp_limit, qty=qty, duration=TimeInForce.DAY,
+                                 client_order_id=f"{sid}-close")
         log.warning("CLOSE spread %s %s x%s of %s @ %s", sid, sp["kind"], qty, units, exp_limit)
         self.t.store.log_action("spread_close", sp["underlying"], None, "SENDING", sid)
         # Held BEFORE the POST: if the app stops between Schwab's answer and recording it, the spread
@@ -794,18 +804,13 @@ class SpreadDesk:
         self.book.hold(sid, "close being sent: if this stays, check thinkorswim, then Resolve")
         sent["v"] = True
         try:
-            r = self.t._logged("place_order", lambda: client.place_order(self.t._hash, order))
+            result = self.t._broker_mutation("place_order", SubmitOrder(intent))
         except Exception as e:
             self.book.hold(sid, f"close sent, no answer from Schwab ({type(e).__name__}): check thinkorswim, then Resolve")
             return {"ok": False, "spread_id": sid, "status": "UNKNOWN",
                     "error": "No answer from Schwab. The close MAY be live: check thinkorswim."}
-        if r.status_code in (200, 201):
-            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-            oid = int(tail) if tail.isdigit() else None
-            if oid is None:
-                self.book.hold(sid, "close accepted without an order id: check thinkorswim, then Resolve")
-                return {"ok": False, "spread_id": sid, "status": "UNKNOWN",
-                        "error": "Schwab accepted the close but gave no order id. Check thinkorswim."}
+        if result.status == MutationStatus.ACCEPTED and result.order_id is not None:
+            oid = int(result.order_id)
             self.book.attach_order(sid, "close", oid)
             self.book.clear_hold(sid)
             self.book.set_state(sid, "CLOSING", "close sent")
@@ -827,21 +832,21 @@ class SpreadDesk:
                 if not rt["ok"]:
                     out["warning"] = f"The close was sent, but the target was NOT put back: {rt['error']}"
             return out
-        if r.status_code == 429 or 400 <= r.status_code < 500:
+        if result.status in (MutationStatus.RATE_LIMITED, MutationStatus.REJECTED):
             # Schwab refused it: nothing was placed, the spread is open as before.
             sent["v"] = False
             self.book.clear_hold(sid)
             self.book.set_state(sid, "OPEN", "close not placed")
-        if r.status_code == 429:
+        if result.status == MutationStatus.RATE_LIMITED:
             return {"ok": False, "spread_id": sid, "status": "RATE_LIMITED",
-                    "error": "Schwab throttled the close (HTTP 429): nothing was placed. Click again to retry."}
-        if 400 <= r.status_code < 500:
-            self.t.store.log_action("spread_close", sp["underlying"], None, "REJECTED", f"HTTP {r.status_code}")
+                    "error": "Schwab throttled the close: nothing was placed. Click again to retry."}
+        if result.status == MutationStatus.REJECTED:
+            self.t.store.log_action("spread_close", sp["underlying"], None, "REJECTED", result.message)
             return {"ok": False, "spread_id": sid, "status": "REJECTED",
-                    "error": f"Schwab rejected the close (HTTP {r.status_code}): {plain_refusal(r.text[:300])}"}
-        self.book.hold(sid, f"close answered HTTP {r.status_code}: check thinkorswim, then Resolve")
+                    "error": f"Schwab rejected the close: {result.message}"}
+        self.book.hold(sid, (result.message or "close outcome unknown") + ": check thinkorswim, then Resolve")
         return {"ok": False, "spread_id": sid, "status": "UNKNOWN",
-                "error": f"Schwab answered HTTP {r.status_code}. The close MAY be live: check thinkorswim."}
+                "error": "The close MAY be live: check thinkorswim, then Resolve."}
 
     # ---- profit target (slice 3) --------------------------------------------------------------
 
@@ -1123,23 +1128,21 @@ class SpreadDesk:
         if not pv["ok"]:
             return {"ok": False, "spread_id": sid, "error": (f"Schwab's preview refused the target: {pv['error']}"
                                                              if pv.get("rejected") else pv["error"]) + f". Nothing was sent.{moved}"}
+        intent = vertical_intent(sp["legs"], opening=False, net_debit=not debit,
+                                 price=price, qty=units, duration=TimeInForce.GTC,
+                                 client_order_id=f"{sid}-target")
         log.warning("TARGET spread %s %s x%s @ %s GTC", sid, sp["kind"], units, price)
         self.t.store.log_action("spread_target", sp["underlying"], None, "SENDING", sid)
         self.book.hold(sid, "target being sent: if this stays, check thinkorswim, then Resolve")
         sent["v"] = True
         try:
-            r = self.t._logged("place_order", lambda: client.place_order(self.t._hash, order))
+            result = self.t._broker_mutation("place_order", SubmitOrder(intent))
         except Exception as e:
             self.book.hold(sid, f"target sent, no answer from Schwab ({type(e).__name__}): check thinkorswim, then Resolve")
             return {"ok": False, "spread_id": sid, "status": "UNKNOWN",
                     "error": "No answer from Schwab. The target MAY be live: check thinkorswim."}
-        if r.status_code in (200, 201):
-            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-            oid = int(tail) if tail.isdigit() else None
-            if oid is None:
-                self.book.hold(sid, "target accepted without an order id: check thinkorswim, then Resolve")
-                return {"ok": False, "spread_id": sid, "status": "UNKNOWN",
-                        "error": "Schwab accepted the target but gave no order id. Check thinkorswim."}
+        if result.status == MutationStatus.ACCEPTED and result.order_id is not None:
+            oid = int(result.order_id)
             self.book.attach_order(sid, "target", oid)
             self.book.clear_hold(sid)
             self.book.set_state(sid, *after)
@@ -1147,17 +1150,20 @@ class SpreadDesk:
             return {"ok": True, "spread_id": sid, "order_id": oid, "limit": _f(price), "qty": units,
                     "moved": bool(sent.get("old"))}
         sent["v"] = False
-        if r.status_code == 429 or 400 <= r.status_code < 500:
+        if result.status in (MutationStatus.RATE_LIMITED, MutationStatus.REJECTED):
             self.book.clear_hold(sid)
             self.book.set_state(sid, after[0], "target not placed")
-            self.t.store.log_action("spread_target", sp["underlying"], None, "REJECTED", f"HTTP {r.status_code}")
-            why = ("Schwab throttled the target (HTTP 429): nothing was placed. Click again to retry." if r.status_code == 429
-                   else f"Schwab rejected the target (HTTP {r.status_code}): {plain_refusal(r.text[:300])}")
-            return {"ok": False, "spread_id": sid, "status": "RATE_LIMITED" if r.status_code == 429 else "REJECTED",
+            self.t.store.log_action("spread_target", sp["underlying"], None,
+                                    result.status.value.upper(), result.message)
+            why = ("Schwab throttled the target: nothing was placed. Click again to retry."
+                   if result.status == MutationStatus.RATE_LIMITED else
+                   f"Schwab rejected the target: {result.message}")
+            return {"ok": False, "spread_id": sid, "status": result.status.value.upper().replace("-", "_"),
                     "error": why + moved}
-        self.book.hold(sid, f"target answered HTTP {r.status_code}: check thinkorswim, then Resolve")
+        sent["v"] = True
+        self.book.hold(sid, (result.message or "target outcome unknown") + ": check thinkorswim, then Resolve")
         return {"ok": False, "spread_id": sid, "status": "UNKNOWN",
-                "error": f"Schwab answered HTTP {r.status_code}. The target MAY be live: check thinkorswim."}
+                "error": "The target MAY be live: check thinkorswim, then Resolve."}
 
     def cancel_target(self, spread_id: str) -> dict:
         """Cancel the spread's working target (only removes an exit order: no arming needed)."""
