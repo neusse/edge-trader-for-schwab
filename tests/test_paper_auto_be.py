@@ -144,6 +144,21 @@ def test_auto_be_ignores_stale_indicative_or_changed_oco(tmp_path):
         store.close()
 
 
+def test_auto_be_accepts_small_broker_clock_lead(tmp_path):
+    now = datetime.now(timezone.utc)
+    position, group = pair()
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    try:
+        watch = PaperAutoBEWatch(store)
+        row = watch.set(oco_auto_be_plan(position, group), now - timedelta(seconds=10))
+        assert observe(watch, row, position, group,
+                       quote(now + timedelta(seconds=3)), now)["status"] == "watching"
+        assert observe(watch, row, position, group,
+                       quote(now + timedelta(seconds=7)), now)["status"] == "suspended"
+    finally:
+        store.close()
+
+
 def test_auto_be_restart_after_claim_never_retries(tmp_path):
     now = datetime.now(timezone.utc)
     position, group = pair()

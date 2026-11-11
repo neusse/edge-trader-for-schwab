@@ -34,7 +34,7 @@ def entry_plan(body: dict, quote, now: datetime | None = None) -> BracketOrderIn
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
-    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+    if quote.observed_at.tzinfo is None or not -5 <= (now - quote.observed_at).total_seconds() <= 30:
         raise ValueError("Alpaca Paper quote is stale; refresh before ordering")
     reference = quote.mark or quote.last
     if reference is None or reference <= 0:
@@ -91,7 +91,7 @@ def oco_plan(body: dict, position: Position, quote,
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
-    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+    if quote.observed_at.tzinfo is None or not -5 <= (now - quote.observed_at).total_seconds() <= 30:
         raise ValueError("Alpaca Paper quote is stale; refresh before ordering")
     mark = quote.mark or quote.last
     if mark is None or mark <= 0:
@@ -130,7 +130,7 @@ def close_plan(body: dict, position: Position, quote,
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
-    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+    if quote.observed_at.tzinfo is None or not -5 <= (now - quote.observed_at).total_seconds() <= 30:
         raise ValueError("Alpaca Paper quote is stale; refresh before closing")
     if not (quote.mark or quote.last) or (quote.mark or quote.last) <= 0:
         raise ValueError("Alpaca Paper quote has no usable price")
@@ -161,7 +161,7 @@ def add_plan(body: dict, position: Position, quote,
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
-    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+    if quote.observed_at.tzinfo is None or not -5 <= (now - quote.observed_at).total_seconds() <= 30:
         raise ValueError("Alpaca Paper quote is stale; refresh before adding shares")
     if not (quote.mark or quote.last) or (quote.mark or quote.last) <= 0:
         raise ValueError("Alpaca Paper quote has no usable price")
@@ -190,7 +190,7 @@ def trailing_plan(body: dict, position: Position, quote,
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
-    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+    if quote.observed_at.tzinfo is None or not -5 <= (now - quote.observed_at).total_seconds() <= 30:
         raise ValueError("Alpaca Paper quote is stale; refresh before attaching a trail")
     mark = quote.mark or quote.last
     if mark is None or mark <= 0:
@@ -313,7 +313,7 @@ def equity_exit_reprice(body: dict, position: Position, group: OrderGroup, quote
     if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
         raise ValueError("a current Alpaca Paper IEX quote is required")
     now = now or datetime.now(timezone.utc)
-    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+    if quote.observed_at.tzinfo is None or not -5 <= (now - quote.observed_at).total_seconds() <= 30:
         raise ValueError("Alpaca Paper quote is stale; refresh before adjusting the exit")
     mark = quote.mark or quote.last
     if mark is None or mark <= 0:
