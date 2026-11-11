@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from .adapter import BrokerAdapter
 from .policy import contains_option_leg
 from .models import (
-    AccountQuery, AccountSnapshot, AssetType, BrokerCommand, ClientOrderQuery, MarketSessionsQuery,
+    AccountQuery, AccountSnapshot, AssetType, BrokerCommand, CancelOrder, ClientOrderQuery, MarketSessionsQuery,
     MutationResult, MutationStatus, OrderClass, OrderInstruction, OrderQuery, OrderRole,
     OrderStatus, ReplaceOrder, SubmitOrder, TimeInForce,
 )
