@@ -1504,46 +1504,50 @@ class Trader:
         results = []
         unknown_replace = False
         for p in stops:
-            r = self._logged("order_details", lambda o=p.order_id: client.order_details(self._hash, o))
-            cur = r.json() if r.status_code == 200 else {}
-            if cur.get("status") not in LIVE:
-                results.append({"order_id": p.order_id, "ok": False, "note": f"stop is {cur.get('status')}"})
+            try:
+                group = self._broker_query("order_details", OrderQuery(str(p.order_id)))
+                cur = next((order for order in group.orders if order.order_id == str(p.order_id)), None)
+            except Exception:
+                cur = None
+            status = cur.status_detail if cur else None
+            if status not in LIVE:
+                results.append({"order_id": p.order_id, "ok": False, "note": f"stop is {status}"})
                 continue
             if only:
-                was = _dec(cur.get("stopPrice"))
-                if cur.get("orderType") not in ("STOP", "STOP_LIMIT") or was is None:
-                    results.append({"order_id": p.order_id, "ok": False, "note": f"it is a {cur.get('orderType')} order now"})
+                was = cur.stop_price
+                if cur.order_type not in (OrderType.STOP, OrderType.STOP_LIMIT) or was is None:
+                    results.append({"order_id": p.order_id, "ok": False,
+                                    "note": f"it is a {cur.order_type_detail} order now"})
                     continue
                 if was >= price if side == "LONG" else was <= price:
                     results.append({"order_id": p.order_id, "ok": False, "note": f"already at {f(was)}, not loosened"})
                     continue
-            legs = cur.get("orderLegCollection") or []
-            if len(legs) != 1 or cur.get("orderType") not in ("STOP", "STOP_LIMIT"):
+            legs = cur.legs
+            if len(legs) != 1 or cur.order_type not in (OrderType.STOP, OrderType.STOP_LIMIT):
                 results.append({"order_id": p.order_id, "ok": False,
                                 "note": "the current stop is not a single fixed stop"})
                 continue
             leg = legs[0]
-            if ((leg.get("instrument") or {}).get("symbol") != symbol or
-                    (leg.get("instrument") or {}).get("assetType", "EQUITY") != asset or
-                    str(cur.get("duration", "DAY")).upper() not in ("DAY", "GTC", "GOOD_TILL_CANCEL")):
+            if (leg.symbol != symbol or asset not in AssetType.__members__ or
+                    leg.asset_type != AssetType[asset] or
+                    str(cur.duration_detail or "DAY").upper() not in ("DAY", "GTC", "GOOD_TILL_CANCEL")):
                 results.append({"order_id": p.order_id, "ok": False,
                                 "note": "the current stop's symbol, asset, or duration changed"})
                 continue
             try:
                 replacement = SimpleOrderIntent(
-                    OrderLegIntent(symbol, AssetType[asset], OrderInstruction[leg["instruction"]],
-                                   Decimal(str(leg["quantity"]))),
-                    OrderType.STOP_LIMIT if cur["orderType"] == "STOP_LIMIT" else OrderType.STOP,
-                    TimeInForce.GTC if _gtc(cur.get("duration")) else TimeInForce.DAY,
+                    OrderLegIntent(symbol, AssetType[asset], leg.instruction, leg.quantity),
+                    cur.order_type,
+                    cur.time_in_force,
                     f"move-stop-{symbol}-{now_iso()}",
-                    limit_price=Decimal(str(cur["price"])) if cur["orderType"] == "STOP_LIMIT" else None,
+                    limit_price=cur.limit_price if cur.order_type == OrderType.STOP_LIMIT else None,
                     stop_price=Decimal(f(price)),
                 )
             except (KeyError, ValueError, TypeError) as e:
                 results.append({"order_id": p.order_id, "ok": False, "note": f"invalid current stop: {e}"})
                 continue
             self.store.log_action("move_stop", symbol, p.order_id, "SENDING",
-                                  f"{f(Decimal(str(cur.get('stopPrice') or 0)))} -> {f(price)}")
+                                  f"{f(cur.stop_price or Decimal(0))} -> {f(price)}")
             try:
                 result = self._broker_mutation("replace_order", ReplaceOrder(str(p.order_id), replacement))
             except Exception as e:
