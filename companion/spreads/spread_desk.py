@@ -19,7 +19,10 @@ from datetime import date, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 
 from ..bracket import PENNY_ALL_ROOTS, put_call
-from ..brokers.models import CancelOrder, MutationStatus
+from ..brokers.models import (
+    AssetType, CancelOrder, MultiLegOrderIntent, MutationStatus, OrderInstruction,
+    OrderLegIntent, OrderType, SubmitOrder, TimeInForce,
+)
 from ..orders import TERMINAL
 from ..pnl import ET
 from ..trading import INDEX_ROOTS, _odd_deliverable, _occ_root, _all_symbols, _nodes, market_open, regular_hours_text, terminal_ids
@@ -410,6 +413,17 @@ class SpreadDesk:
         if not pv["ok"]:
             return {"ok": False, "error": f"Schwab's preview refused it: {pv['error']}. Nothing was sent."
                     if pv.get("rejected") else f"{pv['error']}. Nothing was sent.", "plan": p}
+        intent = MultiLegOrderIntent(
+            legs=tuple(OrderLegIntent(
+                l["symbol"], AssetType.OPTION,
+                OrderInstruction.BUY_TO_OPEN if l["side"] == "LONG" else OrderInstruction.SELL_TO_OPEN,
+                Decimal(exp_qty),
+            ) for l in legs),
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY,
+            client_order_id=ticket_id,
+            limit_price=exp_limit if p["kind"] == "DEBIT" else -exp_limit,
+        )
         ticket = {"put_call": p["put_call"], "width": float(p["width"]), "entry_limit": float(exp_limit),
                   "max_loss": float(p["max_loss"]), "max_gain": float(p["max_gain"]),
                   "breakeven": float(p["breakeven"]), "request": order, "preview": pv["balance"]}
@@ -422,35 +436,30 @@ class SpreadDesk:
         log.warning("PLACE spread %s x%s %s %s @ %s", p["kind"], exp_qty, syms[0].strip(), syms[1].strip(), exp_limit)
         self.t.store.log_action("spread_entry", p["underlying"], None, "SENDING", sid)
         try:
-            r = self.t._logged("place_order", lambda: client.place_order(self.t._hash, order))
+            result = self.t._broker_mutation("place_order", SubmitOrder(intent))
         except Exception as e:
             self.book.set_state(sid, "UNKNOWN", f"no answer from Schwab ({type(e).__name__}): check thinkorswim, "
                                                 "then Resolve")
             return {"ok": False, "status": "UNKNOWN", "spread_id": sid,
                     "error": "No answer from Schwab. The spread MAY be live: check thinkorswim."}
-        if r.status_code in (200, 201):
-            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-            oid = int(tail) if tail.isdigit() else None
-            if oid is None:
-                self.book.set_state(sid, "UNKNOWN", "Schwab accepted it without an order id: check thinkorswim, "
-                                                    "then Resolve")
-                return {"ok": False, "status": "UNKNOWN", "spread_id": sid,
-                        "error": "Schwab accepted the spread but gave no order id. Check thinkorswim."}
+        if result.status == MutationStatus.ACCEPTED and result.order_id is not None:
+            oid = int(result.order_id)
             self.book.attach_order(sid, "entry", oid)
             self.book.set_state(sid, "PENDING", "entry sent")
             self.t.store.log_action("spread_entry", p["underlying"], oid, "ACCEPTED", sid)
             return {"ok": True, "spread_id": sid, "order_id": oid, "plan": p, "balance": pv["balance"]}
-        if r.status_code == 429:
-            self.book.set_state(sid, "CANCELED", "throttled (HTTP 429): not placed")
-            return {"ok": False, "status": "RATE_LIMITED", "spread_id": sid, "retry_after": r.headers.get("Retry-After"),
-                    "error": "Schwab throttled the order request (HTTP 429): nothing was placed. Click again to retry."}
-        if 400 <= r.status_code < 500:
-            self.book.set_state(sid, "CANCELED", f"rejected: HTTP {r.status_code} {r.text[:200]}")
+        if result.status == MutationStatus.RATE_LIMITED:
+            self.book.set_state(sid, "CANCELED", result.message or "rate limited")
+            return {"ok": False, "status": "RATE_LIMITED", "spread_id": sid,
+                    "retry_after": result.retry_after_seconds,
+                    "error": "Schwab throttled the order request: nothing was placed. Click again to retry."}
+        if result.status == MutationStatus.REJECTED:
+            self.book.set_state(sid, "CANCELED", result.message or "rejected")
             return {"ok": False, "status": "REJECTED", "spread_id": sid,
-                    "error": f"Schwab rejected the spread (HTTP {r.status_code}): {plain_refusal(r.text[:300])}"}
-        self.book.set_state(sid, "UNKNOWN", f"HTTP {r.status_code}: check thinkorswim, then Resolve")
+                    "error": f"Schwab rejected the spread: {result.message}"}
+        self.book.set_state(sid, "UNKNOWN", (result.message or "unknown outcome") + ": check thinkorswim, then Resolve")
         return {"ok": False, "status": "UNKNOWN", "spread_id": sid,
-                "error": f"Schwab answered HTTP {r.status_code}. The spread MAY be live: check thinkorswim."}
+                "error": "The spread MAY be live: check thinkorswim, then Resolve."}
 
     def _working_on(self, client, syms: set[str], exclude: frozenset = frozenset()) -> list[int]:
         """Order ids, read now, that can still execute and touch any of these contracts (today's
