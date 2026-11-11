@@ -166,6 +166,7 @@ def test_submit_previews_then_places_one_vertical_and_reserves_both_legs(desk):
     assert r["ok"] and r["order_id"] == 700
     placed = desk.t._client.placed
     assert len(placed) == 1 and placed[0]["price"] == "1.20" and placed[0]["orderType"] == "NET_CREDIT"
+    assert placed[0] == entry_order(plan()["legs"], False, Decimal("1.20"), 1)
     sp = desk.book.get(r["spread_id"])
     assert sp["state"] == "PENDING" and sp["entry_order_id"] == 700 and sp["ticket"]["max_loss"] == 380.0
     assert desk.t._spread_gate([LO_P])                 # single-leg actions refuse both contracts now
@@ -206,6 +207,14 @@ def test_a_rejected_entry_releases_the_contracts(desk):
     r = send(desk)
     assert r["status"] == "REJECTED" and desk.book.get(r["spread_id"])["state"] == "CANCELED"
     assert desk.book.owner_of([HI_P]) is None
+
+
+def test_rate_limited_spread_entry_does_not_retry(desk):
+    desk.t._client.place_resp = Resp(429, {"Retry-After": "15"})
+    result = send(desk)
+    assert result["status"] == "RATE_LIMITED" and result["retry_after"] == 15
+    assert desk.book.get(result["spread_id"])["state"] == "CANCELED"
+    assert len(desk.t._client.placed) == 1
 
 
 def test_no_answer_keeps_the_contracts_and_blocks_the_next_spread(desk):
