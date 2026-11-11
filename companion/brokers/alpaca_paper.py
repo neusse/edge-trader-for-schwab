@@ -114,11 +114,15 @@ def _order_group(raw) -> OrderGroup:
         if legs:
             raw_status = _enum_value(member.status)
             # Alpaca holds a bracket/OCO exit at the broker until it can trigger.
-            # Keep other held orders unknown so they cannot appear actionable.
+            # A replacement lookup can return the held stop alone, without the
+            # filled entry; its app-owned replacement client ID identifies it.
             status = (OrderStatus.WORKING if raw_status == "held" and
                       (group_class == OrderClass.OCO or
                        group_class == OrderClass.BRACKET and
-                       _enum_value(raw.status) == "filled") and
+                       (_enum_value(raw.status) == "filled" or
+                        member is raw and role == OrderRole.STOP and
+                        str(member.client_order_id or "").startswith(
+                            ("et-exit-", "et-autobe-")))) and
                       role in (OrderRole.STOP, OrderRole.TARGET) else
                       _ORDER_STATUS.get(raw_status, OrderStatus.UNKNOWN))
             members.append(BrokerOrder(
