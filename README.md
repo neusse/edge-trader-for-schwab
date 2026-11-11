@@ -128,7 +128,8 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, confirmed equity bracket or explicitly unprotected simple market/limit entry from the Paper form, cancellation or limit repricing of an unfilled app-created entry, OCO exits with target and tighter fixed-stop adjustments, a standalone trailing stop, a full or partial market close or add shares for an order-free whole-share equity position, reviewed long call/put, covered-call/cash-secured-put, and defined-risk vertical limit entries, an exact held vertical multi-leg limit close or GTC profit target with guarded target repricing, app-watched vertical stops when OPRA is available, a full or partial held-option limit close, one fixed option stop, stop-limit, or target, and cancellation of the unfilled remainder of an app-created option or vertical order. Stock quotes use Alpaca IEX data and ordinary option views use indicative data. No live Alpaca order endpoint is configured.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads plus the Paper order actions described above. The app sends an order only after its review and confirmation or an explicitly enabled app-watched stop trigger. No live Alpaca order endpoint is configured.
+- **Alpaca market data** (`data.alpaca.markets`): stock IEX quotes, option contracts and indicative quotes. An enabled app-watched vertical stop separately requests real-time OPRA option quotes. That request needs OPRA entitlement; a 403 leaves monitoring suspended and sends no close.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
@@ -275,6 +276,8 @@ never touches them. Stop the app first (`stop.bat`).
 
 **If you downloaded the ZIP:** unzip the new version into a new folder, copy `.env` and the `data`
 folder across, run `setup.bat` once, then `launch.bat`.
+
+For a broker-changing release, follow the [Paper validation and rollback checklist](docs/paper-release-readiness.md) before re-arming orders.
 
 ## Configuration
 
