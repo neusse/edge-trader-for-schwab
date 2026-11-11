@@ -32,6 +32,7 @@ from .brokers.models import (
     TrailingOrderIntent, TrailingStopSpec,
 )
 from .brokers.schwab_adapter import SchwabAdapter
+from .brokers.policy import contains_option_leg
 from .orders import LIVE, TERMINAL, PendingOrder, cancellable_unfilled_entry, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
@@ -511,6 +512,8 @@ class Trader:
 
     def _broker_mutation(self, endpoint: str, command):
         """Send one canonical command through the selected Schwab adapter and log its result."""
+        if not getattr(self, "options_trading_enabled", True) and contains_option_leg(command):
+            raise ValueError("Option trading is disabled for both brokers")
         started = now_iso()
         if self.on_request:
             self.on_request(None)
@@ -886,6 +889,10 @@ class Trader:
             return {"ok": False, "order_id": order_id, "error": "Could not read the order."}
         root = next((order for order in group.orders if order.parent_id is None and
                      order.order_id == group.group_id), None)
+        if not getattr(self, "options_trading_enabled", True) and any(
+                leg.asset_type == AssetType.OPTION for order in group.orders for leg in order.legs):
+            return {"ok": False, "order_id": order_id,
+                    "error": "Option trading is disabled for both brokers"}
         symbols = {leg.symbol for order in group.orders for leg in order.legs}
         sym = root.legs[0].symbol if root and root.legs else next(iter(symbols), None)
         gate = self._spread_gate(symbols, order_id=order_id, symbol=sym)
@@ -1611,6 +1618,9 @@ class Trader:
             self.store.set_auto_be(ticket_id, state, text)
             self.store.log_action("auto_be", symbol, None, state, text)
             return {"ok": ok, "state": state, "message": text}
+
+        if not getattr(self, "options_trading_enabled", True) and OCC_RE.fullmatch(symbol):
+            return done("SKIPPED", "Option trading is disabled for both brokers")
 
         if not market_open():
             self.store.set_auto_be(ticket_id, "PENDING", "market closed", only_from="SENDING")

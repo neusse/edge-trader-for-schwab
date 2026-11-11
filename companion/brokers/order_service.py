@@ -10,6 +10,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .adapter import BrokerAdapter
+from .policy import contains_option_leg
 from .models import (
     AccountQuery, AccountSnapshot, AssetType, BrokerCommand, ClientOrderQuery, MarketSessionsQuery,
     MutationResult, MutationStatus, OrderClass, OrderInstruction, OrderQuery, OrderRole,
@@ -22,13 +23,15 @@ ET = ZoneInfo("America/New_York")
 
 class BrokerOrderService:
     def __init__(self, adapter: BrokerAdapter, store: Store, account_ref: str,
-                 clock: Callable[[], datetime] | None = None):
+                 clock: Callable[[], datetime] | None = None,
+                 *, options_trading_enabled: bool = True):
         if store.scope != (adapter.identity.key, account_ref):
             raise ValueError("order store must match broker and account")
         self.adapter = adapter
         self.store = store
         self.account_ref = account_ref
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.options_trading_enabled = options_trading_enabled
         self._lock = threading.Lock()
         self.arm(False)
 
@@ -57,6 +60,9 @@ class BrokerOrderService:
 
     def execute(self, command: BrokerCommand, request_id: str,
                 preflight: Callable[[AccountSnapshot], None] | None = None) -> MutationResult:
+        if not self.options_trading_enabled and contains_option_leg(command):
+            return MutationResult(MutationStatus.REJECTED,
+                                  message="Option trading is disabled for both brokers")
         if not self._lock.acquire(blocking=False):
             return MutationResult(MutationStatus.UNKNOWN, message="Another order action is in progress")
         try:
@@ -84,6 +90,12 @@ class BrokerOrderService:
                 if account.account_ref != self.account_ref:
                     return MutationResult(MutationStatus.REJECTED,
                                           message="Active account changed; no order was sent")
+                if not self.options_trading_enabled and isinstance(command, (CancelOrder, ReplaceOrder)):
+                    group = self.adapter.query(OrderQuery(command.order_id))
+                    legs = tuple(leg for order in group.orders for leg in order.legs) if group else ()
+                    if not legs or any(leg.asset_type != AssetType.EQUITY for leg in legs):
+                        return MutationResult(MutationStatus.REJECTED,
+                                              message="Only equity orders may be changed in this app")
                 if preflight is not None:
                     preflight(account)
                 if isinstance(command, SubmitOrder):

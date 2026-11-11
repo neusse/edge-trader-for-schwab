@@ -75,6 +75,7 @@ def test_switch_disarms_paper_service_stops_poller_and_isolates_store(monkeypatc
         assert events[-1] == ("start", "demo")
         assert appmod.trader.store is created["demo"].store
         assert not appmod.trader.armed
+        assert appmod.trader.options_trading_enabled is False
         assert created["demo"].store.get_setting("scope_marker") is None
     finally:
         if "demo" in created:

@@ -25,7 +25,7 @@ from ..store import Store
 
 
 class AlpacaBootstrapPoller:
-    def __init__(self, adapter: AlpacaPaperAdapter | None = None):
+    def __init__(self, adapter: AlpacaPaperAdapter | None = None, *, options_trading_enabled: bool = False):
         self.store = Store(Path(":memory:"))
         self._stores = [self.store]
         self.trader = None
@@ -41,6 +41,7 @@ class AlpacaBootstrapPoller:
         self.order_service: BrokerOrderService | None = None
         self.auto_be: PaperAutoBEWatch | None = None
         self.spread_stops: PaperSpreadStopWatch | None = None
+        self.options_trading_enabled = options_trading_enabled
         self.action_lock = None  # injected by app; never wait for it while broker selection stops us
         self._last_fill_read: datetime | None = None
         self._sessions_date = None
@@ -78,7 +79,8 @@ class AlpacaBootstrapPoller:
                 with self._lock:
                     self.store = scoped
                     self.order_service = BrokerOrderService(self._adapter, scoped,
-                                                             account.account_ref)
+                                                             account.account_ref,
+                                                             options_trading_enabled=self.options_trading_enabled)
                     self.auto_be = PaperAutoBEWatch(scoped)
                     self.spread_stops = PaperSpreadStopWatch(scoped)
                     if self.trader is not None:
@@ -194,8 +196,9 @@ class AlpacaBootstrapPoller:
                 account, groups, fills, quotes, now=now,
                 orders_fresh=True, history_complete=fill_error is None and
                 self._last_fill_read is not None, freshness=freshness)
-            paper_spread_stops = self._spread_stop_rows(account, groups, clock,
+            paper_spread_stops = (self._spread_stop_rows(account, groups, clock,
                                                         today_session, now)
+                                  if self.options_trading_enabled else [])
             paper_auto_be = self._auto_be_rows(account, groups, quotes, clock,
                                                today_session, now)
             positions = [{"symbol": p.symbol, "asset_type": p.asset_type.value,
@@ -282,6 +285,8 @@ class AlpacaBootstrapPoller:
             for group in groups for order in group.orders)
 
     def _send_spread_stop(self, stop: dict) -> None:
+        if not self.options_trading_enabled:
+            return
         watch = self.spread_stops
         lock = self.action_lock
         if lock is None or not lock.acquire(blocking=False):
@@ -362,6 +367,8 @@ class AlpacaBootstrapPoller:
             lock.release()
 
     def _spread_stop_rows(self, account, groups, clock, today_session, now) -> list[dict]:
+        if not self.options_trading_enabled:
+            return []
         watch = self.spread_stops
         if watch is None:
             return []

@@ -173,7 +173,7 @@ def test_poller_sends_one_atomic_close_only_after_confirmed_opra_hit(tmp_path, r
     adapter = SimpleNamespace(query=query)
     service = SimpleNamespace(adapter=adapter, store=store, account_ref="paper-account",
                               armed=True, execute=execute)
-    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller = AlpacaBootstrapPoller(adapter=adapter, options_trading_enabled=True)
     poller.spread_stops = monitor
     poller.order_service = service
     poller.action_lock = RLock()
@@ -214,7 +214,7 @@ def test_poller_suspends_send_stop_when_opra_is_unavailable(tmp_path):
     def query(value):
         if isinstance(value, QuotesQuery): raise Forbidden()
         raise AssertionError(type(value))
-    poller = AlpacaBootstrapPoller(adapter=SimpleNamespace(query=query))
+    poller = AlpacaBootstrapPoller(adapter=SimpleNamespace(query=query), options_trading_enabled=True)
     poller.spread_stops = monitor
     poller.order_service = SimpleNamespace(armed=True)
     session = MarketSession(now.date(), now - timedelta(hours=1),

@@ -445,7 +445,7 @@
     </div>`;
   }
   const classicWorkspace = renderWorkspace;
-  renderWorkspace = (p, st) => (ON && p && !VIEW ? cockpitWorkspace(p, st) : classicWorkspace(p, st));
+  renderWorkspace = (p, st) => (ON && p && !VIEW && p.asset_type !== "OPTION" ? cockpitWorkspace(p, st) : classicWorkspace(p, st));
 
   // ---- spread ladder (Cockpit only) -----------------------------------------------------------
   // A companion vertical's net price per spread, from 0 to its width, at true spacing. spreads.js

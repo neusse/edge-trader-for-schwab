@@ -5,8 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Watch the walkthrough on YouTube](https://img.shields.io/badge/YouTube-Watch_the_walkthrough-FF0000?logo=youtube&logoColor=white)](https://youtu.be/41VQNmCN2r4)
 
-A local day-trading dashboard and one-click order ticket for a Charles Schwab account, built on the
-Schwab Trader API. It shows your open positions with live R, open and realized P&L and every working
+A local equities trading dashboard for Alpaca Paper and Charles Schwab. Alpaca Paper is selected by
+default; Schwab and Demo are selectable in the app. It shows your open positions with live R, open and realized P&L and every working
 order, and lets you enter a fully protected bracket (entry, stop and target, sized from the dollars you
 want to risk) and manage it with one click: stop to break-even, move the stop, trail it, replace the
 target, take partials, cancel or close. It runs on your own computer, next to thinkorswim or your charts.
@@ -43,71 +43,21 @@ unprotected until the fill is confirmed and an OCO for the new total position is
 An order-free whole-share equity position can instead attach one standalone broker-held trailing
 stop by dollar or percent distance. It has no paired target, does not trigger outside regular market
 hours, and a triggered stop becomes a market order whose fill may differ from the stop price.
-The Paper option discovery view fetches active expirations for an underlying, then lists OCC
-contracts for one selected expiration and call/put type,
-with Alpaca indicative quotes, Greeks, implied volatility, and open interest when supplied.
-Those quotes can be delayed or absent. A level-2-or-higher Paper account can select a standard
-call or put and send a reviewed buy-to-open limit order during regular hours. It has no attached
-stop or target; the full premium can be lost. The app refuses an existing position or active order
-in that contract, and an unknown submit outcome blocks further order actions until reconciled.
-A level-1-or-higher Paper account can also review a covered call or cash-secured put sell-to-open
-limit order. Covered calls require 100 uncommitted underlying shares per contract; cash-secured
-puts require options buying power for the full strike value of the underlying shares. The app
-refuses conflicting active orders on that underlying during review and final preflight. Short
-options can be assigned, and no stop or target is attached automatically. While a short call is
-held, the Paper equity close, OCO, and trailing exit controls refuse to sell its underlying
-shares; close the call first.
-A level-3 Paper account can open a same-expiration, same-type 1:1 vertical with one multi-leg
-limit order. The signed net limit is positive for a debit and negative for a credit. The preview
-shows strike width and maximum loss, and the app checks options buying power before sending.
-An accepted entry has no attached broker-held spread stop or target. An exact held 1:1 vertical with equal whole-contract leg quantities can be
-closed using one reviewed multi-leg limit order. An active order on that underlying blocks a
-second action, and the app rechecks both held legs before submitting. A partial or unknown close
-must be reconciled with the broker before another close is attempted. The same held pair can
-receive one GTC multi-leg profit target when the broker's average entry prices prove the reviewed
-net limit would earn a profit before fees. This target is broker-held but has no paired stop; an
-active target blocks another close until canceled or filled and reconciled.
-An app-watched spread stop is available for an order-free held pair. Choose watch-only or explicitly
-opt in to one automatic close attempt. The stop is a local watch, never broker-held: it needs the app
-running, Paper orders armed for a send stop, regular market hours, and two distinct fresh verified OPRA
-quotes. Alpaca's free indicative option feed never triggers it. Without OPRA entitlement a watch-only
-stop can be saved but stays suspended, and automatic send cannot be enabled. The configured Paper
-account may need a paid OPRA subscription. At the threshold, the app uses a reviewed loss guard and
-one multi-leg limit close based on executable quotes; the price may be worse than the trigger and the
-order may not fill. A working target or any other active option order on the underlying suspends the
-stop. A position change, stale quote, market closure, missing arming, or app shutdown also suspends it.
-An uncertain send blocks further actions until broker reconciliation. An interrupted send becomes
-unknown after restart and must be checked against Alpaca Paper before clearing the local watch.
-An active app-created Paper vertical order can request cancellation of its unfilled remainder.
-Already filled legs remain in the account, and an unknown cancellation stays blocked until the
-broker confirms its final order state.
-A held Paper option position with no active order can be closed in whole or in part using a
-confirmed limit order. The app rechecks the position before sending; any remaining contracts
-receive no new broker-held exit from that close.
-An active option order created by Edge Trader can request cancellation of its unfilled remainder.
-Already filled contracts remain in the account; an unknown cancel result blocks later order actions
-until the broker confirms its final state.
-An order-free held option can receive one broker-held GTC fixed stop, stop-limit, or target for the
-full contract quantity. Alpaca does not pair option exits as OCO, so the app never attaches two.
-A fixed stop becomes a market order when triggered and its fill can differ from the stop price.
-A stop-limit may remain unfilled after triggering while losses grow. Cancel the existing exit and
-verify its final broker state before changing exit type.
-A lost submit or cancel response also blocks new order actions until the broker confirms its outcome. Other Alpaca order workflows are still being
-connected. Select Schwab in the app for the existing Schwab trading workflows. Switching disarms
+**Trading scope:** This app supports equities only in Alpaca Paper and Schwab. Option and spread trading controls, API routes, and automatic spread-stop sending are disabled for both brokers. Existing option positions and orders may still appear in read-only account views; manage them directly with the broker.
+
+A lost submit or cancel response also blocks new order actions until the broker confirms its outcome. Select Schwab in the app for its equity trading workflows. Switching disarms
 entries and loads a fresh broker runtime before order controls can be used again.
 The strip below the header explains which workflows the selected broker can currently use; Demo
 shows invented data with order controls disabled.
 
 These Paper screenshots use invented account data and intercepted browser responses.
 
-![Alpaca Paper overview with invented Auto B/E and app-watched spread stops](docs/screenshot-alpaca-paper-demo.png)
+![Alpaca Paper overview with invented Auto B/E](docs/screenshot-alpaca-paper-demo.png)
 
 ![Alpaca Paper equity bracket form with invented demo state](docs/screenshot-paper-entry-demo.png)
 
-![Alpaca Paper option discovery and vertical controls with invented contracts](docs/screenshot-paper-options-demo.png)
-
 - **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks to the selected broker.
-- **Every order is your click.** No signals, no auto-trading. Two exceptions, both opt-in per trade: pick "Auto B/E 1R" on the ticket and the app moves that trade's stop to break-even once, when price reaches +1R; tick "Send when hit" on a spread's stop and the app sends that spread's close once, when the stop is reached.
+- **Every order is your click.** No signals, no auto-trading. The optional Auto B/E watch can move an equity stop to break-even once at +1R.
 - **Protection first for Schwab trades.** Entries go in as one Schwab bracket, so the stop and target live at Schwab even if the app or your PC is off. Leaving out the stop is possible only when you size by quantity, and the ticket asks you to confirm it every time.
 - **Honest numbers.** P&L comes from your own fills, and anything incomplete is labeled as such, never shown as complete.
 - **Free and MIT licensed.** No paid tier.
@@ -143,8 +93,8 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads plus the Paper order actions described above. The app sends an order only after its review and confirmation or an explicitly enabled app-watched stop trigger. No live Alpaca order endpoint is configured.
-- **Alpaca market data** (`data.alpaca.markets`): stock IEX quotes, option contracts and indicative quotes. An enabled app-watched vertical stop separately requests real-time OPRA option quotes. That request needs OPRA entitlement; a 403 leaves monitoring suspended and sends no close.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads plus the equity actions described above. The app sends an order only after its review and confirmation. No live Alpaca order endpoint is configured.
+- **Alpaca market data** (`data.alpaca.markets`): stock IEX quotes for equity workflows. Existing option holdings may be quoted indicatively; option trading and automatic spread stops are disabled.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
@@ -166,30 +116,14 @@ Keys live in `.env` or your process environment on your machine, which is never 
   (it checks every 3 seconds and only while the app is running; it never loosens a stop). One click
   sends one Schwab bracket. Entries must be armed each session.
 - **Size by risk or by quantity:** size from your risk and stop (the default), or type the number of
-  shares or contracts yourself. Sizing by quantity also allows **no stop** (a red warning and a
+  shares yourself. Sizing by quantity also allows **no stop** (a red warning and a
   confirmation on every click) and either way you can send **no target**. The order then carries only
   what you picked; add the missing stop or target later from the trade (Set stop / Set target), and
   once it has both they are paired as one OCO.
-- **Options on the ticket:** switch the ticket to Option, type the underlying, pick the expiry, calls
-  or puts and a strike from the chain (bid, ask, mark, delta, spread and open interest), then buy to
-  open or sell to open. Stop and targets are option prices; contracts are sized from your risk (one
-  contract = 100 shares of premium). The same one-click bracket goes to Schwab, with limit entries
-  only (mid, ask or bid) and a warning on wide markets and on every sell to open.
-- **Vertical spreads:** switch the ticket to Spread, pick the underlying, debit or
-  credit, expiry, calls or puts, click the near strike and pick the width. The ticket says the trade in
-  plain words (bull put, bear call, bull call or bear put: where you keep the credit, breakeven, where you
-  lose the most, the short leg's delta) and sizes by quantity or by risk (one spread's max loss = 1R).
-  It goes to Schwab as ONE paired net-limit order at the mid, natural or your price, after Schwab's order
-  preview accepts it. Each spread then gets its own workbench: live P&L and R against the max loss,
-  close all or part of it, a GTC profit target (25, 50 or 75% of the max gain, or your price) and an
-  app-watched stop (see Good to know).
 - **Cockpit layout (new in 1.4.0):** the page's layout from 1.4.0 on (it replaces the old Classic
   layout). The selected trade gets a price ladder at true price spacing: last price, entry, stop,
   target and 1R levels, with your exits as cards beside it. Drag a stop or target line to a new price: the drag only
-  fills the price box, and nothing is sent until you click the button. Spreads get their own ladder
-  (net price from 0 to the width, max gain and max loss in dollars and R). An attention bar lists what
-  needs you: no stop, a stop that covers only part of the position, an order with an unclear outcome,
-  a spread that needs a check.
+  fills the price box, and nothing is sent until you click the button. An attention bar lists what needs you: no stop, a stop that covers only part of the position, or an order with an unclear outcome.
 - **Add shares (new in 1.4.0):** add to a stock position from its workbench at the mid, market, ask or
   bid. **Keep stop** leaves the stop where it is (more dollars at risk); **Keep risk** moves the stop so
   the dollars at risk stay the same. Then ONE stop and target go back on the whole new size, and 1R is
@@ -223,77 +157,6 @@ risk before you send.
 
 ![The New trade ticket](docs/screenshot-ticket.png)
 
-**Spread ticket.** A bull put spread on the demo chain: the trade in plain words (where you keep the
-credit, breakeven, the most you can lose, the short leg's delta), both legs, and the max loss as 1R.
-
-![The spread ticket with a bull put spread planned](docs/screenshot-spread-ticket.png)
-
-**Manage window.** The same controls in a small always-on-top window.
-
-![The floating Manage window](docs/screenshot-manage-window.png)
-
-## Your Schwab app
-
-Edge Trader uses your own Schwab developer app. You set it up once (Schwabdev's
-[setup guide](https://tylerebowers.github.io/Schwabdev/?source=pages%2Fsetupguide.html) covers the same
-steps with a video):
-
-1. **Create a developer account** at [developer.schwab.com](https://developer.schwab.com). It is a
-   separate registration from your brokerage login; use the same email as your Schwab account.
-2. **Request access** to the **Trader API - Individual** product.
-3. **Create an app** with the Callback URL `https://127.0.0.1` (or any `https` localhost URL you also put
-   in `.env`) and add both API products: **Accounts and Trading Production** (account, orders) and
-   **Market Data Production** (quotes).
-4. **Wait for the status "Ready For Use".** Schwab reviews new apps and it can take a few days;
-   "Approved - Pending" does not work yet.
-5. **thinkorswim must be enabled** on your Schwab account (sign in to thinkorswim once); Schwab needs it
-   for orders through the API.
-6. Open the app (**Modify App**) and check its **Order Limit** is above 0. With 0, every order is
-   refused with HTTP 429 even though everything else works.
-7. Copy the **App Key** and **Secret** into `.env`. On your first `login.bat`, Schwab asks you to agree
-   to the terms and pick the account(s) the app may use.
-
-## Quick start
-
-Requirements: Windows 10 or 11 and [Python 3.11 or newer](https://www.python.org/downloads/)
-(tick "Add python.exe to PATH" when installing). Mac and Linux work with the manual steps.
-
-**Windows:** download or clone this repo, then
-
-1. `setup.bat`, once. It creates `.venv`, installs dependencies, and creates `.env`.
-2. For the default Alpaca Paper overview, put `alpaca_paper_api_key` and `alpaca_paper_secret` in `.env`.
-   For Schwab trading, put your Schwab App Key and Secret in `.env`, then select Schwab in the app.
-   Credentials added to `.env` require a process restart to load into the environment.
-3. For Schwab, run `login.bat`. It opens Schwab's sign-in page through Schwabdev; approve, then paste the address of
-   the page you land on (it will not load, that is expected). Repeat about once a week: Schwab's
-   sign-in lasts 7 days.
-4. `launch.bat`, every time. It opens http://127.0.0.1:8770. `stop.bat` stops it.
-
-**Manual setup (Mac, Linux, or if you prefer):**
-
-```bash
-python -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt     # Windows: .venv\Scripts\python.exe
-cp .env.example .env                                     # add Alpaca Paper credentials for the default overview
-.venv/bin/python -m companion.login                      # only when using Schwab
-.venv/bin/python -m companion                            # open http://127.0.0.1:8770
-```
-
-Every install starts empty: Edge Trader shows only what the selected broker reports, and keeps
-nothing from anyone else.
-
-## Updating to a new release
-
-Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
-never touches them. Stop the app first (`stop.bat`).
-
-**If you cloned with git:** `git pull`, then `setup.bat` if requirements changed, then `launch.bat`.
-
-**If you downloaded the ZIP:** unzip the new version into a new folder, copy `.env` and the `data`
-folder across, run `setup.bat` once, then `launch.bat`.
-
-For a broker-changing release, follow the [Paper validation and rollback checklist](docs/paper-release-readiness.md) before re-arming orders.
-
 ## Configuration
 
 | Variable | What it does |
@@ -311,29 +174,7 @@ For a broker-changing release, follow the [Paper validation and rollback checkli
 
 - **Futures:** Schwab's API reports futures fills but not futures positions or orders, so Edge Trader
   shows futures realized P&L only and cannot trade futures.
-- **Options:** single calls and puts, bought or sold to open from the ticket and managed like stocks
-  (close, cancel, stops, Auto B/E, partials, targets, trailing stops). Prices follow each contract's own
-  steps (pennies, nickels or dimes). Schwab does not document trailing stops on options, so each one is
-  first checked with Schwab's order preview; if Schwab would refuse it, nothing is sent. Multi-leg orders
-  sent elsewhere are shown but not traded here (only spreads sent from Edge Trader are managed as one),
-  and adjusted contracts (after a split or merger) are refused. Selling to open needs the matching option
-  approval level on your Schwab account.
-- **Leg guard:** Close and partials ask before they send when the contract looks like one leg of a
-  bigger position: an opposite-side option of the same type on the same underlying, short calls
-  against long shares (short puts against short shares), or a working multi-leg order on it. Closing
-  one leg alone can leave the other uncovered; the warning says which, and nothing is sent unless you
-  confirm.
-- **Spreads have no stop at Schwab.** Schwab's API refuses stop orders on spreads, so a spread's stop
-  is watched by the app: it reads both legs' real-time quotes and fires only after two separate checks
-  at the stop price, during regular hours. By default it only alerts you (a red banner and an optional
-  voice line) and sends nothing. Tick **Send when hit** and, when it fires, the app cancels the spread's
-  target and any working close, then sends ONE close of everything the spread holds at natural plus 2
-  price steps, never past the max loss. Once, never retried, and **only while the app is running and
-  connected**: if the app or your PC is off, nothing protects the spread, and the most it can lose is its
-  max loss. A red banner on the spread always says which mode its stop is in. Use it at your own risk.
-- **Spread legs belong to the spread.** While a spread from Edge Trader is open, single-leg actions on
-  its contracts are refused; close it from its own workbench. If something changes it outside the app
-  (in thinkorswim), it is flagged and waits for you to check it and press Resolve.
+- **Options and spreads:** trading controls are disabled for Alpaca Paper and Schwab. Existing holdings remain visible as read-only account data. Manage any existing option orders directly with the broker.
 - **No stop at entry:** a trade sent without a stop gets its R from the first stop you set from the
   app once Schwab shows it working (a stop set in thinkorswim does not count).
 - **One stream per Schwab user:** Edge Trader polls (REST) and never opens Schwab's streamer, so it
@@ -349,7 +190,7 @@ For a broker-changing release, follow the [Paper validation and rollback checkli
   earlier sessions, their orders, the carried P&L and the account value, so you can record or share your
   screen while showing only today's trades. It only changes what is displayed; orders work as usual.
   `--demo` runs on invented data with no Schwab connection, and refuses every order (the ticket plans on
-  invented quotes and an invented AAPL option chain, so you can try it).
+  invented quotes, so you can try the equity ticket).
 
 ## Contributing
 
