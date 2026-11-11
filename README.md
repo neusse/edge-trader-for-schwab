@@ -21,8 +21,9 @@ entry can be canceled, or its limit price replaced, from the working-order list 
 check. A replacement keeps the same stop and target and remains blocked until Alpaca confirms the
 new order ID and reviewed price. A held whole-share equity position with no active order can receive
 one broker-held OCO target and fixed stop after a fresh position, order, and IEX quote check. The same
-order-free position can instead be closed with one market order from the Positions list after arming
-and reviewing the current quantity and indicative IEX mark. The actual fill price can differ. A
+order-free position can instead be closed fully or partially with one market order from the Positions
+list after arming and reviewing the share count and indicative IEX mark. The actual fill price can differ.
+Any shares left after a partial close have no new stop; attach an OCO after the fill is confirmed. A
 position with a working exit must have that order resolved first; closing does not cancel its OCO.
 A lost submit or cancel response also blocks new order actions until the broker confirms its outcome. Other Alpaca order workflows are still being
 connected. Select Schwab in the app for the existing Schwab trading workflows. Switching disarms
@@ -69,7 +70,7 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, and OCO exits or a market close for an order-free whole-share equity position. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, and OCO exits or a full or partial market close for an order-free whole-share equity position. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.

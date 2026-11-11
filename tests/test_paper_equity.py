@@ -89,6 +89,12 @@ def test_close_plan_handles_long_and_short_without_attaching_an_exit():
     with pytest.raises(ValueError, match="whole shares"):
         close_plan(body, Position("AAPL", AssetType.EQUITY, side,
                                   Decimal("1.5"), Decimal(100)), quote(now), now)
+    partial = close_plan({**body, "shares": "1"}, position, quote(now), now)
+    assert partial.leg.quantity == 1
+    with pytest.raises(ValueError, match="no greater than"):
+        close_plan({**body, "shares": "3"}, position, quote(now), now)
+    with pytest.raises(ValueError, match="whole"):
+        close_plan({**body, "shares": "1.5"}, position, quote(now), now)
 
 
 def test_paper_close_route_requires_order_free_position_and_rechecks_before_send(monkeypatch, tmp_path):
@@ -117,16 +123,18 @@ def test_paper_close_route_requires_order_free_position_and_rechecks_before_send
     monkeypatch.setattr(appmod, "BrokerSelection", Selection)
     client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
     headers = {"X-Companion": "1"}
-    body = {"symbol": "AAPL", "request_id": str(uuid4())}
+    body = {"symbol": "AAPL", "shares": "1", "request_id": str(uuid4())}
     try:
         preview = client.post("/api/paper/position/close/preview", json=body, headers=headers).json()
-        assert preview["ok"] and preview["quantity"] == "2"
+        assert preview["ok"] and preview["quantity"] == "1"
+        assert preview["held_quantity"] == "2" and preview["remaining_if_filled"] == "1"
         assert preview["order_type"] == "market"
         poller.order_service.arm(True)
         sent = client.post("/api/paper/position/close/submit", json=body, headers=headers).json()
         assert sent["status"] == "accepted" and sent["order_id"] == "close-order"
         assert len(adapter.commands) == 1
         assert adapter.commands[0].intent.leg.instruction == OrderInstruction.BUY_TO_COVER
+        assert adapter.commands[0].intent.leg.quantity == 1
     finally:
         store.close()
         poller.store.close()

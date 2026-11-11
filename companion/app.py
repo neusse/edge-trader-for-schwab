@@ -74,12 +74,12 @@ BROKER_ACTION_LOCK = threading.RLock()
 BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
-    "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close"),
+    "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, and OCO exits or market close for an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
+    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, and OCO exits, market close, or partial close for an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -451,20 +451,22 @@ def _paper_oco(body: dict):
 
 def _paper_close(body: dict):
     service, position, quote = _paper_order_free_position(body)
-    return service, close_plan(body, position, quote), quote
+    return service, close_plan(body, position, quote), quote, position.quantity
 
 
 @app.post("/api/paper/position/close/preview")
 async def paper_close_preview(request: Request):
     _guard(request)
     try:
-        _, intent, quote = await run_in_threadpool(_paper_close, await request.json())
+        _, intent, quote, held = await run_in_threadpool(_paper_close, await request.json())
         return {"ok": True, "symbol": intent.leg.symbol,
                 "side": intent.leg.instruction.value,
                 "quantity": str(intent.leg.quantity),
+                "held_quantity": str(held),
+                "remaining_if_filled": str(held - intent.leg.quantity),
                 "quote": str(quote.mark or quote.last), "quote_source": quote.source,
                 "order_type": "market",
-                "protection": "This is a market close for an order-free position; no new stop is attached"}
+                "protection": "No stop is attached; remaining shares, if any, stay unprotected"}
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     except HTTPException:
@@ -493,14 +495,14 @@ async def paper_close_submit(request: Request):
 
 def _send_paper_close(body: dict, request_id: str):
     with BROKER_ACTION_LOCK:
-        service, intent, _ = _paper_close(body)
+        service, intent, _, held = _paper_close(body)
         symbol, quantity, instruction = (intent.leg.symbol, intent.leg.quantity,
                                          intent.leg.instruction)
         def preflight(account):
             positions = [position for position in account.positions if position.symbol == symbol]
             if (account.status.upper() != "ACTIVE" or len(positions) != 1 or
                     positions[0].asset_type != AssetType.EQUITY or
-                    positions[0].quantity != quantity or
+                    positions[0].quantity != held or
                     (positions[0].side.value == "long") !=
                     (instruction == OrderInstruction.SELL)):
                 raise ValueError("position changed before close submission; no order was sent")
