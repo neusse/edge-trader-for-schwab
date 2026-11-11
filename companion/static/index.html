@@ -1349,6 +1349,8 @@ function renderAlpacaOverview(st) {
   panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
     <p class="mut">Equities only. Option and spread trading are disabled in this app.</p>
     <p class="mut">Account and order overview. ${esc(st.broker_health?.message || "")}. Updated ${esc(new Date(a.updated_at).toLocaleTimeString())}. ${market}.</p>
+    ${positions.some(p => p.asset_type === "OPTION") || working.some(o => o.asset_type === "OPTION") ?
+      `<p class="mut">${esc(st.option_quote_health?.message || "Read-only Schwab option quotes unavailable")}. Option holdings remain read-only.</p>` : ""}
     <div class="alpaca-metrics"><div>Equity<strong>${a.equity == null ? "—" : money(Number(a.equity), false)}</strong></div>
       <div>Cash<strong>${a.cash == null ? "—" : money(Number(a.cash), false)}</strong></div>
       <div>Buying power<strong>${a.buying_power == null ? "—" : money(Number(a.buying_power), false)}</strong></div>

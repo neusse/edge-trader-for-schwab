@@ -20,18 +20,22 @@ from .paper_auto_be import PaperAutoBEWatch, oco_auto_be_plan
 from .paper_spread_stop import PaperSpreadStopWatch
 from .paper_vertical import vertical_close_plan
 from .paper_options import OCC
+from .schwab_option_quotes import SchwabOptionQuoteReader
 from .persistence import load_fills, save_fills
 from ..store import Store
 
 
 class AlpacaBootstrapPoller:
-    def __init__(self, adapter: AlpacaPaperAdapter | None = None, *, options_trading_enabled: bool = False):
+    def __init__(self, adapter: AlpacaPaperAdapter | None = None, *,
+                 options_trading_enabled: bool = False,
+                 option_quote_reader: SchwabOptionQuoteReader | None = None):
         self.store = Store(Path(":memory:"))
         self._stores = [self.store]
         self.trader = None
         self.terminal: set[str] = set()
         self.orders_today: dict[str, dict] = {}
         self._adapter = adapter
+        self._option_quotes = option_quote_reader or SchwabOptionQuoteReader()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._state = {"status": "Alpaca Paper connecting", "booting": True,
@@ -157,23 +161,39 @@ class AlpacaBootstrapPoller:
                            for order in group.orders if order.status in active for leg in order.legs)
             quotes = {}
             quote_error = None
+            option_quote_error = None
+            option_quote_requested = False
             for asset_type in (AssetType.EQUITY, AssetType.OPTION):
                 names = tuple(dict.fromkeys(symbol for symbol, kind in symbols
                                             if kind == asset_type))[:30]
+                if asset_type == AssetType.OPTION:
+                    option_quote_requested = bool(names)
                 if len({symbol for symbol, kind in symbols if kind == asset_type}) > 30:
-                    quote_error = "Quote limit reached; some symbols are unpriced"
-                    health_errors.append({"state": "stale", "message": quote_error,
-                                          "retry_after_seconds": None})
+                    if asset_type == AssetType.OPTION:
+                        option_quote_error = "Schwab option quote limit reached; some holdings are unpriced"
+                    else:
+                        quote_error = "Quote limit reached; some symbols are unpriced"
+                        health_errors.append({"state": "stale", "message": quote_error,
+                                              "retry_after_seconds": None})
                 if names:
                     stage = "quotes"
                     try:
-                        quotes.update(self._adapter.query(QuotesQuery(names, asset_type)))
+                        if asset_type == AssetType.OPTION:
+                            option_quotes = self._option_quotes.query(names)
+                            quotes.update(option_quotes)
+                            if len(option_quotes) < len(names):
+                                option_quote_error = "Some Schwab option quotes are unavailable"
+                        else:
+                            quotes.update(self._adapter.query(QuotesQuery(names, asset_type)))
                     except Exception as exc:
-                        health = read_health(exc)
-                        if health["state"] == "rate-limited":
-                            raise
-                        health_errors.append(health)
-                        quote_error = health["message"]
+                        if asset_type == AssetType.OPTION:
+                            option_quote_error = "Schwab option quotes unavailable; check Schwab login and market data"
+                        else:
+                            health = read_health(exc)
+                            if health["state"] == "rate-limited":
+                                raise
+                            health_errors.append(health)
+                            quote_error = health["message"]
             rate_limit = next((h for h in health_errors if h["state"] == "rate-limited"), None)
             if rate_limit:
                 self._cooldown_until = now + timedelta(seconds=rate_limit["retry_after_seconds"])
@@ -188,6 +208,9 @@ class AlpacaBootstrapPoller:
                                  "error": fill_error, "interval": 60},
                 "quotes": {"ok_at": now.isoformat() if not quote_error else None,
                            "error": quote_error, "interval": 10},
+                "option_quotes": {"ok_at": now.isoformat()
+                                  if option_quote_requested and not option_quote_error else None,
+                                  "error": option_quote_error, "interval": 10},
                 "market_hours": {"ok_at": now.isoformat() if clock else None,
                                  "error": None if clock else "Market clock unavailable",
                                  "interval": 10},
@@ -214,6 +237,12 @@ class AlpacaBootstrapPoller:
             state = {**canonical, "status": health["message"],
                      "booting": False, "broker_ready": not health_errors,
                      "broker_health": health, "market_hours": market_hours,
+                     "option_quote_health": {
+                         "state": ("unavailable" if option_quote_error else
+                                   "ready" if option_quote_requested else "not-needed"),
+                         "message": option_quote_error or
+                                    ("Read-only option quotes from Schwab" if option_quote_requested
+                                     else "No option quotes requested")},
                      "paper_spread_stops": paper_spread_stops,
                      "paper_auto_be": paper_auto_be,
                      "fills": [{"activity_id": fill.activity_id, "symbol": fill.symbol,

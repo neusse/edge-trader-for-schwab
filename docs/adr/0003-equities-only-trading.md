@@ -16,6 +16,10 @@ intents before sending. The Alpaca background spread-stop sender is disabled. Ex
 positions and orders may remain visible as read-only account information; users manage them directly
 with their broker.
 
+When Alpaca Paper is selected, visible option holdings and working option orders may use a separate
+Schwab read-only market quote client. Those quotes never alter the Alpaca account, order, or fill source.
+Schwab quote or login failures leave option prices unavailable and do not disarm Paper equity trading.
+
 The adapter capability matrix in ADR-0001 remains a description of technical broker support. The
 application's broker metadata reports the narrower enabled trading scope. The Alpaca Paper release
 gate requires equity scenarios only.
