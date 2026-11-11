@@ -26,8 +26,8 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .brokers.models import (
-    AssetType, CancelOrder, MutationResult, MutationStatus, OrderInstruction,
-    OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent, SubmitOrder, TimeInForce,
+    AssetType, CancelOrder, MutationResult, MutationStatus, OcoOrderIntent, OrderInstruction,
+    OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent, StopLossIntent, SubmitOrder, TimeInForce,
 )
 from .brokers.schwab_adapter import SchwabAdapter
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
@@ -2643,19 +2643,44 @@ class Trader:
         self.store.log_action("create_stop", symbol, None, "SENDING", f"{what}, {n} {us}")
         log.warning("CREATE STOP %s %s %s", symbol, n, what)
         try:
-            r = self._logged("place_order", lambda: client.place_order(self._hash, order))
+            if trail:
+                r = self._logged("place_order", lambda: client.place_order(self._hash, order))
+                tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
+                if r.status_code in (200, 201):
+                    result = MutationResult(MutationStatus.ACCEPTED if tail.isdigit() else MutationStatus.UNKNOWN,
+                                            order_id=tail if tail.isdigit() else None,
+                                            message=None if tail.isdigit() else "Schwab accepted the stop without an ID")
+                elif r.status_code == 429:
+                    result = MutationResult(MutationStatus.RATE_LIMITED, message=f"HTTP 429 {r.text[:200]}")
+                elif 400 <= r.status_code < 500:
+                    result = MutationResult(MutationStatus.REJECTED,
+                                            message=f"HTTP {r.status_code} {r.text[:200]}")
+                else:
+                    result = MutationResult(MutationStatus.UNKNOWN,
+                                            message=f"HTTP {r.status_code} {r.text[:200]}")
+            else:
+                exit_leg = OrderLegIntent(symbol, AssetType[asset], OrderInstruction[instr], Decimal(str(n)))
+                tif = TimeInForce.GTC if _gtc(duration) else TimeInForce.DAY
+                if target is not None:
+                    intent = OcoOrderIntent(exit_leg, Decimal(fmt(target, tk)),
+                                            StopLossIntent(Decimal(fmt(price, tk))), tif,
+                                            f"stop-{symbol}-{now_iso()}")
+                else:
+                    intent = SimpleOrderIntent(exit_leg, OrderType.STOP, tif, f"stop-{symbol}-{now_iso()}",
+                                               stop_price=Decimal(fmt(price, tk)))
+                result = self._broker_mutation("place_order", SubmitOrder(intent))
         except Exception as e:
             self.store.log_action("create_stop", symbol, None, "UNKNOWN", repr(e))
             return {"ok": False, "unknown": True, "symbol": symbol,
                     "error": "No answer from Schwab: the stop MAY have been placed. Check thinkorswim."}
-        if r.status_code >= 500:
-            # A server error is not a refusal: the order MAY be live.
-            self.store.log_action("create_stop", symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:200]}")
+        if result.status == MutationStatus.UNKNOWN:
+            self.store.log_action("create_stop", symbol, None, "UNKNOWN", result.message)
             return {"ok": False, "unknown": True, "symbol": symbol,
-                    "error": f"Schwab answered HTTP {r.status_code}: the {what} MAY have been placed. Check thinkorswim "
+                    "error": f"Schwab's answer was unclear: the {what} MAY have been placed. Check thinkorswim "
                              "before setting it again."}
-        if r.status_code not in (200, 201):
-            self.store.log_action("create_stop", symbol, None, "REJECTED", f"HTTP {r.status_code} {r.text[:200]}")
+        if result.status != MutationStatus.ACCEPTED:
+            self.store.log_action("create_stop", symbol, None, result.status.value.upper().replace("-", "_"),
+                                  result.message)
             if exits_gone:        # after a partial or an add: Schwab already dropped the old exits
                 kept = "The position has NO STOP now: use Move stop or thinkorswim."
             elif rebuild:         # nothing entered, so nothing was cancelled
@@ -2663,9 +2688,8 @@ class Trader:
             else:
                 kept = "Your target is still working." if targets else "The position has no stop."
             return {"ok": False, "symbol": symbol,
-                    "error": f"Schwab refused the stop (HTTP {r.status_code}): {r.text[:150]}. " + kept}
-        tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-        new_id = int(tail) if tail.isdigit() else None
+                    "error": f"Schwab refused the stop: {result.message}. " + kept}
+        new_id = int(result.order_id) if result.order_id else None
         # Auto B/E follows a stop the companion rebuilt itself (never a trailing one). Linked as
         # soon as Schwab accepts it, so a slow read below cannot lose it; auto_breakeven still
         # checks the stop is live, fixed and not loosened before it moves anything.

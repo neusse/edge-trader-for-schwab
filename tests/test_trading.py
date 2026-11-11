@@ -686,6 +686,27 @@ def test_new_stop_is_sent_with_the_existing_target_as_one_oco(trader, monkeypatc
     assert stop["orderType"] == "STOP" and stop["stopPrice"] == "912.00"
 
 
+@pytest.mark.parametrize("existing_target, expected_type", [(False, "SimpleOrderIntent"), (True, "OcoOrderIntent")])
+def test_fixed_stop_submission_uses_a_canonical_intent(trader, monkeypatch, existing_target, expected_type):
+    from companion.brokers.models import SubmitOrder
+
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_leaf(52, "LIMIT", 57, price=900.18)] if existing_target else [])
+    sent = []
+    execute = trader._broker_mutation
+
+    def capture(endpoint, command):
+        sent.append((endpoint, command))
+        return execute(endpoint, command)
+
+    monkeypatch.setattr(trader, "_broker_mutation", capture)
+    result = trader.move_stop("MXR", "912.00", [], set())
+    assert result["ok"], result
+    assert len(sent) == 1 and sent[0][0] == "place_order"
+    assert isinstance(sent[0][1], SubmitOrder)
+    assert type(sent[0][1].intent).__name__ == expected_type
+
+
 def test_unclear_created_stop_blocks_another_stop(trader, monkeypatch):
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
     broker = Broker([])
