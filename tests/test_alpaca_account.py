@@ -24,7 +24,8 @@ def test_paper_account_read_normalizes_positions_without_sdk_objects():
     class Client:
         def get_account(self):
             return SimpleNamespace(id="account-uuid", status="ACTIVE", equity="10000.00",
-                                   buying_power="20000", daytrading_buying_power=None,
+                                   buying_power="20000", options_buying_power="7500",
+                                   daytrading_buying_power=None,
                    cash="5000", maintenance_margin="200",
                    options_trading_level=3, options_approved_level=3)
 
@@ -35,6 +36,7 @@ def test_paper_account_read_normalizes_positions_without_sdk_objects():
     snapshot = AlpacaPaperAdapter(Client()).query(AccountQuery())
     assert snapshot.account_ref == "account-uuid"
     assert snapshot.balances.equity == 10000
+    assert snapshot.balances.options_buying_power == 7500
     assert snapshot.positions[0].asset_type == AssetType.EQUITY
     assert snapshot.positions[0].side == PositionSide.SHORT
     assert snapshot.positions[0].quantity == 3
@@ -342,7 +344,7 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
     assert paper["workflows"] == ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
                                   "equity-oco-adjust", "equity-add", "equity-trailing",
                                   "option-long-entry", "option-close", "option-cancel",
-                                  "option-fixed-exit")
+                                  "option-fixed-exit", "option-covered-short")
     assert "option-bracket" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")

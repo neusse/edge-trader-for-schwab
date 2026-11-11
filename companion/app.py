@@ -37,7 +37,8 @@ from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_re
                                    oco_plan, trailing_plan)
 from .brokers.paper_options import (chain_query, chain_response, expirations_query,
                                     expirations_response, long_entry_plan,
-                                    option_close_plan, option_fixed_exit_plan)
+                                    option_close_plan, option_fixed_exit_plan,
+                                    short_entry_plan, OCC)
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -81,12 +82,12 @@ APP_WORKFLOWS = {
     "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
                      "equity-oco-adjust", "equity-add", "equity-trailing",
                      "option-long-entry", "option-close", "option-cancel",
-                     "option-fixed-exit"),
+                     "option-fixed-exit", "option-covered-short"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; held options can be closed or given one fixed stop, stop-limit, or target, and unfilled option quantities canceled. Option exits are single orders, never OCO pairs. Other option and spread workflows are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Held options can be closed or given one fixed stop, stop-limit, or target, and unfilled option quantities canceled. Option exits are single orders, never OCO pairs. Other option and spread workflows are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -446,6 +447,100 @@ def _send_paper_option_long(body: dict, request_id: str):
             if any(symbol == leg.symbol.replace(" ", "") for group in groups
                    for order in group.orders if order.status in active for leg in order.legs):
                 raise ValueError("another order appeared for this option; no order was sent")
+        return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
+
+
+def _short_collateral_order_conflict(groups, underlying: str) -> bool:
+    active = {OrderStatus.PENDING, OrderStatus.WORKING,
+              OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN}
+    for group in groups:
+        for order in group.orders:
+            if order.status not in active:
+                continue
+            for leg in order.legs:
+                symbol = leg.symbol.replace(" ", "")
+                match = OCC.fullmatch(symbol)
+                if symbol == underlying or (match and match.group(1) == underlying):
+                    return True
+    return False
+
+
+def _paper_option_short_entry(body: dict):
+    service, _ = _paper_service()
+    query = chain_query(body)
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref:
+        raise ValueError("Alpaca Paper account changed; no option order was sent")
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=active))
+    if _short_collateral_order_conflict(groups, query.underlying):
+        raise ValueError("an active order touches this underlying or its options; resolve it first")
+    chain = service.adapter.query(query)
+    intent = short_entry_plan(body, account, chain)
+    contract = next(contract for contract in chain.contracts
+                    if contract.symbol.replace(" ", "") == intent.leg.symbol)
+    return service, intent, contract, chain
+
+
+@app.post("/api/paper/options/short/preview")
+async def paper_option_short_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, contract, _ = await run_in_threadpool(_paper_option_short_entry,
+                                                          await request.json())
+        quote = contract.quote
+        call = contract.option_type.value == "call"
+        return {"ok": True, "contract": intent.leg.symbol,
+                "quantity": str(intent.leg.quantity), "limit_price": str(intent.limit_price),
+                "collateral_type": "covered shares" if call else "options buying power",
+                "collateral_required": str(intent.leg.quantity *
+                                           (100 if call else contract.strike * 100)),
+                "indicative_bid": str(quote.bid),
+                "indicative_ask": str(quote.ask) if quote.ask is not None else None,
+                "protection": "No broker-held stop or target is attached. Assignment may occur; collateral must remain available."}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper short option preview failed; no order was sent"}
+
+
+@app.post("/api/paper/options/short/submit")
+async def paper_option_short_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_option_short, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper short option preflight failed; no order was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_option_short(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, intent, _, chain = _paper_option_short_entry(body)
+        underlying = chain.underlying
+        def preflight(account):
+            if account.account_ref != service.account_ref:
+                raise ValueError("option account changed; no short order was sent")
+            short_entry_plan(body, account, chain)
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                       statuses=active))
+            if _short_collateral_order_conflict(groups, underlying):
+                raise ValueError("another order appeared for this underlying; no short order was sent")
         return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 

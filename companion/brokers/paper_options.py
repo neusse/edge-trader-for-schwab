@@ -152,6 +152,74 @@ def long_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
         OrderType.LIMIT, TimeInForce.DAY, f"et-opt-{request_id.hex}", limit_price=limit)
 
 
+def short_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
+                     now: datetime | None = None) -> SimpleOrderIntent:
+    """One covered call or cash-secured put; uncovered calls are never planned."""
+    query = chain_query(body, now)
+    now = now or datetime.now(timezone.utc)
+    if query.expiration <= now.astimezone(ET).date():
+        raise ValueError("opening an option on its expiration day is unavailable")
+    if (account.status.upper() != "ACTIVE" or account.options_trading_level is None or
+            account.options_approved_level is None or
+            min(account.options_trading_level, account.options_approved_level) < 1):
+        raise ValueError("Alpaca Paper account needs active level 1 options access")
+    symbol = body.get("contract")
+    matches = [contract for contract in chain.contracts
+               if contract.symbol.replace(" ", "") == symbol]
+    if chain.underlying != query.underlying or len(matches) != 1:
+        raise ValueError("choose exactly one contract from the current option chain")
+    contract = matches[0]
+    if (contract.expiration != query.expiration or contract.option_type != query.option_type or
+            contract.underlying != query.underlying or not contract.tradable or
+            contract.multiplier != 100 or _occ_symbol(contract.symbol, query, contract.strike) != symbol):
+        raise ValueError("selected option contract is not a tradable standard contract")
+    if any(position.symbol.replace(" ", "") == symbol for position in account.positions):
+        raise ValueError("an option position already exists; manage it before adding")
+    quote = contract.quote
+    if (quote is None or quote.source != "Alpaca indicative options" or quote.realtime or
+            quote.observed_at.tzinfo is None or
+            not 0 <= (now - quote.observed_at).total_seconds() <= 60 or
+            quote.bid is None or quote.bid <= 0):
+        raise ValueError("a current Alpaca indicative option bid is required")
+    try:
+        quantity = Decimal(str(body.get("quantity")))
+        limit = Decimal(str(body.get("limit_price")))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("contracts and limit price must be positive numbers") from None
+    if (not quantity.is_finite() or quantity <= 0 or quantity != quantity.to_integral_value() or
+            quantity > 100):
+        raise ValueError("option entry requires 1 to 100 whole contracts")
+    if not limit.is_finite() or limit <= 0 or limit != limit.quantize(Decimal("0.01")):
+        raise ValueError("option limit price must be positive with cent precision")
+    if query.option_type == OptionType.CALL:
+        shares = sum((position.quantity if position.side == PositionSide.LONG else
+                      -position.quantity) for position in account.positions
+                     if position.asset_type == AssetType.EQUITY and position.symbol == query.underlying)
+        reserved = Decimal(0)
+        for position in account.positions:
+            if position.asset_type != AssetType.OPTION or position.side != PositionSide.SHORT:
+                continue
+            match = OCC.fullmatch(position.symbol)
+            if match and match.group(1) == query.underlying and match.group(5) == "C":
+                reserved += position.quantity * 100
+        if shares - reserved < quantity * 100:
+            raise ValueError("covered call requires 100 uncommitted underlying shares per contract")
+    else:
+        collateral = contract.strike * quantity * 100
+        available = account.balances.options_buying_power
+        if available is None or available < collateral:
+            raise ValueError("cash-secured put requires available options buying power for full strike collateral")
+        if limit > contract.strike:
+            raise ValueError("put sell limit cannot exceed strike price")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("request_id must be a UUID") from None
+    return SimpleOrderIntent(
+        OrderLegIntent(symbol, AssetType.OPTION, OrderInstruction.SELL_TO_OPEN, quantity),
+        OrderType.LIMIT, TimeInForce.DAY, f"et-opt-short-{request_id.hex}", limit_price=limit)
+
+
 def option_close_plan(body: dict, position: Position,
                       now: datetime | None = None) -> SimpleOrderIntent:
     """Limit close of up to the held whole-contract option quantity, without an exit chain."""
