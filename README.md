@@ -30,6 +30,9 @@ Any shares left after a partial close have no new stop; attach an OCO after the 
 position with a working exit must have that order resolved first; closing does not cancel its OCO.
 An order-free position can also add whole shares with a confirmed market order. Added shares are
 unprotected until the fill is confirmed and an OCO for the new total position is accepted.
+An order-free whole-share equity position can instead attach one standalone broker-held trailing
+stop by dollar or percent distance. It has no paired target, does not trigger outside regular market
+hours, and a triggered stop becomes a market order whose fill may differ from the stop price.
 A lost submit or cancel response also blocks new order actions until the broker confirms its outcome. Other Alpaca order workflows are still being
 connected. Select Schwab in the app for the existing Schwab trading workflows. Switching disarms
 entries and loads a fresh broker runtime before order controls can be used again.
@@ -75,7 +78,7 @@ name are refused). It needs no account and sends no telemetry.
 ### What leaves your computer
 
 - **Schwab** (`api.schwabapi.com`): the Trader API calls that read your account and send the orders you click.
-- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, OCO exits with target and tighter fixed-stop adjustments, and a full or partial market close or add shares for an order-free whole-share equity position. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
+- **Alpaca Paper** (`paper-api.alpaca.markets`): paper account and order reads, a confirmed equity bracket order from the Paper form, cancellation or limit repricing of an unfilled bracket entry, OCO exits with target and tighter fixed-stop adjustments, a standalone trailing stop, and a full or partial market close or add shares for an order-free whole-share equity position. Stock quotes use Alpaca IEX data and option quotes use indicative data. No live Alpaca order endpoint is configured.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.

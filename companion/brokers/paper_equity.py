@@ -9,7 +9,7 @@ from uuid import UUID
 from .models import (AssetType, BracketOrderIntent, OcoOrderIntent, OrderClass, OrderGroup,
                      OrderInstruction, OrderLegIntent, OrderType, Position,
                      PositionSide, OrderRole, OrderStatus, ReplaceOrder,
-                     SimpleOrderIntent, StopLossIntent, TimeInForce)
+                     SimpleOrderIntent, StopLossIntent, TimeInForce, TrailingOrderIntent)
 
 SYMBOL = re.compile(r"[A-Z][A-Z0-9.]{0,9}\Z")
 
@@ -166,6 +166,46 @@ def add_plan(body: dict, position: Position, quote,
     return SimpleOrderIntent(OrderLegIntent(symbol, AssetType.EQUITY, instruction, quantity),
                              OrderType.MARKET, TimeInForce.DAY,
                              f"et-add-{request_id.hex}")
+
+
+def trailing_plan(body: dict, position: Position, quote,
+                  now: datetime | None = None) -> TrailingOrderIntent:
+    """One broker-held trailing exit for an order-free whole-share Paper position."""
+    if not isinstance(body, dict) or position.asset_type != AssetType.EQUITY:
+        raise ValueError("Paper trailing stop requires an equity position")
+    symbol = body.get("symbol")
+    if symbol != position.symbol or not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol):
+        raise ValueError("trailing stop symbol must match the held position")
+    quantity = position.quantity
+    if quantity <= 0 or quantity != quantity.to_integral_value() or quantity > 10000:
+        raise ValueError("Paper trailing stop requires 1 to 10000 whole shares")
+    if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
+        raise ValueError("a current Alpaca Paper IEX quote is required")
+    now = now or datetime.now(timezone.utc)
+    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+        raise ValueError("Alpaca Paper quote is stale; refresh before attaching a trail")
+    mark = quote.mark or quote.last
+    if mark is None or mark <= 0:
+        raise ValueError("Alpaca Paper quote has no usable price")
+    unit = body.get("unit")
+    if unit not in ("dollar", "percent"):
+        raise ValueError("trail unit must be dollar or percent")
+    distance = _positive(body.get("distance"), "trail distance")
+    if (unit == "dollar" and position.side == PositionSide.LONG and distance >= mark) or (
+            unit == "percent" and distance >= 100):
+        raise ValueError("trail distance would not leave a valid stop from the current mark")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("request_id must be a UUID") from None
+    instruction = (OrderInstruction.SELL if position.side == PositionSide.LONG else
+                   OrderInstruction.BUY_TO_COVER)
+    return TrailingOrderIntent(
+        OrderLegIntent(symbol, AssetType.EQUITY, instruction, quantity),
+        TimeInForce.GTC, f"et-trail-{request_id.hex}",
+        trail_price=distance if unit == "dollar" else None,
+        trail_percent=distance if unit == "percent" else None,
+    )
 
 
 def oco_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
