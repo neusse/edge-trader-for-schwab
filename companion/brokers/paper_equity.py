@@ -137,6 +137,37 @@ def close_plan(body: dict, position: Position, quote,
                              f"et-close-{request_id.hex}")
 
 
+def add_plan(body: dict, position: Position, quote,
+             now: datetime | None = None) -> SimpleOrderIntent:
+    """Add whole shares to an order-free Paper equity position without claiming protection."""
+    if not isinstance(body, dict) or position.asset_type != AssetType.EQUITY:
+        raise ValueError("Paper add requires an equity position")
+    symbol = body.get("symbol")
+    if symbol != position.symbol or not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol):
+        raise ValueError("add symbol must match the held equity position")
+    if position.quantity <= 0 or position.quantity != position.quantity.to_integral_value():
+        raise ValueError("Paper add requires a whole-share held position")
+    quantity = _positive(body.get("shares"), "shares")
+    if quantity != quantity.to_integral_value() or quantity > 10000:
+        raise ValueError("add shares must be 1 to 10000 whole shares")
+    if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
+        raise ValueError("a current Alpaca Paper IEX quote is required")
+    now = now or datetime.now(timezone.utc)
+    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+        raise ValueError("Alpaca Paper quote is stale; refresh before adding shares")
+    if not (quote.mark or quote.last) or (quote.mark or quote.last) <= 0:
+        raise ValueError("Alpaca Paper quote has no usable price")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("request_id must be a UUID") from None
+    instruction = (OrderInstruction.BUY if position.side == PositionSide.LONG else
+                   OrderInstruction.SELL_SHORT)
+    return SimpleOrderIntent(OrderLegIntent(symbol, AssetType.EQUITY, instruction, quantity),
+                             OrderType.MARKET, TimeInForce.DAY,
+                             f"et-add-{request_id.hex}")
+
+
 def oco_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
                      now: datetime | None = None) -> ReplaceOrder:
     """Review one broker-held OCO leg change without canceling the paired exit."""

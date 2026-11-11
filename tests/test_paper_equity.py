@@ -19,7 +19,7 @@ from companion.brokers.models import (
     SubmitOrder,
 )
 from companion.brokers.order_service import BrokerOrderService
-from companion.brokers.paper_equity import close_plan, entry_plan, oco_exit_reprice, oco_plan
+from companion.brokers.paper_equity import add_plan, close_plan, entry_plan, oco_exit_reprice, oco_plan
 from companion.store import Store
 from companion.trading import Trader
 
@@ -96,6 +96,62 @@ def test_close_plan_handles_long_and_short_without_attaching_an_exit():
         close_plan({**body, "shares": "3"}, position, quote(now), now)
     with pytest.raises(ValueError, match="whole"):
         close_plan({**body, "shares": "1.5"}, position, quote(now), now)
+
+
+def test_add_plan_handles_long_and_short_and_refuses_stale_or_fractional():
+    now = datetime.now(timezone.utc)
+    body = {"symbol": "AAPL", "shares": "2", "request_id": str(uuid4())}
+    for side, instruction in ((PositionSide.LONG, OrderInstruction.BUY),
+                              (PositionSide.SHORT, OrderInstruction.SELL_SHORT)):
+        position = Position("AAPL", AssetType.EQUITY, side, Decimal(3), Decimal(100))
+        plan = add_plan(body, position, quote(now), now)
+        assert plan.leg.quantity == 2 and plan.leg.instruction == instruction
+        assert plan.order_type == OrderType.MARKET and plan.client_order_id.startswith("et-add-")
+    with pytest.raises(ValueError, match="stale"):
+        add_plan(body, position, quote(now - timedelta(seconds=31)), now)
+    with pytest.raises(ValueError, match="whole shares"):
+        add_plan({**body, "shares": "1.5"}, position, quote(now), now)
+
+
+def test_paper_add_route_previews_and_sends_once_for_short_position(monkeypatch, tmp_path):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    held = Position("AAPL", AssetType.EQUITY, PositionSide.SHORT, Decimal(2), Decimal(100))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (held,))
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, account, account, account)
+    adapter.given_query(OrdersQuery, (), (), ())
+    adapter.given_query(QuotesQuery, {"AAPL": quote(now)}, {"AAPL": quote(now)})
+    et_day = now.astimezone(timezone(timedelta(hours=-5))).date()
+    adapter.given_query(MarketSessionsQuery, (MarketSession(
+        et_day, now - timedelta(hours=1), now + timedelta(hours=1), True),))
+    adapter.given_command(SubmitOrder, MutationResult(MutationStatus.ACCEPTED, "add-order"))
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
+    poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
+                     "updated_at": now.isoformat(), "positions": [], "orders": []}}
+    class Selection:
+        def get(self): return "alpaca-paper"
+    monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
+    monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "BrokerSelection", Selection)
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    body = {"symbol": "AAPL", "shares": "1", "request_id": str(uuid4())}
+    try:
+        preview = client.post("/api/paper/position/add/preview", json=body, headers=headers).json()
+        assert preview["ok"] and preview["quantity"] == "1"
+        assert preview["held_quantity"] == "2" and preview["total_if_filled"] == "3"
+        poller.order_service.arm(True)
+        sent = client.post("/api/paper/position/add/submit", json=body, headers=headers).json()
+        assert sent["status"] == "accepted" and sent["order_id"] == "add-order"
+        assert len(adapter.commands) == 1
+        assert adapter.commands[0].intent.leg.instruction == OrderInstruction.SELL_SHORT
+    finally:
+        store.close()
+        poller.store.close()
 
 
 def oco_group(side=PositionSide.LONG, qty=Decimal(2), stop=Decimal(95),

@@ -33,7 +33,7 @@ from .brokers.models import (AccountQuery, AssetType, CancelOrder,
                              OrderClass, OrderInstruction, OrderQuery, OrderRole,
                              OrderStatus, OrderType, OrdersQuery, QuotesQuery, ReplaceOrder,
                              SubmitOrder)
-from .brokers.paper_equity import close_plan, entry_plan, oco_exit_reprice, oco_plan
+from .brokers.paper_equity import add_plan, close_plan, entry_plan, oco_exit_reprice, oco_plan
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -74,12 +74,13 @@ BROKER_ACTION_LOCK = threading.RLock()
 BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
-    "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial", "equity-oco-adjust"),
+    "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
+                     "equity-oco-adjust", "equity-add"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, OCO exits with fixed stop and target adjustments, and market or partial close of an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
+    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, OCO exits with fixed stop and target adjustments, and market close, partial close, or add shares for an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -452,6 +453,72 @@ def _paper_oco(body: dict):
 def _paper_close(body: dict):
     service, position, quote = _paper_order_free_position(body)
     return service, close_plan(body, position, quote), quote, position.quantity
+
+
+def _paper_add(body: dict):
+    service, position, quote = _paper_order_free_position(body)
+    return service, add_plan(body, position, quote), quote, position.quantity
+
+
+@app.post("/api/paper/position/add/preview")
+async def paper_add_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, quote, held = await run_in_threadpool(_paper_add, await request.json())
+        return {"ok": True, "symbol": intent.leg.symbol,
+                "side": intent.leg.instruction.value,
+                "quantity": str(intent.leg.quantity), "held_quantity": str(held),
+                "total_if_filled": str(held + intent.leg.quantity),
+                "quote": str(quote.mark or quote.last), "quote_source": quote.source,
+                "order_type": "market",
+                "protection": "No stop is attached; the added shares remain unprotected until a new OCO is accepted"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper position, order, or quote verification failed; no order was sent"}
+
+
+@app.post("/api/paper/position/add/submit")
+async def paper_add_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_add, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper add preflight failed; no order was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_add(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, intent, _, held = _paper_add(body)
+        symbol, instruction = intent.leg.symbol, intent.leg.instruction
+        def preflight(account):
+            positions = [position for position in account.positions if position.symbol == symbol]
+            if (account.status.upper() != "ACTIVE" or len(positions) != 1 or
+                    positions[0].asset_type != AssetType.EQUITY or
+                    positions[0].quantity != held or
+                    (positions[0].side.value == "long") !=
+                    (instruction == OrderInstruction.BUY)):
+                raise ValueError("position changed before add submission; no order was sent")
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                       statuses=active))
+            if any(symbol == leg.symbol for group in groups for order in group.orders
+                   if order.status in active for leg in order.legs):
+                raise ValueError("another order appeared for this symbol; no add was sent")
+        return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 
 @app.post("/api/paper/position/close/preview")
