@@ -14,10 +14,10 @@ import hmac
 import json
 import re
 import secrets
-import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 
+from companion.build_info import checkout_identity  # noqa: E402
 from companion.brokers.alpaca_paper import AlpacaPaperAdapter  # noqa: E402
 from companion.brokers.models import (AccountQuery, FillsQuery, MarketClockQuery,
                                       OrderStatus, OrdersQuery)  # noqa: E402
@@ -40,6 +41,10 @@ class PreflightRefused(ValueError):
     """Safe, identifier-free reason to delay the first controlled Paper action."""
 
 
+class RuntimeMismatch(ValueError):
+    """The running app cannot be attributed to this clean checkout."""
+
+
 def ref(value: object, salt: bytes) -> str:
     """Stable opaque reference for comparing snapshots without disclosing broker IDs."""
     return hmac.new(salt, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:12]
@@ -50,8 +55,14 @@ def _json(port: int, path: str) -> dict:
         return json.load(response)
 
 
-def _git_revision() -> str:
-    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+def require_matching_runtime(runtime: dict, checkout: dict) -> str:
+    """Refuse a snapshot whose app code and repository revision may differ."""
+    if not checkout.get("commit") or checkout.get("clean") is not True:
+        raise RuntimeMismatch("use a clean Git checkout before collecting evidence")
+    if (not isinstance(runtime, dict) or runtime.get("clean") is not True or
+            runtime.get("commit") != checkout["commit"]):
+        raise RuntimeMismatch("restart Edge Trader from this clean checkout")
+    return checkout["commit"]
 
 
 def collect(scenario: str, app: dict, status: dict, account, groups, fills,
@@ -145,6 +156,13 @@ def main() -> None:
         parser.error("output must stay under the repository's ignored data/ directory")
     record_written = False
     try:
+        try:
+            runtime = _json(args.port, "/api/build")
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise RuntimeMismatch("restart Edge Trader from this clean checkout") from None
+            raise
+        revision = require_matching_runtime(runtime, checkout_identity(ROOT))
         app = _json(args.port, "/api/state")
         status = _json(args.port, "/api/paper/status")
         if (app.get("broker") or {}).get("key") != "alpaca-paper":
@@ -168,7 +186,7 @@ def main() -> None:
         if len(salt) != 32:
             raise ValueError("local evidence salt is invalid")
         record = collect(args.scenario, app, status, account, groups, fills,
-                         now=now, revision=_git_revision(), salt=salt)
+                         now=now, revision=revision, salt=salt)
         if args.require_clean_market:
             broker_clock = adapter.query(MarketClockQuery())
             require_clean_market(record, broker_clock, now)
@@ -183,6 +201,8 @@ def main() -> None:
               f"{len(record['paper']['fills_today'])} fills today -> {output}")
     except PreflightRefused as exc:
         parser.exit(2, f"Preflight refused: {exc}; no record written.\n")
+    except RuntimeMismatch as exc:
+        parser.exit(2, f"Evidence capture refused: {exc}; no record written.\n")
     except Exception as exc:
         detail = "record may already be written" if record_written else "no record written"
         parser.exit(1, f"Evidence capture failed ({type(exc).__name__}); {detail}.\n")
