@@ -418,7 +418,7 @@ class Poller:
             positions = {position.symbol: float(position.quantity) *
                          (1 if position.side.value == "long" else -1)
                          for position in account.positions} if account else {}
-            if self.trader.spreads:
+            if self.trader.spreads and getattr(self.trader, "options_trading_enabled", True):
                 # Companion spreads: persist fills, judge each one against the account, show them.
                 fresh = orders_fresh and self._fresh("account") and account is not None
                 merged = self._merged_orders()
