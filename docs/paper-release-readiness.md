@@ -21,7 +21,7 @@ Start or restart the app from the same clean checkout before collecting evidence
 | --- | --- | --- |
 | Broker selection | Default Paper, switch to Schwab and Demo, then back; each switch disarms | Passed 2026-11-10 on local running app; all three modes selected and Paper reselected, disarmed throughout |
 | Equity entry | Long and short market/limit simple and bracket; fill, target and stop children | Pending |
-| Equity management | Unfilled cancel/reprice, partial fill, held OCO, fixed stop/target adjust, trail, partial/full close, add shares | Pending |
+| Equity management | Unfilled cancel/reprice, partial fill, held OCO, fixed stop/target adjust on OCO and filled bracket exits, trail, partial/full close, add shares | Pending |
 | Equity Auto B/E | One +1R move, no loosening, restart and unknown replacement handling | Filled bracket and existing OCO paths implemented; Paper E2E pending (#8) |
 | Options and verticals | Trading is disabled for both brokers because this project has no options authorization | Excluded from release scope |
 | Failure cases | Broker rejection, partial and unknown outcomes, rate limit, stale data, restart, external changes | Pending |
