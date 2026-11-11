@@ -397,6 +397,13 @@ class OptionChainQuery:
     option_type: OptionType | None = None
 
 
+@dataclass(frozen=True)
+class OptionExpirationsQuery:
+    underlying: str
+    start: date
+    end: date
+
+
 BrokerQuery: TypeAlias = (
     AccountQuery
     | OrdersQuery
@@ -407,6 +414,7 @@ BrokerQuery: TypeAlias = (
     | MarketSessionsQuery
     | MarketClockQuery
     | OptionChainQuery
+    | OptionExpirationsQuery
 )
 BrokerQueryResult: TypeAlias = (
     AccountSnapshot
@@ -418,6 +426,7 @@ BrokerQueryResult: TypeAlias = (
     | tuple[MarketSession, ...]
     | MarketClock
     | OptionChain
+    | tuple[date, ...]
 )
 
 

@@ -35,7 +35,8 @@ from .brokers.models import (AccountQuery, AssetType, CancelOrder,
                              SubmitOrder)
 from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_reprice,
                                    oco_plan, trailing_plan)
-from .brokers.paper_options import chain_query, chain_response
+from .brokers.paper_options import (chain_query, chain_response, expirations_query,
+                                    expirations_response)
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -341,6 +342,24 @@ async def paper_option_chain(request: Request):
         raise
     except Exception:
         return {"ok": False, "error": "Alpaca Paper option discovery failed; no order was sent"}
+
+
+@app.post("/api/paper/options/expirations")
+async def paper_option_expirations(request: Request):
+    """List currently active Paper contract expirations in a bounded date range."""
+    _guard(request)
+    try:
+        query = expirations_query(await request.json())
+        def fetch():
+            service, _ = _paper_service()
+            return expirations_response(query, service.adapter.query(query))
+        return await run_in_threadpool(fetch)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper expiration lookup failed; no order was sent"}
 
 
 def _paper_entry(body: dict, for_submit: bool = False):

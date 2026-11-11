@@ -33,7 +33,8 @@ unprotected until the fill is confirmed and an OCO for the new total position is
 An order-free whole-share equity position can instead attach one standalone broker-held trailing
 stop by dollar or percent distance. It has no paired target, does not trigger outside regular market
 hours, and a triggered stop becomes a market order whose fill may differ from the stop price.
-The Paper option discovery view lists OCC contracts for one selected expiration and call/put type,
+The Paper option discovery view fetches active expirations for an underlying, then lists OCC
+contracts for one selected expiration and call/put type,
 with Alpaca indicative quotes, Greeks, implied volatility, and open interest when supplied.
 Those quotes can be delayed or absent. Discovery has no option order control yet.
 A lost submit or cancel response also blocks new order actions until the broker confirms its outcome. Other Alpaca order workflows are still being

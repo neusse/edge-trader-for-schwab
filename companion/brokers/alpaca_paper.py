@@ -14,7 +14,8 @@ from .models import (
     CancelOrder, ClientOrderQuery,
     BrokerOrder, BrokerQuery, BrokerQueryResult, Fill, FillsQuery, MarketClock,
     MarketClockQuery, MarketSession, MarketSessionsQuery,
-    MutationResult, MutationStatus, OptionChain, OptionChainQuery, OptionContract, OptionGreeks, OptionType,
+    MutationResult, MutationStatus, OptionChain, OptionChainQuery, OptionContract,
+    OptionExpirationsQuery, OptionGreeks, OptionType,
     OrderClass, OrderGroup, OrderInstruction, OrderLeg, OrderQuery,
     OrderRole, OrdersQuery, OrderStatus, OrderType, Position, PositionSide, Quote,
     QuotesQuery, ReplaceOrder, SubmitOrder,
@@ -142,6 +143,29 @@ class AlpacaPaperAdapter(BrokerAdapter):
         raise NotImplementedError(f"Alpaca Paper quotes for {asset_type.value} are not supported")
 
     def _query(self, query: BrokerQuery) -> BrokerQueryResult:
+        if isinstance(query, OptionExpirationsQuery):
+            from alpaca.trading.requests import GetOptionContractsRequest
+
+            filters = {"underlying_symbols": [query.underlying],
+                       "expiration_date_gte": query.start,
+                       "expiration_date_lte": query.end, "limit": 1000}
+            dates: set[date] = set()
+            tokens: set[str] = set()
+            for _ in range(100):
+                page = self._client.get_option_contracts(GetOptionContractsRequest(**filters))
+                for contract in page.option_contracts or ():
+                    if (contract.underlying_symbol != query.underlying or
+                            not query.start <= contract.expiration_date <= query.end):
+                        raise ValueError("Alpaca expiration list contained a contract outside the requested terms")
+                    dates.add(contract.expiration_date)
+                token = page.next_page_token
+                if not token:
+                    return tuple(sorted(dates))
+                if token in tokens:
+                    raise ValueError("Alpaca expiration pagination made no progress")
+                tokens.add(token)
+                filters["page_token"] = token
+            raise ValueError("Alpaca expiration list exceeded the safe page limit")
         if isinstance(query, OptionChainQuery):
             from alpaca.data.enums import OptionsFeed
             from alpaca.data.requests import OptionChainRequest

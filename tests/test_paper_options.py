@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from companion.brokers.models import (OptionChain, OptionContract, OptionGreeks,
                                       OptionType, Quote)
 from companion.brokers.paper_options import chain_query, chain_response
+from companion.brokers.paper_options import expirations_query, expirations_response
 
 
 NOW = datetime(2026, 11, 11, 17, 0, tzinfo=timezone.utc)
@@ -33,6 +34,16 @@ def test_chain_query_requires_exact_near_expiry_and_type():
                   {**BODY, "option_type": "both"}):
         with pytest.raises(ValueError):
             chain_query(wrong, NOW)
+
+
+def test_expirations_query_and_response_are_bounded_and_sorted():
+    query = expirations_query({"underlying": "AAPL"}, NOW)
+    assert query.start == date(2026, 11, 11)
+    result = expirations_response(query, (date(2026, 11, 20), date(2026, 11, 13),
+                                          date(2026, 11, 13)))
+    assert result["expirations"] == ["2026-11-13", "2026-11-20"]
+    with pytest.raises(ValueError, match="requested range"):
+        expirations_response(query, (date(2027, 4, 1),))
 
 
 def test_chain_response_normalizes_occ_and_labels_indicative_quote():
@@ -73,3 +84,19 @@ def test_option_discovery_route_uses_active_paper_adapter_without_mutation(monke
     assert result.status_code == 200 and result.json()["ok"]
     assert len(observed) == 1 and observed[0].underlying == "AAPL"
     assert result.json()["contracts"][0]["symbol"] == "AAPL261113C00225000"
+
+
+def test_option_expirations_route_reads_adapter_without_mutation(monkeypatch):
+    import companion.app as appmod
+
+    observed = []
+    adapter = SimpleNamespace(query=lambda query: (observed.append(query),
+                                                     (date(2026, 11, 13),))[1])
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (SimpleNamespace(adapter=adapter), {}))
+    monkeypatch.setattr("companion.brokers.paper_options.datetime", SimpleNamespace(
+        now=lambda _tz: NOW))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    result = client.post("/api/paper/options/expirations", json={"underlying": "AAPL"},
+                         headers={"X-Companion": "1"})
+    assert result.status_code == 200 and result.json()["expirations"] == ["2026-11-13"]
+    assert len(observed) == 1 and observed[0].underlying == "AAPL"
