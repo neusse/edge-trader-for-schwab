@@ -9,7 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .alpaca_paper import AlpacaPaperAdapter, prefer_complete_order_groups
+from .alpaca_paper import (AlpacaPaperAdapter, prefer_complete_order_groups,
+                           query_complete_active_groups)
 from .canonical_view import build_canonical_state
 from .errors import read_health
 from .models import (AccountQuery, AssetType, FillsQuery, MarketClockQuery,
@@ -493,8 +494,7 @@ class AlpacaBootstrapPoller:
             account = self._adapter.query(AccountQuery())
             active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
                                 OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
-            groups = self._adapter.query(OrdersQuery(now - timedelta(days=3650), now,
-                                                     statuses=active))
+            groups = query_complete_active_groups(self._adapter, now)
             if account.account_ref != service.account_ref or not self._auto_be_pair(account, groups, row):
                 raise ValueError("Held position or broker-held exits changed; no stop was moved")
             quote = self._adapter.query(QuotesQuery((row["symbol"],), AssetType.EQUITY)).get(row["symbol"])
@@ -516,9 +516,7 @@ class AlpacaBootstrapPoller:
             def preflight(current):
                 if current.account_ref != service.account_ref:
                     raise ValueError("Paper account changed; no stop was moved")
-                later = self._adapter.query(OrdersQuery(now - timedelta(days=3650),
-                                                        datetime.now(timezone.utc),
-                                                        statuses=active))
+                later = query_complete_active_groups(self._adapter, datetime.now(timezone.utc))
                 if not self._auto_be_pair(current, later, row):
                     raise ValueError("Protected exits changed immediately before Auto B/E; nothing was sent")
 

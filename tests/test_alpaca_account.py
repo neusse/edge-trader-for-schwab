@@ -152,9 +152,14 @@ def test_oco_root_without_group_role_is_still_a_target():
 
 
 def test_bracket_children_without_group_role_keep_stop_and_target():
+    from datetime import datetime, timezone
     from alpaca.trading.models import Order
     from companion.brokers.alpaca_paper import (_order_group,
-                                                prefer_complete_order_groups)
+                                                prefer_complete_order_groups,
+                                                query_complete_active_groups)
+    from companion.brokers.capabilities import ALPACA_PAPER
+    from companion.brokers.fake import FakeBrokerAdapter
+    from companion.brokers.models import OrdersQuery
 
     def raw(order_id, order_type, price=None, stop=None, legs=None, status="new",
             filled="0", intent=None):
@@ -183,6 +188,9 @@ def test_bracket_children_without_group_role_keep_stop_and_target():
     active_target_only = _order_group(target)
     assert len(active_target_only.orders) == 1
     assert prefer_complete_order_groups((group,), (active_target_only,)) == (group,)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(OrdersQuery, (active_target_only,), (group,))
+    assert query_complete_active_groups(adapter, datetime.now(timezone.utc)) == (group,)
     unfilled = raw("entry", "market", legs=[target, stop])
     unfilled_group = _order_group(unfilled)
     assert unfilled_group.orders[2].status == OrderStatus.UNKNOWN

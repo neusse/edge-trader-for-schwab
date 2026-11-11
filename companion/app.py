@@ -30,6 +30,7 @@ from .build_info import checkout_identity
 from .brokers.capabilities import BROKERS
 from .brokers.configuration import BrokerSelection
 from .brokers.bootstrap import AlpacaBootstrapPoller
+from .brokers.alpaca_paper import query_complete_active_groups
 from .brokers.models import (AccountQuery, AssetType, BracketOrderIntent, BrokerCapability, CancelOrder,
                              OrderClass, OrderInstruction, OrderQuery, OrderRole,
                              OrderStatus, OrderType, OrdersQuery, QuotesQuery, ReplaceOrder,
@@ -1753,7 +1754,7 @@ def _paper_equity_exit_adjust(body: dict, account=None):
     now = datetime.now(timezone.utc)
     active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
                         OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
-    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=active))
+    groups = query_complete_active_groups(service.adapter, now)
     touching = [group for group in groups if any(
         leg.symbol == symbol for order in group.orders if order.status in active for leg in order.legs)]
     if len(touching) != 1:
@@ -1836,8 +1837,7 @@ def _paper_oco_auto_be_plan(body: dict):
     now = datetime.now(timezone.utc)
     active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
                         OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
-    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
-                                               statuses=active))
+    groups = query_complete_active_groups(service.adapter, now)
     touching = [group for group in groups if any(
         leg.symbol == symbol for order in group.orders
         if order.status in active for leg in order.legs)]
