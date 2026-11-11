@@ -135,6 +135,9 @@ def test_option_fixed_exit_is_one_whole_position_stop_or_target():
                                        _held_option(), quote, NOW)
     long_target = option_fixed_exit_plan({**base, "role": "target", "price": "1.60"},
                                          _held_option(), quote, NOW)
+    long_stop_limit = option_fixed_exit_plan(
+        {**base, "role": "stop-limit", "price": "1.00", "limit_price": "0.90"},
+        _held_option(), quote, NOW)
     short_stop = option_fixed_exit_plan({**base, "role": "stop", "price": "1.60"},
                                         _held_option(PositionSide.SHORT), quote, NOW)
     short_target = option_fixed_exit_plan({**base, "role": "target", "price": "1.00"},
@@ -142,9 +145,22 @@ def test_option_fixed_exit_is_one_whole_position_stop_or_target():
     assert long_stop.order_type == OrderType.STOP and long_stop.stop_price == D("1.00")
     assert long_stop.leg.quantity == 3 and long_stop.time_in_force == TimeInForce.GTC
     assert long_target.order_type == OrderType.LIMIT and long_target.limit_price == D("1.60")
+    assert (long_stop_limit.order_type == OrderType.STOP_LIMIT and
+            long_stop_limit.stop_price == D("1.00") and
+            long_stop_limit.limit_price == D("0.90"))
     assert short_stop.leg.instruction == OrderInstruction.BUY_TO_CLOSE
     assert short_target.leg.instruction == OrderInstruction.BUY_TO_CLOSE
     assert short_target.limit_price == D("1.00")
+    short_stop_limit = option_fixed_exit_plan(
+        {**base, "role": "stop-limit", "price": "1.60", "limit_price": "1.70"},
+        _held_option(PositionSide.SHORT), quote, NOW)
+    assert short_stop_limit.leg.instruction == OrderInstruction.BUY_TO_CLOSE
+    with pytest.raises(ValueError, match="sell limit"):
+        option_fixed_exit_plan({**base, "role": "stop-limit", "price": "1.00",
+                                "limit_price": "1.10"}, _held_option(), quote, NOW)
+    with pytest.raises(ValueError, match="cent-precision"):
+        option_fixed_exit_plan({**base, "role": "stop-limit", "price": "1.00",
+                                "limit_price": "0.901"}, _held_option(), quote, NOW)
     with pytest.raises(ValueError, match="loss side"):
         option_fixed_exit_plan({**base, "role": "stop", "price": "1.50"},
                                _held_option(), quote, NOW)
@@ -321,3 +337,7 @@ def test_option_fixed_exit_route_rechecks_order_free_full_position(monkeypatch):
     assert result.json()["ok"] and len(commands) == 1
     assert commands[0].intent.order_type == OrderType.STOP
     assert commands[0].intent.leg.quantity == 3
+    stop_limit = client.post("/api/paper/options/exit/preview", json={
+        **body, "role": "stop-limit", "limit_price": "0.90"}, headers=headers)
+    assert stop_limit.json()["ok"] and stop_limit.json()["limit_price"] == "0.90"
+    assert "may remain unfilled" in stop_limit.json()["protection"]

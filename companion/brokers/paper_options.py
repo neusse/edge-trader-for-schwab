@@ -224,20 +224,32 @@ def option_fixed_exit_plan(body: dict, position: Position, quote: Quote | None,
     if mark is None or mark <= 0:
         raise ValueError("Alpaca option quote has no usable bid/ask mark")
     role = body.get("role")
-    if role not in ("stop", "target"):
-        raise ValueError("option exit role must be stop or target")
+    if role not in ("stop", "stop-limit", "target"):
+        raise ValueError("option exit role must be stop, stop-limit, or target")
     try:
         price = Decimal(str(body.get("price")))
     except (InvalidOperation, TypeError, ValueError):
         raise ValueError("option exit price must be positive") from None
     if not price.is_finite() or price <= 0 or price != price.quantize(Decimal("0.01")):
         raise ValueError("option exit price must be positive with cent precision")
-    if role == "stop" and ((position.side == PositionSide.LONG and price >= mark) or
-                           (position.side == PositionSide.SHORT and price <= mark)):
+    if role in ("stop", "stop-limit") and ((position.side == PositionSide.LONG and price >= mark) or
+                                              (position.side == PositionSide.SHORT and price <= mark)):
         raise ValueError("fixed stop must be on the loss side of the indicative mark")
     if role == "target" and ((position.side == PositionSide.LONG and price <= mark) or
                              (position.side == PositionSide.SHORT and price >= mark)):
         raise ValueError("target must be on the profit side of the indicative mark")
+    stop_limit = None
+    if role == "stop-limit":
+        try:
+            stop_limit = Decimal(str(body.get("limit_price")))
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValueError("stop-limit exit needs a positive limit price") from None
+        if (not stop_limit.is_finite() or stop_limit <= 0 or
+                stop_limit != stop_limit.quantize(Decimal("0.01"))):
+            raise ValueError("stop-limit exit needs a positive cent-precision limit")
+        if ((position.side == PositionSide.LONG and stop_limit > price) or
+                (position.side == PositionSide.SHORT and stop_limit < price)):
+            raise ValueError("stop-limit sell limit must be at or below its trigger; buy limit at or above")
     try:
         request_id = UUID(str(body.get("request_id")))
     except (ValueError, TypeError, AttributeError):
@@ -246,7 +258,8 @@ def option_fixed_exit_plan(body: dict, position: Position, quote: Quote | None,
                    OrderInstruction.BUY_TO_CLOSE)
     return SimpleOrderIntent(
         OrderLegIntent(symbol, AssetType.OPTION, instruction, quantity),
+        OrderType.STOP_LIMIT if role == "stop-limit" else
         OrderType.STOP if role == "stop" else OrderType.LIMIT,
         TimeInForce.GTC, f"et-opt-exit-{request_id.hex}",
-        stop_price=price if role == "stop" else None,
-        limit_price=price if role == "target" else None)
+        stop_price=price if role in ("stop", "stop-limit") else None,
+        limit_price=stop_limit if role == "stop-limit" else price if role == "target" else None)
