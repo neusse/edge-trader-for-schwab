@@ -1,10 +1,8 @@
-"""Fills, FIFO lots, realized P&L and round-trip trades, from Schwab TRADE transactions.
+"""Broker-neutral fills, FIFO lots, realized P&L, and round-trip trades.
 
-Transactions are the one source that covers stocks, options AND futures (futures
-never show up in the positions or orders endpoints). Each TRADE carries one or
-more instrument transferItems (signed `amount`, `price`, signed cash `cost`) plus
-currency items for fees. `cost / amount` is price x multiplier, so the contract
-multiplier (1, 100, $2/pt MNQ, $50/pt ES, ...) falls out without a lookup table.
+Legacy Schwab callers use compatibility functions that normalize stored TRADE
+transactions through the Schwab adapter. Canonical fills cover equities,
+options, and futures with signed quantities and contract multipliers.
 
 Inventory older than the fill history enters the book as an opening lot
 (`Opening`), so FIFO consumes it first. Its basis is either known (ESTIMATED,
@@ -22,10 +20,6 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 EPS = 1e-9
-
-
-def parse_time(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
 
 
 def session_day(t: datetime, asset_type: str) -> date:
@@ -56,58 +50,16 @@ class Fill:
 
 
 def fills_from_transaction(t: dict) -> list[Fill]:
-    if t.get("type") != "TRADE" or t.get("status") not in (None, "VALID"):
-        return []
-    items = t.get("transferItems") or []
-    fees = sum(float(i.get("cost") or 0) for i in items
-               if (i.get("instrument") or {}).get("assetType") == "CURRENCY")
-    out: list[Fill] = []
-    for idx, it in enumerate(items):
-        ins = it.get("instrument") or {}
-        if ins.get("assetType") in (None, "CURRENCY"):
-            continue
-        qty = float(it.get("amount") or 0)
-        price = float(it.get("price") or 0)
-        if abs(qty) < EPS or price <= 0:
-            continue
-        cost = float(it.get("cost") or 0)
-        mult = round(abs(cost / (qty * price)), 4) if cost else 1.0
-        symbol = ins.get("quoteSymbol") or ins.get("symbol", "?")
-        if ins.get("assetType") == "FUTURE":
-            symbol = symbol.split(":")[0]
-        out.append(Fill(
-            id=f"{t.get('activityId')}:{idx}",
-            order_id=t.get("orderId"),
-            time=parse_time(t["time"]),
-            symbol=symbol,
-            asset_type=ins.get("assetType", "?"),
-            underlying=ins.get("underlyingSymbol") or ins.get("rootSymbol") or symbol,
-            qty=qty,
-            price=price,
-            multiplier=mult or 1.0,
-            fees=min(fees, 0.0) if not out else 0.0,   # transaction fees ride on its first leg
-            effect=it.get("positionEffect"),
-        ))
-    return out
-
-
-def _seq(fill_id: str) -> tuple[int, int]:
-    act, _, idx = fill_id.partition(":")
-    return (int(act) if act.isdigit() else 0, int(idx or 0))
+    """Compatibility entry point for stored Schwab transactions."""
+    from .brokers.canonical_view import _ledger_fills
+    from .brokers.schwab_adapter import normalize_fills
+    return _ledger_fills(normalize_fills([t]))
 
 
 def fills_from_transactions(txns: list[dict]) -> list[Fill]:
-    seen: set[str] = set()
-    out: list[Fill] = []
-    for t in txns:
-        for f in fills_from_transaction(t):
-            if f.id not in seen:
-                seen.add(f.id)
-                out.append(f)
-    # Within a second, Schwab's activityId is the best available sequence (unverified);
-    # open/close order inside a second is settled again in build_book.
-    out.sort(key=lambda f: (f.time, _seq(f.id)))
-    return out
+    from .brokers.canonical_view import _ledger_fills
+    from .brokers.schwab_adapter import normalize_fills
+    return _ledger_fills(normalize_fills(txns))
 
 
 @dataclass(frozen=True)
