@@ -55,6 +55,11 @@ def test_single_option_and_spread_requests_preserve_position_intent():
     single = build_order_request(SimpleOrderIntent(
         buy, OrderType.LIMIT, TimeInForce.DAY, "option-key", limit_price=D("1.25")))
     assert single.position_intent == PositionIntent.BUY_TO_OPEN
+    stop = build_order_request(SimpleOrderIntent(
+        option("AAPL261113C00100000", OrderInstruction.SELL_TO_CLOSE, "2"),
+        OrderType.STOP, TimeInForce.GTC, "option-stop-key", stop_price=D("0.80")))
+    assert stop.position_intent == PositionIntent.SELL_TO_CLOSE
+    assert stop.stop_price == 0.8 and stop.time_in_force.value == "gtc"
     spread = build_order_request(MultiLegOrderIntent(
         (buy, sell), OrderType.LIMIT, TimeInForce.DAY, "spread-key", D("0.80")))
     assert spread.order_class == OrderClass.MLEG
