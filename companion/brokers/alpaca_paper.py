@@ -86,12 +86,20 @@ def _order_group(raw) -> OrderGroup:
             return None
         intent = _enum_value(member.position_intent) if member.position_intent else ""
         side = _enum_value(member.side) if member.side else ""
-        instruction = {
-            "buy_to_open": OrderInstruction.BUY_TO_OPEN,
-            "sell_to_open": OrderInstruction.SELL_TO_OPEN,
-            "buy_to_close": OrderInstruction.BUY_TO_CLOSE,
-            "sell_to_close": OrderInstruction.SELL_TO_CLOSE,
-        }.get(intent, OrderInstruction.BUY if side == "buy" else OrderInstruction.SELL)
+        if asset == AssetType.EQUITY:
+            instruction = {
+                "buy_to_open": OrderInstruction.BUY,
+                "sell_to_open": OrderInstruction.SELL_SHORT,
+                "buy_to_close": OrderInstruction.BUY_TO_COVER,
+                "sell_to_close": OrderInstruction.SELL,
+            }.get(intent, OrderInstruction.BUY if side == "buy" else OrderInstruction.SELL)
+        else:
+            instruction = {
+                "buy_to_open": OrderInstruction.BUY_TO_OPEN,
+                "sell_to_open": OrderInstruction.SELL_TO_OPEN,
+                "buy_to_close": OrderInstruction.BUY_TO_CLOSE,
+                "sell_to_close": OrderInstruction.SELL_TO_CLOSE,
+            }.get(intent, OrderInstruction.BUY if side == "buy" else OrderInstruction.SELL)
         return OrderLeg(symbol=symbol, asset_type=asset, instruction=instruction,
                         quantity=Decimal(str(member.qty)),
                         filled_quantity=Decimal(str(member.filled_qty or 0)), role=role)
@@ -104,8 +112,17 @@ def _order_group(raw) -> OrderGroup:
             leg = leg_from(member, role)
             legs = (leg,) if leg else ()
         if legs:
+            raw_status = _enum_value(member.status)
+            # Alpaca holds a bracket/OCO exit at the broker until it can trigger.
+            # Keep other held orders unknown so they cannot appear actionable.
+            status = (OrderStatus.WORKING if raw_status == "held" and
+                      (group_class == OrderClass.OCO or
+                       group_class == OrderClass.BRACKET and
+                       _enum_value(raw.status) == "filled") and
+                      role in (OrderRole.STOP, OrderRole.TARGET) else
+                      _ORDER_STATUS.get(raw_status, OrderStatus.UNKNOWN))
             members.append(BrokerOrder(
-                order_id=str(member.id), status=_ORDER_STATUS.get(_enum_value(member.status), OrderStatus.UNKNOWN),
+                order_id=str(member.id), status=status,
                 order_type=OrderType(_enum_value(member.type or member.order_type or "limit").replace("_", "-")),
                 time_in_force=TimeInForce(_enum_value(member.time_in_force)), legs=legs, role=role,
                 group_id=group_id, parent_id=parent_id, client_order_id=member.client_order_id,

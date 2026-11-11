@@ -3,7 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 from companion.brokers.alpaca_paper import AlpacaPaperAdapter
-from companion.brokers.models import AccountQuery, AssetType, ClientOrderQuery, OrderRole, PositionSide
+from companion.brokers.models import (AccountQuery, AssetType, ClientOrderQuery,
+                                      OrderInstruction, OrderRole, OrderStatus,
+                                      PositionSide)
 
 
 def test_runtime_factory_selects_exact_broker_without_fallback(monkeypatch):
@@ -133,38 +135,54 @@ def test_oco_root_without_group_role_is_still_a_target():
         id="stop-id", group_id="oco-id", order_class="oco", group_role="stop_loss",
         status="new", type="stop", time_in_force="gtc", legs=[],
         symbol="AAPL", asset_class="us_equity", qty="2", filled_qty="0",
-        side="sell", position_intent=None, limit_price=None, stop_price="95",
+        side="sell", position_intent="sell_to_close", limit_price=None, stop_price="95",
         trail_price=None, trail_percent=None, submitted_at=None, updated_at=None,
         client_order_id="stop-client")
     target = Order.model_construct(
         id="target-id", group_id="oco-id", order_class="oco", group_role=None,
         status="new", type="limit", time_in_force="gtc", legs=[stop],
         symbol="AAPL", asset_class="us_equity", qty="2", filled_qty="0",
-        side="sell", position_intent=None, limit_price="110", stop_price=None,
+        side="sell", position_intent="sell_to_close", limit_price="110", stop_price=None,
         trail_price=None, trail_percent=None, submitted_at=None, updated_at=None,
         client_order_id="oco-client")
     group = _order_group(target)
     assert [order.role for order in group.orders] == [OrderRole.TARGET, OrderRole.STOP]
+    assert [order.legs[0].instruction for order in group.orders] == [
+        OrderInstruction.SELL, OrderInstruction.SELL]
 
 
 def test_bracket_children_without_group_role_keep_stop_and_target():
     from alpaca.trading.models import Order
     from companion.brokers.alpaca_paper import _order_group
 
-    def raw(order_id, order_type, price=None, stop=None, legs=None):
+    def raw(order_id, order_type, price=None, stop=None, legs=None, status="new",
+            filled="0", intent=None):
         return Order.model_construct(
             id=order_id, group_id="bracket-id", order_class="bracket", group_role=None,
-            status="new", type=order_type, time_in_force="gtc", legs=legs or [],
-            symbol="AAPL", asset_class="us_equity", qty="2", filled_qty="0",
-            side="sell" if order_id != "entry" else "buy", position_intent=None,
+            status=status, type=order_type, time_in_force="gtc", legs=legs or [],
+            symbol="AAPL", asset_class="us_equity", qty="2", filled_qty=filled,
+            side="sell" if order_id != "entry" else "buy", position_intent=intent,
             limit_price=price, stop_price=stop, trail_price=None, trail_percent=None,
             submitted_at=None, updated_at=None, client_order_id=order_id)
 
-    target = raw("target", "limit", price="110")
-    stop = raw("stop", "stop", stop="95")
-    entry = raw("entry", "market", legs=[target, stop])
-    assert [order.role for order in _order_group(entry).orders] == [
+    target = raw("target", "limit", price="110", intent="sell_to_close")
+    stop = raw("stop", "stop", stop="95", status="held", intent="sell_to_close")
+    entry = raw("entry", "market", legs=[target, stop], status="filled", filled="2",
+                intent="buy_to_open")
+    group = _order_group(entry)
+    assert [order.role for order in group.orders] == [
         OrderRole.ENTRY, OrderRole.TARGET, OrderRole.STOP]
+    assert group.orders[2].status == OrderStatus.WORKING
+    assert group.orders[2].status_detail == "HELD"
+    assert [order.legs[0].instruction for order in group.orders] == [
+        OrderInstruction.BUY, OrderInstruction.SELL, OrderInstruction.SELL]
+    from companion.brokers.canonical_view import _pending
+    from companion.orders import stop_coverage
+    assert stop_coverage(_pending((group,)), "AAPL", "LONG", 2)[0] == 2
+    unfilled = raw("entry", "market", legs=[target, stop])
+    unfilled_group = _order_group(unfilled)
+    assert unfilled_group.orders[2].status == OrderStatus.UNKNOWN
+    assert stop_coverage(_pending((unfilled_group,)), "AAPL", "LONG", 2)[0] == 0
 
 
 def test_owned_paper_trailing_stop_counts_as_broker_held_coverage():
