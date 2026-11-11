@@ -1,14 +1,14 @@
 """Defined-risk, same-expiration Alpaca Paper vertical spread plans."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from .models import (AccountSnapshot, AssetType, MultiLegOrderIntent, OptionChain,
                      OptionType, OrderInstruction, OrderLegIntent, OrderType,
-                     TimeInForce)
-from .paper_options import ET, _occ_symbol, chain_query
+                     PositionSide, Quote, TimeInForce)
+from .paper_options import ET, OCC, _occ_symbol, chain_query
 
 
 def vertical_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
@@ -82,3 +82,68 @@ def vertical_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain
          OrderLegIntent(symbols[1], AssetType.OPTION, OrderInstruction.SELL_TO_OPEN,
                         quantity)),
         OrderType.LIMIT, TimeInForce.DAY, f"et-vertical-{request_id.hex}", net)
+
+
+def vertical_close_plan(body: dict, account: AccountSnapshot,
+                        quotes: dict[str, Quote], now: datetime | None = None) -> MultiLegOrderIntent:
+    """Close one exact held 1:1 vertical in a single broker multi-leg order."""
+    if not isinstance(body, dict) or account.status.upper() != "ACTIVE":
+        raise ValueError("an active Paper account and vertical close request are required")
+    long_symbol, short_symbol = body.get("long_contract"), body.get("short_contract")
+    if (not isinstance(long_symbol, str) or not isinstance(short_symbol, str) or
+            long_symbol == short_symbol):
+        raise ValueError("choose two distinct held vertical contracts")
+    long_match, short_match = OCC.fullmatch(long_symbol), OCC.fullmatch(short_symbol)
+    if not long_match or not short_match or long_match.group(1, 2, 3, 4, 5) != short_match.group(1, 2, 3, 4, 5):
+        raise ValueError("vertical close needs one underlying, expiry, and option type")
+    root, year, month, day, cp, _ = long_match.groups()
+    try:
+        expiration = date(2000 + int(year), int(month), int(day))
+    except ValueError:
+        raise ValueError("held vertical OCC expiration is invalid") from None
+    now = now or datetime.now(timezone.utc)
+    if expiration < now.astimezone(ET).date():
+        raise ValueError("expired vertical cannot be closed from this form")
+    positions = {position.symbol.replace(" ", ""): position for position in account.positions
+                 if position.asset_type == AssetType.OPTION and
+                 (match := OCC.fullmatch(position.symbol)) and match.group(1) == root}
+    if set(positions) != {long_symbol, short_symbol}:
+        raise ValueError("vertical close requires exactly two held option positions on this underlying")
+    long, short = positions[long_symbol], positions[short_symbol]
+    if (long.side != PositionSide.LONG or short.side != PositionSide.SHORT or
+            long.quantity != short.quantity or long.quantity <= 0 or
+            long.quantity != long.quantity.to_integral_value() or long.quantity > 10000):
+        raise ValueError("held vertical legs must be equal whole long and short quantities")
+    width = abs(Decimal(long_match.group(6)) - Decimal(short_match.group(6))) / 1000
+    if width <= 0:
+        raise ValueError("held vertical strikes must differ")
+    for symbol in (long_symbol, short_symbol):
+        quote = quotes.get(symbol)
+        if (quote is None or quote.symbol.replace(" ", "") != symbol or
+                quote.source != "Alpaca indicative options" or quote.realtime or
+                quote.observed_at.tzinfo is None or
+                not 0 <= (now - quote.observed_at).total_seconds() <= 60 or
+                quote.bid is None or quote.ask is None or
+                quote.bid <= 0 or quote.ask <= 0):
+            raise ValueError("both held vertical legs require current indicative bid and ask")
+    try:
+        net = Decimal(str(body.get("net_price")))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("vertical close net limit must be a number") from None
+    debit_entry = ((cp == "C" and Decimal(long_match.group(6)) < Decimal(short_match.group(6))) or
+                   (cp == "P" and Decimal(long_match.group(6)) > Decimal(short_match.group(6))))
+    if (not net.is_finite() or net == 0 or abs(net) >= width or
+            net != net.quantize(Decimal("0.01")) or
+            (debit_entry and net > 0) or (not debit_entry and net < 0)):
+        raise ValueError("vertical close limit must be a cent-precision credit or debit inside strike width")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("request_id must be a UUID") from None
+    quantity = long.quantity
+    return MultiLegOrderIntent(
+        (OrderLegIntent(long_symbol, AssetType.OPTION, OrderInstruction.SELL_TO_CLOSE,
+                        quantity),
+         OrderLegIntent(short_symbol, AssetType.OPTION, OrderInstruction.BUY_TO_CLOSE,
+                        quantity)),
+        OrderType.LIMIT, TimeInForce.DAY, f"et-vertical-close-{request_id.hex}", net)
