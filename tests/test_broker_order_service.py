@@ -194,3 +194,27 @@ def test_replacement_waits_for_exact_client_order_id_and_working_status(tmp_path
         assert len(adapter.commands) == 1
     finally:
         store.close()
+
+
+def test_stop_replacement_waits_for_exact_reviewed_stop(tmp_path):
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT, ACCOUNT)
+    adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, "new-stop"))
+    service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
+    def replacement(stop):
+        order = BrokerOrder("new-stop", OrderStatus.WORKING, OrderType.STOP,
+                            TimeInForce.GTC,
+                            (OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL,
+                                      Decimal(2)),), OrderRole.STOP,
+                            client_order_id="et-exit-test", stop_price=Decimal(stop))
+        return OrderGroup("oco", OrderClass.OCO, OrderStatus.WORKING, (order,))
+    try:
+        command = ReplaceOrder("old-stop", stop_price=Decimal(97),
+                               client_order_id="et-exit-test")
+        assert service.execute(command, "replace-stop").status == MutationStatus.UNKNOWN
+        adapter.given_query(ClientOrderQuery, replacement(96), replacement(97))
+        assert service.reconcile_replace("replace-stop").status == MutationStatus.UNKNOWN
+        assert service.reconcile_replace("replace-stop").status == MutationStatus.ACCEPTED
+    finally:
+        store.close()

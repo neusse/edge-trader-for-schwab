@@ -33,7 +33,7 @@ from .brokers.models import (AccountQuery, AssetType, CancelOrder,
                              OrderClass, OrderInstruction, OrderQuery, OrderRole,
                              OrderStatus, OrderType, OrdersQuery, QuotesQuery, ReplaceOrder,
                              SubmitOrder)
-from .brokers.paper_equity import close_plan, entry_plan, oco_plan
+from .brokers.paper_equity import close_plan, entry_plan, oco_exit_reprice, oco_plan
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -74,12 +74,12 @@ BROKER_ACTION_LOCK = threading.RLock()
 BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
-    "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial"),
+    "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial", "equity-oco-adjust"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, and OCO exits, market close, or partial close for an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
+    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, OCO exits with fixed stop and target adjustments, and market or partial close of an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -576,6 +576,85 @@ def _send_paper_oco(body: dict, request_id: str):
                    if order.status in active for leg in order.legs):
                 raise ValueError("another order appeared for this symbol; no OCO was sent")
         return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
+
+
+def _paper_oco_adjust(body: dict, account=None):
+    service, _ = _paper_service()
+    if not isinstance(body, dict):
+        raise ValueError("OCO adjustment request must be an object")
+    symbol = body.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise ValueError("an equity symbol is required")
+    account = account or service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref or account.status.upper() != "ACTIVE":
+        raise ValueError("Alpaca Paper account changed or is inactive")
+    positions = [position for position in account.positions if position.symbol == symbol]
+    if len(positions) != 1:
+        raise ValueError("exactly one held equity position is required")
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=active))
+    touching = [group for group in groups if any(
+        leg.symbol == symbol for order in group.orders if order.status in active for leg in order.legs)]
+    if len(touching) != 1:
+        raise ValueError("exactly one active OCO group must protect this symbol")
+    quote = service.adapter.query(QuotesQuery((symbol,), AssetType.EQUITY)).get(symbol)
+    command = oco_exit_reprice(body, positions[0], touching[0], quote)
+    return service, command, touching[0], quote, positions[0]
+
+
+@app.post("/api/paper/oco/adjust/preview")
+async def paper_oco_adjust_preview(request: Request):
+    _guard(request)
+    try:
+        _, command, group, quote, position = await run_in_threadpool(
+            _paper_oco_adjust, await request.json())
+        selected = next(order for order in group.orders if order.order_id == command.order_id)
+        other = next(order for order in group.orders if order.order_id != command.order_id)
+        return {"ok": True, "symbol": position.symbol, "side": position.side.value,
+                "quantity": str(position.quantity),
+                "role": "stop" if command.stop_price is not None else "target",
+                "old_price": str(selected.stop_price or selected.limit_price),
+                "new_price": str(command.stop_price or command.limit_price),
+                "other_price": str(other.stop_price or other.limit_price),
+                "quote": str(quote.mark or quote.last), "quote_source": quote.source,
+                "protection": "OCO replacement protection is unconfirmed until Alpaca verifies the new order"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper OCO verification failed; no replace was sent"}
+
+
+@app.post("/api/paper/oco/adjust/submit")
+async def paper_oco_adjust_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_oco_adjust, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper OCO adjustment preflight failed; no replace was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_oco_adjust(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, command, original_group, _, original_position = _paper_oco_adjust(body)
+        def preflight(account):
+            _, checked, group, _, position = _paper_oco_adjust(body, account)
+            if (checked != command or group != original_group or
+                    position != original_position):
+                raise ValueError("OCO changed before replacement; no replace was sent")
+        return service.execute(command, request_id, preflight=preflight)
 
 
 @app.post("/api/paper/entry/cancel")

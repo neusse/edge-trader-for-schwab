@@ -234,6 +234,10 @@ class BrokerOrderService:
             if expected_limit is not None and order.limit_price != Decimal(str(expected_limit)):
                 return MutationResult(MutationStatus.UNKNOWN,
                                       message="Broker replacement price does not match the reviewed price")
+            expected_stop = row["payload"].get("stop_price")
+            if expected_stop is not None and order.stop_price != Decimal(str(expected_stop)):
+                return MutationResult(MutationStatus.UNKNOWN,
+                                      message="Broker replacement stop does not match the reviewed price")
             if order.status == OrderStatus.REJECTED:
                 result = MutationResult(MutationStatus.REJECTED, order.order_id,
                                         "Broker rejected the replacement; inspect the original order")

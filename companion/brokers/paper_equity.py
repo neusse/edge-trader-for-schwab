@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
-from .models import (AssetType, BracketOrderIntent, OcoOrderIntent,
+from .models import (AssetType, BracketOrderIntent, OcoOrderIntent, OrderClass, OrderGroup,
                      OrderInstruction, OrderLegIntent, OrderType, Position,
-                     PositionSide, SimpleOrderIntent, StopLossIntent, TimeInForce)
+                     PositionSide, OrderRole, OrderStatus, ReplaceOrder,
+                     SimpleOrderIntent, StopLossIntent, TimeInForce)
 
 SYMBOL = re.compile(r"[A-Z][A-Z0-9.]{0,9}\Z")
 
@@ -134,3 +135,66 @@ def close_plan(body: dict, position: Position, quote,
     return SimpleOrderIntent(OrderLegIntent(symbol, AssetType.EQUITY, instruction, quantity),
                              OrderType.MARKET, TimeInForce.DAY,
                              f"et-close-{request_id.hex}")
+
+
+def oco_exit_reprice(body: dict, position: Position, group: OrderGroup, quote,
+                     now: datetime | None = None) -> ReplaceOrder:
+    """Review one broker-held OCO leg change without canceling the paired exit."""
+    if not isinstance(body, dict) or position.asset_type != AssetType.EQUITY or group.order_class != OrderClass.OCO:
+        raise ValueError("Only an equity OCO exit can be repriced here")
+    symbol = body.get("symbol")
+    if symbol != position.symbol or not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol):
+        raise ValueError("OCO symbol must match the held position")
+    quantity = position.quantity
+    if quantity <= 0 or quantity != quantity.to_integral_value() or quantity > 10000:
+        raise ValueError("OCO adjustment requires 1 to 10000 whole shares")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+        order_id = str(UUID(str(body.get("order_id"))))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("order_id and request_id must be UUIDs") from None
+    role = body.get("role")
+    if role not in ("stop", "target"):
+        raise ValueError("role must be stop or target")
+    if len(group.orders) != 2:
+        raise ValueError("OCO must have exactly one target and one stop")
+    selected = next((order for order in group.orders if order.order_id == order_id), None)
+    stop = next((order for order in group.orders if order.role == OrderRole.STOP), None)
+    target = next((order for order in group.orders if order.role == OrderRole.TARGET), None)
+    if (selected is None or stop is None or target is None or
+            selected.role != (OrderRole.STOP if role == "stop" else OrderRole.TARGET)):
+        raise ValueError("OCO exit order no longer matches the reviewed leg")
+    exit_instruction = (OrderInstruction.SELL if position.side == PositionSide.LONG else
+                        OrderInstruction.BUY)
+    for order in (stop, target):
+        if (order.status != OrderStatus.WORKING or len(order.legs) != 1 or
+                order.legs[0].symbol != symbol or order.legs[0].asset_type != AssetType.EQUITY or
+                order.legs[0].instruction != exit_instruction or
+                order.legs[0].filled_quantity != 0 or
+                (order.legs[0].remaining_quantity if order.legs[0].remaining_quantity is not None
+                 else order.legs[0].quantity) != quantity):
+            raise ValueError("OCO exit is not fully working for the current position")
+    if stop.stop_price is None or target.limit_price is None:
+        raise ValueError("OCO target or stop price is unavailable")
+    if quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or not quote.realtime:
+        raise ValueError("a current Alpaca Paper IEX quote is required")
+    now = now or datetime.now(timezone.utc)
+    if quote.observed_at.tzinfo is None or not 0 <= (now - quote.observed_at).total_seconds() <= 30:
+        raise ValueError("Alpaca Paper quote is stale; refresh before adjusting the OCO")
+    mark = quote.mark or quote.last
+    if mark is None or mark <= 0:
+        raise ValueError("Alpaca Paper quote has no usable price")
+    price = _positive(body.get("price"), "price")
+    if role == "stop":
+        if position.side == PositionSide.LONG and not stop.stop_price < price < mark:
+            raise ValueError("long stop can only tighten below the current mark")
+        if position.side == PositionSide.SHORT and not mark < price < stop.stop_price:
+            raise ValueError("short stop can only tighten above the current mark")
+        return ReplaceOrder(order_id, stop_price=price,
+                            client_order_id=f"et-exit-{request_id.hex}")
+    if position.side == PositionSide.LONG and not mark < price:
+        raise ValueError("long target must remain above the current mark")
+    if position.side == PositionSide.SHORT and not price < mark:
+        raise ValueError("short target must remain below the current mark")
+    return ReplaceOrder(order_id, limit_price=price,
+                        client_order_id=f"et-exit-{request_id.hex}")

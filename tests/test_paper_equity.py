@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
@@ -18,7 +19,7 @@ from companion.brokers.models import (
     SubmitOrder,
 )
 from companion.brokers.order_service import BrokerOrderService
-from companion.brokers.paper_equity import close_plan, entry_plan, oco_plan
+from companion.brokers.paper_equity import close_plan, entry_plan, oco_exit_reprice, oco_plan
 from companion.store import Store
 from companion.trading import Trader
 
@@ -95,6 +96,51 @@ def test_close_plan_handles_long_and_short_without_attaching_an_exit():
         close_plan({**body, "shares": "3"}, position, quote(now), now)
     with pytest.raises(ValueError, match="whole"):
         close_plan({**body, "shares": "1.5"}, position, quote(now), now)
+
+
+def oco_group(side=PositionSide.LONG, qty=Decimal(2), stop=Decimal(95),
+              target=Decimal(110)):
+    group_id, target_id, stop_id = (str(uuid4()) for _ in range(3))
+    instruction = OrderInstruction.SELL if side == PositionSide.LONG else OrderInstruction.BUY
+    leg = OrderLeg("AAPL", AssetType.EQUITY, instruction, qty)
+    target_order = BrokerOrder(target_id, OrderStatus.WORKING, OrderType.LIMIT,
+                               TimeInForce.GTC, (leg,), OrderRole.TARGET,
+                               group_id=group_id, limit_price=target)
+    stop_order = BrokerOrder(stop_id, OrderStatus.WORKING, OrderType.STOP,
+                             TimeInForce.GTC, (leg,), OrderRole.STOP,
+                             group_id=group_id, parent_id=target_id, stop_price=stop)
+    return OrderGroup(group_id, OrderClass.OCO, OrderStatus.WORKING,
+                      (target_order, stop_order))
+
+
+def test_oco_exit_reprice_tightens_stop_and_moves_target_with_exact_ids():
+    now = datetime.now(timezone.utc)
+    position = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, Decimal(2), Decimal(100))
+    group = oco_group()
+    body = {"symbol": "AAPL", "order_id": group.orders[1].order_id,
+            "role": "stop", "price": "97", "request_id": str(uuid4())}
+    stop = oco_exit_reprice(body, position, group, quote(now), now)
+    assert stop.order_id == group.orders[1].order_id and stop.stop_price == 97
+    assert stop.limit_price is None and stop.client_order_id.startswith("et-exit-")
+    target = oco_exit_reprice({**body, "order_id": group.orders[0].order_id,
+                               "role": "target", "price": "108"}, position, group, quote(now), now)
+    assert target.order_id == group.orders[0].order_id and target.limit_price == 108
+    with pytest.raises(ValueError, match="only tighten"):
+        oco_exit_reprice({**body, "price": "94"}, position, group, quote(now), now)
+    with pytest.raises(ValueError, match="fully working"):
+        oco_exit_reprice(body, Position("AAPL", AssetType.EQUITY, PositionSide.LONG,
+                                       Decimal(1), Decimal(100)), group, quote(now), now)
+
+
+def test_oco_exit_reprice_short_uses_buy_side_and_rejects_looser_stop():
+    now = datetime.now(timezone.utc)
+    position = Position("AAPL", AssetType.EQUITY, PositionSide.SHORT, Decimal(2), Decimal(100))
+    group = oco_group(PositionSide.SHORT, stop=Decimal(105), target=Decimal(90))
+    body = {"symbol": "AAPL", "order_id": group.orders[1].order_id,
+            "role": "stop", "price": "103", "request_id": str(uuid4())}
+    assert oco_exit_reprice(body, position, group, quote(now), now).stop_price == 103
+    with pytest.raises(ValueError, match="only tighten"):
+        oco_exit_reprice({**body, "price": "106"}, position, group, quote(now), now)
 
 
 def test_paper_close_route_requires_order_free_position_and_rechecks_before_send(monkeypatch, tmp_path):
@@ -428,6 +474,95 @@ def test_paper_oco_submit_refuses_position_change_before_mutation(monkeypatch, t
             "symbol": "AAPL", "target_price": "110", "stop_price": "95",
             "request_id": str(uuid4())}, headers={"X-Companion": "1"}).json()
         assert sent["status"] == "rejected" and "position changed" in sent["message"]
+        assert adapter.commands == []
+    finally:
+        store.close()
+        poller.store.close()
+
+
+def test_paper_oco_adjust_previews_rechecks_and_reconciles_exact_stop(monkeypatch, tmp_path):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    position = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, Decimal(2), Decimal(100))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (position,))
+    group = oco_group()
+    request_id = str(uuid4())
+    replacement_id = str(uuid4())
+    client_id = f"et-exit-{request_id.replace('-', '')}"
+    replacement = BrokerOrder(replacement_id, OrderStatus.WORKING, OrderType.STOP,
+                              TimeInForce.GTC,
+                              (OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL,
+                                        Decimal(2)),), OrderRole.STOP,
+                              client_order_id=client_id, stop_price=Decimal(97))
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, account, account, account, account)
+    adapter.given_query(OrdersQuery, (group,), (group,), (group,))
+    adapter.given_query(QuotesQuery, {"AAPL": quote(now)}, {"AAPL": quote(now)},
+                        {"AAPL": quote(now)})
+    adapter.given_query(ClientOrderQuery, OrderGroup(group.group_id, OrderClass.OCO,
+                                                     OrderStatus.WORKING, (replacement,)))
+    adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, replacement_id))
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
+    poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
+                     "updated_at": now.isoformat(), "positions": [], "orders": []}}
+    class Selection:
+        def get(self): return "alpaca-paper"
+    monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
+    monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "BrokerSelection", Selection)
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    body = {"symbol": "AAPL", "order_id": group.orders[1].order_id,
+            "role": "stop", "price": "97", "request_id": request_id}
+    try:
+        preview = client.post("/api/paper/oco/adjust/preview", json=body, headers=headers).json()
+        assert preview["ok"] and preview["old_price"] == "95"
+        assert preview["new_price"] == "97" and preview["other_price"] == "110"
+        sent = client.post("/api/paper/oco/adjust/submit", json=body, headers=headers).json()
+        assert sent["status"] == "unknown" and sent["order_id"] == replacement_id
+        assert len(adapter.commands) == 1
+        assert adapter.commands[0].stop_price == 97
+        resolved = client.post("/api/paper/entry/reprice/reconcile",
+                               json={"request_id": request_id}, headers=headers).json()
+        assert resolved["status"] == "accepted" and resolved["order_id"] == replacement_id
+    finally:
+        store.close()
+        poller.store.close()
+
+
+def test_paper_oco_adjust_refuses_changed_pair_before_replace(monkeypatch, tmp_path):
+    import companion.app as appmod
+
+    now = datetime.now(timezone.utc)
+    position = Position("AAPL", AssetType.EQUITY, PositionSide.LONG, Decimal(2), Decimal(100))
+    account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (position,))
+    group = oco_group()
+    changed = replace(group, orders=(replace(group.orders[0], limit_price=Decimal(111)),
+                                     group.orders[1]))
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, account, account)
+    adapter.given_query(OrdersQuery, (group,), (changed,))
+    adapter.given_query(QuotesQuery, {"AAPL": quote(now)}, {"AAPL": quote(now)})
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    poller = AlpacaBootstrapPoller(adapter=adapter)
+    poller.order_service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: now)
+    poller._state = {"broker_ready": True, "alpaca": {"account_status": "ACTIVE",
+                     "updated_at": now.isoformat(), "positions": [], "orders": []}}
+    class Selection:
+        def get(self): return "alpaca-paper"
+    monkeypatch.setattr(appmod, "BROKER_KEY", "alpaca-paper")
+    monkeypatch.setattr(appmod, "poller", poller)
+    monkeypatch.setattr(appmod, "BrokerSelection", Selection)
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    try:
+        result = client.post("/api/paper/oco/adjust/submit", json={
+            "symbol": "AAPL", "order_id": group.orders[1].order_id,
+            "role": "stop", "price": "97", "request_id": str(uuid4())},
+            headers={"X-Companion": "1"}).json()
+        assert result["status"] == "rejected" and "OCO changed" in result["message"]
         assert adapter.commands == []
     finally:
         store.close()
