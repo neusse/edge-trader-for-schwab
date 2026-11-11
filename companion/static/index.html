@@ -361,7 +361,7 @@
 <section class="panel" id="alpaca-overview" aria-label="Alpaca Paper account overview"></section>
 <section class="panel" id="paper-entry" aria-label="Alpaca Paper equity bracket entry">
   <h2>Paper equity bracket entry</h2>
-  <p class="mut">One target and one fixed stop are held by Alpaca after entry fills. Existing order-free positions can receive OCO exits, a market close, or a partial market close from the Positions list. Shares left after a partial close have no new stop. Options, trailing stops, and two targets are unavailable in this form.</p>
+  <p class="mut">One target and one fixed stop are held by Alpaca after entry fills. Existing order-free positions can receive OCO exits, a market close, or a partial market close from the Positions list. Working OCO stop and target prices can be adjusted from Working orders. Shares left after a partial close have no new stop. Options, trailing stops, and two targets are unavailable in this form.</p>
   <form id="paper-form">
     <div class="paper-fields">
       <label>Symbol<input class="in" name="symbol" required maxlength="10" placeholder="AAPL" autocomplete="off"></label>
@@ -1266,7 +1266,8 @@ function renderAlpacaOverview(st) {
       `<button type="button" class="btn sm ghost" data-paper-close="${esc(p.symbol)}" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="Market close of an order-free Paper equity position">Close</button>
        ${Number(p.qty) > 1 && st.broker?.workflows?.includes("equity-partial") ? `<button type="button" class="btn sm ghost" data-paper-close="${esc(p.symbol)}" data-paper-partial="1" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="Market sell or cover part of an order-free Paper equity position">Partial</button>` : ""}` : ""}</td></tr>`).join("");
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td>
-    <td>${o.cancellable && o.group_type === "BRACKET" && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}</td></tr>`).join("");
+    <td>${o.cancellable && o.group_type === "BRACKET" && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}
+    ${o.group_type === "OCO" && ["STOP", "TARGET"].includes(o.role) && st.broker?.workflows?.includes("equity-oco-adjust") ? `<button type="button" class="btn sm ghost" data-paper-oco-adjust="${esc(o.order_id)}" data-paper-role="${o.role.toLowerCase()}" data-paper-symbol="${esc(o.symbol)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move ${esc(o.role.toLowerCase())}</button>` : ""}</td></tr>`).join("");
   const orderRows = recent.map(o => `<tr><td>${esc(o.symbols.join(", "))}</td><td>${esc(o.status)}</td><td>${esc(o.type)}</td><td>${esc(o.quantities.join(", "))}</td></tr>`).join("");
   const fillRows = fills.map(f => `<tr><td>${esc(new Date(f.time).toLocaleString())}</td><td>${esc(f.symbol)}</td><td>${esc(f.instruction)}</td><td>${esc(f.quantity)}</td><td>${money(Number(f.price), false)}</td></tr>`).join("");
   panel.innerHTML = `<h2>Alpaca Paper · ${esc(a.account_status)}</h2>
@@ -1672,6 +1673,49 @@ $("alpaca-overview").addEventListener("click", async e => {
     if (sent) {
       paperOutcome = "unknown";
       paperMessage(`OCO may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(String(err.message || err));
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
+$("alpaca-overview").addEventListener("click", async e => {
+  const button = e.target.closest("[data-paper-oco-adjust]");
+  if (!button || paperBusy || paperOutcome === "unknown" ||
+      lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready) return;
+  const {paperOcoAdjust: orderId, paperRole: role, paperSymbol: symbol} = button.dataset;
+  const input = window.prompt(`New ${role} price for ${symbol} OCO`, "");
+  if (input === null) return;
+  if (!Number.isFinite(Number(input)) || Number(input) <= 0) {
+    paperMessage("Enter a positive price."); return;
+  }
+  const requestId = crypto.randomUUID();
+  paperBusy = true; paperRequestId = requestId; paperCommand = "ReplaceOrder"; paperIntentKey = null;
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const payload = {symbol, order_id: orderId, role, price: input, request_id: requestId};
+    const preview = await post("/api/paper/oco/adjust/preview", payload);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "OCO adjustment preview refused");
+    if (!window.confirm(`Move ${preview.symbol} ${preview.role} ${preview.old_price} → ${preview.new_price} for ${preview.quantity} ${preview.side} shares? ` +
+        `Paired exit remains at ${preview.other_price}; IEX mark ${preview.quote}. ${preview.protection}.`)) {
+      paperMessage("Paper OCO adjustment canceled."); return;
+    }
+    paperMessage("Sending Paper OCO replacement once…");
+    sent = true;
+    const result = await post("/api/paper/oco/adjust/submit", payload);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown";
+      paperMessage(result.message || "Replacement pending. Reconcile before another action.");
+    } else {
+      paperRequestId = null;
+      paperMessage(result.ok ? `Alpaca Paper confirmed OCO replacement ${result.order_id}.` :
+        result.message || result.error || result.detail || "OCO adjustment refused");
+    }
+  } catch (err) {
+    if (sent) {
+      paperOutcome = "unknown";
+      paperMessage(`OCO replacement may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
     } else {
       paperRequestId = null;
       paperMessage(String(err.message || err));
