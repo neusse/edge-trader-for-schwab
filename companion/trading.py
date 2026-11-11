@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from . import schwab
-from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
+from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_intent, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .brokers.models import (
     AssetType, CancelOrder, MutationResult, MutationStatus, OcoOrderIntent, OrderInstruction,
     OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent, StopLossIntent, SubmitOrder, TimeInForce,
@@ -800,6 +800,7 @@ class Trader:
             return {"ok": False, "error": "Ticket showed a trailing stop but the plan has a fixed one. Review.",
                     "plan": p.as_dict()}
         order = bracket_order(p)
+        canonical = bracket_intent(p, ticket_id)
         if p.option and p.trail:
             # Schwab does not document trailing stops on options: its preview decides first.
             refused = self._preview_refusal(self._ensure(), order)
@@ -820,38 +821,36 @@ class Trader:
                     p.stop, p.target)
         state["sent"] = True
         try:
-            r = self._logged("place_order", lambda: self._ensure().place_order(self._hash, order))
+            result = self._broker_mutation("place_order", SubmitOrder(canonical))
         except Exception as e:   # timeout, connection reset: the order may or may not exist
             self._safe_update(ticket_id, "UNKNOWN", detail=repr(e)[:500])
             return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id,
                     "error": "No answer from Schwab. The order MAY be live: check thinkorswim."}
-        if r.status_code in (200, 201):
-            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
-            oid = int(tail) if tail.isdigit() else None
-            status = "ACCEPTED" if oid else "ACCEPTED_UNTRACKED"
-            if not self._safe_update(ticket_id, status, order_id=oid):
+        if result.accepted:
+            oid = int(result.order_id) if result.order_id else None
+            if not self._safe_update(ticket_id, "ACCEPTED", order_id=oid):
                 # The ticket stays SENDING (which blocks new tickets) until reconciled.
                 return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id, "order_id": oid,
                         "error": "Schwab accepted the order but the companion could not record it. "
                                  "Check thinkorswim."}
-            return {"ok": True, "status": status, "order_id": oid, "ticket_id": ticket_id,
+            return {"ok": True, "status": "ACCEPTED", "order_id": oid, "ticket_id": ticket_id,
                     "plan": p.as_dict()}
-        if r.status_code == 429:
+        if result.status == MutationStatus.RATE_LIMITED:
             # Throttled before Schwab looked at the order: nothing was placed, a retry is safe
             # (it gets a new ticket id, so the record of this attempt stays intact).
-            ra = r.headers.get("Retry-After")
-            self._safe_update(ticket_id, "RATE_LIMITED", detail=f"Retry-After={ra} {r.text[:800]}")
+            ra = f"{result.retry_after_seconds:g}" if result.retry_after_seconds is not None else None
+            self._safe_update(ticket_id, "RATE_LIMITED", detail=result.message)
             return {"ok": False, "status": "RATE_LIMITED", "ticket_id": ticket_id, "retry_after": ra,
                     "error": "Schwab throttled the order request (HTTP 429): nothing was placed. "
                              + (f"Retry in {ra} s." if ra else "Click again to retry.")}
-        if 400 <= r.status_code < 500:
+        if result.status == MutationStatus.REJECTED:
             # Schwab refused it: nothing was placed.
-            self._safe_update(ticket_id, "REJECTED", detail=r.text[:1000])
+            self._safe_update(ticket_id, "REJECTED", detail=result.message)
             return {"ok": False, "status": "REJECTED", "ticket_id": ticket_id,
-                    "error": f"Schwab rejected the order (HTTP {r.status_code}): {r.text[:300]}"}
-        self._safe_update(ticket_id, "UNKNOWN", detail=f"HTTP {r.status_code}: {r.text[:500]}")
+                    "error": f"Schwab rejected the order: {result.message}"}
+        self._safe_update(ticket_id, "UNKNOWN", detail=result.message)
         return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id,
-                "error": f"Schwab answered HTTP {r.status_code}. The order MAY be live: check thinkorswim."}
+                "error": "Schwab's answer was unclear. The order MAY be live: check thinkorswim."}
 
     # ---- cancel unfilled entries -------------------------------------------
 
@@ -2588,9 +2587,8 @@ class Trader:
         rebuild=True (after a partial): Schwab already cancelled the old exits; send exactly
         `target` (if any) + stop for `qty`, without looking at what is working.
 
-        preview=True asks Schwab's order preview first and sends nothing it refuses (the result
-        then has not_sent=True). Only for a change that keeps the current exits working until the
-        new order enters; never after a partial, where Schwab has already dropped them."""
+        preview=True reports a verified adapter preview refusal as not sent. Only for a change
+        that keeps the current exits working until the new order enters."""
         from .orders import pending_orders
         instr = {("EQUITY", True): "SELL", ("EQUITY", False): "BUY_TO_COVER",
                  ("OPTION", True): "SELL_TO_CLOSE", ("OPTION", False): "BUY_TO_CLOSE"}.get((asset, side == "LONG"))
@@ -2598,14 +2596,11 @@ class Trader:
             return {"ok": False, "symbol": symbol, "error": f"Cannot set a stop on a {asset} position here."}
         size = abs(qty)
         n = int(size) if float(size).is_integer() else size
-        leg = [{"instruction": instr, "quantity": n, "instrument": {"symbol": symbol, "assetType": asset}}]
-        from .bracket import stop_leg
         tk = ticks_for(asset)              # formatting only: the prices are already on their grid
         unit_w, us = _units(asset)
         if not rebuild and any(_gtc(p.duration) for p in pending_orders(fresh, terminal)
                                if p.symbol == symbol and p.live and p.exits(side) and p.role in ("STOP", "TARGET")):
             duration = "GOOD_TILL_CANCEL"     # the kept target was GTC: the new pair keeps it overnight
-        stop = stop_leg(trail or price, leg, duration=duration, ticks=tk)
         stop_txt = _trail_txt(trail) if trail else f"stop {fmt(price, tk)}"
         targets = []
         if not rebuild:
@@ -2624,23 +2619,10 @@ class Trader:
             if targets:
                 target = Decimal(str(targets[0].price))
         if target is not None:
-            order = {"orderStrategyType": "OCO", "childOrderStrategies": [
-                {"orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
-                 "duration": duration, "price": fmt(target, tk), "orderLegCollection": leg},
-                stop]}
             what = f"{stop_txt} + target {fmt(target, tk)} as one OCO"
             targets = targets or [True]
         else:
-            order, what = stop, stop_txt
-        if preview and not (asset == "OPTION" and trail):
-            refused = self._preview_refusal(client, order)
-            if refused:
-                rejected, why = refused
-                what_txt = "trailing stop" if trail else "order"
-                head = (f"Schwab does not accept this {what_txt} on {symbol}: {why}" if rejected else
-                        f"Schwab's preview did not confirm this {what_txt} on {symbol} ({why})")
-                return {"ok": False, "symbol": symbol, "not_sent": True,
-                        "error": head.rstrip(".") + ". Nothing was sent; your current stop and target are still working."}
+            what = stop_txt
         self.store.log_action("create_stop", symbol, None, "SENDING", f"{what}, {n} {us}")
         log.warning("CREATE STOP %s %s %s", symbol, n, what)
         try:

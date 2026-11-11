@@ -17,7 +17,7 @@ from .models import (
     OrderExecution, OrdersQuery, OrderStatus, OrderType, Position, PositionSide,
     PreviousSessionPosition, ReplaceOrder, SubmitOrder,
     TimeInForce, BracketOrderIntent, MultiLegOrderIntent, OcoOrderIntent,
-    TrailingOrderIntent, TrailingStopSpec,
+    TrailingOrderIntent, TrailingStopSpec, TriggeredOrderIntent,
 )
 
 
@@ -425,7 +425,12 @@ class SchwabAdapter(BrokerAdapter):
                 isinstance(intent, OcoOrderIntent) and intent.leg.asset_type == AssetType.OPTION and
                 isinstance(intent.stop_loss, TrailingStopSpec) or
                 isinstance(intent, BracketOrderIntent) and intent.entry.leg.asset_type == AssetType.OPTION and
-                isinstance(intent.stop_loss, TrailingStopSpec)):
+                isinstance(intent.stop_loss, TrailingStopSpec) or
+                isinstance(intent, TriggeredOrderIntent) and intent.entry.leg.asset_type == AssetType.OPTION and
+                any(isinstance(exit_intent, TrailingOrderIntent) or
+                    isinstance(exit_intent, OcoOrderIntent) and
+                    isinstance(exit_intent.stop_loss, TrailingStopSpec)
+                    for exit_intent in intent.exits)):
             try:
                 preview = client.preview_order(account_hash, body)
                 if preview.status_code == 429:

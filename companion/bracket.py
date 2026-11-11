@@ -510,55 +510,65 @@ def _option_warnings(p: Plan) -> None:
 
 
 def bracket_order(p: Plan, exit_duration: str = "DAY") -> dict:
-    """Schwab 1st-triggers-OCO: entry LIMIT (or MARKET) -> OCO(target LIMIT, STOP market).
+    """Translate a canonical reviewed plan for the Schwab preview and ticket record."""
+    from .brokers.schwab_orders import build_schwab_order
 
-    Two targets (OT2OCO): entry LIMIT -> [OCO(target1, stop) for qty1, OCO(runner, stop) for
-    the rest]. Each half has its own stop, so taking target 1 never cancels the runner's stop.
+    return build_schwab_order(bracket_intent(p, "preview", exit_duration))
 
-    Without a target the entry triggers the stop alone; without a stop, the target alone; with
-    neither, the entry is a plain SINGLE order.
-    """
+
+def bracket_intent(p: Plan, client_order_id: str, exit_duration: str = "DAY"):
+    """Represent the reviewed entry and its linked exits without a broker payload."""
+    from .brokers.models import (
+        AssetType, OcoOrderIntent, OrderInstruction, OrderLegIntent, OrderType,
+        SimpleOrderIntent, StopLossIntent, TimeInForce, TrailingOrderIntent,
+        TrailingStopSpec, TriggeredOrderIntent,
+    )
+
     if not p.ok:
         raise ValueError("cannot build an order from an invalid plan: " + "; ".join(p.errors))
-    entry_instr, exit_instr = {("EQUITY", "LONG"): ("BUY", "SELL"), ("EQUITY", "SHORT"): ("SELL_SHORT", "BUY_TO_COVER"),
-                               ("OPTION", "LONG"): ("BUY_TO_OPEN", "SELL_TO_CLOSE"),
-                               ("OPTION", "SHORT"): ("SELL_TO_OPEN", "BUY_TO_CLOSE")}[(p.asset, p.side)]
-    instrument = {"symbol": p.symbol, "assetType": p.asset}
+    opening, closing = {("EQUITY", "LONG"): ("BUY", "SELL"),
+                        ("EQUITY", "SHORT"): ("SELL_SHORT", "BUY_TO_COVER"),
+                        ("OPTION", "LONG"): ("BUY_TO_OPEN", "SELL_TO_CLOSE"),
+                        ("OPTION", "SHORT"): ("SELL_TO_OPEN", "BUY_TO_CLOSE")}[(p.asset, p.side)]
+    asset = AssetType[p.asset]
+    entry = SimpleOrderIntent(
+        OrderLegIntent(p.symbol, asset, OrderInstruction[opening], Decimal(p.qty)),
+        OrderType.MARKET if p.market else OrderType.LIMIT,
+        TimeInForce.DAY, client_order_id,
+        limit_price=None if p.market else Decimal(p.f(p.limit)),
+    )
+    tif = TimeInForce.GTC if exit_duration.upper() in ("GTC", "GOOD_TILL_CANCEL") else TimeInForce.DAY
 
-    def leg(instruction: str, qty: int) -> list[dict]:
-        return [{"instruction": instruction, "quantity": qty, "instrument": instrument}]
+    def exit_leg(quantity: int) -> OrderLegIntent:
+        return OrderLegIntent(p.symbol, asset, OrderInstruction[closing], Decimal(quantity))
 
-    def oco(qty: int, target: Decimal) -> dict:
-        return {
-            "orderStrategyType": "OCO",
-            "childOrderStrategies": [
-                {"orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
-                 "duration": exit_duration, "price": p.f(target),
-                 "orderLegCollection": leg(exit_instr, qty)},
-                stop_leg(p.trail or p.stop, leg(exit_instr, qty), exit_duration, p.ticks),
-            ],
-        }
+    def stop_spec():
+        if not p.trail:
+            return StopLossIntent(Decimal(p.f(p.stop)))
+        values = ({"trail_price": p.trail["offset"]} if p.trail["link"] == "VALUE" else
+                  {"trail_percent": p.trail["offset"]})
+        return TrailingStopSpec(basis=p.trail["basis"], **values)
+
+    def oco(quantity: int, target: Decimal, suffix: str) -> OcoOrderIntent:
+        return OcoOrderIntent(exit_leg(quantity), Decimal(p.f(target)), stop_spec(), tif,
+                              f"{client_order_id}-{suffix}")
 
     if p.two_targets:
-        exits = [oco(p.qty1, p.target1), oco(p.qty - p.qty1, p.target)]
+        exits = (oco(p.qty1, p.target1, "first"),
+                 oco(p.qty - p.qty1, p.target, "runner"))
     elif p.has_stop and p.has_target:
-        exits = [oco(p.qty, p.target)]
+        exits = (oco(p.qty, p.target, "exit"),)
+    elif p.has_stop and p.trail:
+        values = ({"trail_price": p.trail["offset"]} if p.trail["link"] == "VALUE" else
+                  {"trail_percent": p.trail["offset"]})
+        exits = (TrailingOrderIntent(exit_leg(p.qty), tif, f"{client_order_id}-stop",
+                                     basis=p.trail["basis"], **values),)
     elif p.has_stop:
-        exits = [stop_leg(p.trail or p.stop, leg(exit_instr, p.qty), exit_duration, p.ticks)]
+        exits = (SimpleOrderIntent(exit_leg(p.qty), OrderType.STOP, tif,
+                                   f"{client_order_id}-stop", stop_price=Decimal(p.f(p.stop))),)
     elif p.has_target:
-        exits = [{"orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
-                  "duration": exit_duration, "price": p.f(p.target), "orderLegCollection": leg(exit_instr, p.qty)}]
+        exits = (SimpleOrderIntent(exit_leg(p.qty), OrderType.LIMIT, tif,
+                                   f"{client_order_id}-target", limit_price=Decimal(p.f(p.target))),)
     else:
-        exits = []
-    order = {
-        "orderStrategyType": "TRIGGER" if exits else "SINGLE",
-        "orderType": "MARKET" if p.market else "LIMIT",
-        "session": "NORMAL",
-        "duration": "DAY",
-        "orderLegCollection": leg(entry_instr, p.qty),
-    }
-    if exits:
-        order["childOrderStrategies"] = exits
-    if not p.market:
-        order["price"] = p.f(p.limit)
-    return order
+        return entry
+    return TriggeredOrderIntent(entry, exits)

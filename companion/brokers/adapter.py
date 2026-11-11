@@ -29,6 +29,7 @@ from .models import (
     SimpleOrderIntent,
     SubmitOrder,
     TrailingOrderIntent,
+    TriggeredOrderIntent,
     OrderType,
 )
 
@@ -65,7 +66,7 @@ def required_command_capability(command: BrokerCommand) -> BrokerCapability:
     intent = command.intent
     if isinstance(intent, MultiLegOrderIntent):
         return BrokerCapability.MULTI_LEG_OPTIONS
-    if isinstance(intent, BracketOrderIntent):
+    if isinstance(intent, (BracketOrderIntent, TriggeredOrderIntent)):
         return (
             BrokerCapability.OPTION_BRACKET
             if intent.entry.leg.asset_type == AssetType.OPTION

@@ -5,7 +5,8 @@ from decimal import Decimal
 
 from .models import (
     AssetType, BracketOrderIntent, MultiLegOrderIntent, OcoOrderIntent, OrderInstruction,
-    OrderLegIntent, OrderType, SimpleOrderIntent, TimeInForce, TrailingOrderIntent, TrailingStopSpec,
+    OrderLegIntent, OrderType, SimpleOrderIntent, TimeInForce, TrailingOrderIntent,
+    TrailingStopSpec, TriggeredOrderIntent,
 )
 
 _EXIT = {
@@ -86,14 +87,21 @@ def _target(leg: OrderLegIntent, price: Decimal, duration: str) -> dict:
 def build_schwab_order(intent) -> dict:
     """Return an unsent Schwab order tree; the caller owns all action guards."""
     if not isinstance(intent, (SimpleOrderIntent, BracketOrderIntent, OcoOrderIntent,
-                               TrailingOrderIntent, MultiLegOrderIntent)):
+                               TrailingOrderIntent, TriggeredOrderIntent, MultiLegOrderIntent)):
         raise TypeError(f"unknown Schwab order intent: {type(intent).__name__}")
-    duration = (intent.entry.time_in_force if isinstance(intent, BracketOrderIntent)
+    duration = (intent.entry.time_in_force if isinstance(intent, (BracketOrderIntent, TriggeredOrderIntent))
                 else intent.time_in_force)
     if duration not in (TimeInForce.DAY, TimeInForce.GTC):
         raise ValueError("Schwab canonical orders require DAY or GTC time in force")
     if isinstance(intent, SimpleOrderIntent):
         return _simple(intent)
+    if isinstance(intent, TriggeredOrderIntent):
+        if intent.entry.order_type not in (OrderType.MARKET, OrderType.LIMIT):
+            raise ValueError("Schwab triggered entry must be market or limit")
+        entry = _simple(intent.entry)
+        entry["orderStrategyType"] = "TRIGGER"
+        entry["childOrderStrategies"] = [build_schwab_order(exit_intent) for exit_intent in intent.exits]
+        return entry
     if isinstance(intent, BracketOrderIntent):
         if intent.entry.order_type not in (OrderType.MARKET, OrderType.LIMIT):
             raise ValueError("Schwab bracket entry must be market or limit")

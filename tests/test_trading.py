@@ -198,6 +198,20 @@ def test_fewer_shares_than_fresh_plan_sends_the_displayed_size(trader):
     assert r["ok"] and trader._client.placed[0]["orderLegCollection"][0]["quantity"] == 100
 
 
+def test_ticket_submit_uses_a_canonical_triggered_order(trader, monkeypatch):
+    from companion.brokers.models import SubmitOrder, TriggeredOrderIntent
+
+    commands = []
+    execute = trader._broker_mutation
+    monkeypatch.setattr(trader, "_broker_mutation", lambda endpoint, command:
+                        (commands.append(command), execute(endpoint, command))[1])
+    result = trader.submit(req())
+    assert result["ok"] and len(commands) == 1
+    assert isinstance(commands[0], SubmitOrder)
+    assert isinstance(commands[0].intent, TriggeredOrderIntent)
+    assert commands[0].intent.entry.client_order_id == "ticket-0001"
+
+
 def test_timeout_is_unknown_and_blocks_new_tickets(trader):
     trader._client.exc = TimeoutError("read timed out")
     r = trader.submit(req())
