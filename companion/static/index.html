@@ -1294,7 +1294,9 @@ function renderAlpacaOverview(st) {
     ${p.asset_type === "EQUITY" && p.protection === "NONE" && st.broker?.workflows?.includes("equity-add") ?
       `<button type="button" class="btn sm ghost" data-paper-add="${esc(p.symbol)}" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="Add unprotected Paper equity shares; attach OCO after fill">Add</button>` : ""}
     ${p.asset_type === "EQUITY" && p.protection === "NONE" && st.broker?.workflows?.includes("equity-trailing") ?
-      `<button type="button" class="btn sm ghost" data-paper-trailing="${esc(p.symbol)}" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="Attach a standalone Paper trailing stop with no target">Trail</button>` : ""}</td></tr>`).join("");
+      `<button type="button" class="btn sm ghost" data-paper-trailing="${esc(p.symbol)}" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || p.quote_stale || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="Attach a standalone Paper trailing stop with no target">Trail</button>` : ""}
+    ${p.asset_type === "OPTION" && p.protection === "NONE" && st.broker?.workflows?.includes("option-close") ?
+      `<button type="button" class="btn sm ghost" data-paper-option-close="${esc(p.symbol)}" ${!paperArmed || !st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || working.some(o => o.symbol === p.symbol) ? "disabled" : ""} title="Review a limit close of an order-free Paper option position">Close option</button>` : ""}</td></tr>`).join("");
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td>
     <td>${o.cancellable && o.group_type === "BRACKET" && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}
     ${o.group_type === "OCO" && ["STOP", "TARGET"].includes(o.role) && st.broker?.workflows?.includes("equity-oco-adjust") ? `<button type="button" class="btn sm ghost" data-paper-oco-adjust="${esc(o.order_id)}" data-paper-role="${o.role.toLowerCase()}" data-paper-symbol="${esc(o.symbol)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move ${esc(o.role.toLowerCase())}</button>` : ""}</td></tr>`).join("");
@@ -1332,6 +1334,7 @@ function render(st) {
     $("paper-options-form").elements.expiration.innerHTML = '<option value="">Find expirations</option>';
     resetPaperOptionSelection();
     paperOptionSentKeys.clear();
+    paperOptionCloseSentKeys.clear();
     TV.pos = null; TV.closed = null; TV.flat = {}; TV.said = {};
     if ("speechSynthesis" in window) speechSynthesis.cancel();
   }
@@ -1473,6 +1476,7 @@ const post = (url, body, ms = 25000) => {
 };
 let paperOptionChain = null, paperOptionSelected = null;
 const paperOptionSentKeys = new Set();
+const paperOptionCloseSentKeys = new Set();
 const paperOptionsForm = $("paper-options-form");
 const paperExpirySelect = paperOptionsForm.elements.expiration;
 function resetPaperOptionSelection() {
@@ -2057,6 +2061,65 @@ $("alpaca-overview").addEventListener("click", async e => {
     if (sent) {
       paperOutcome = "unknown";
       paperMessage(`Trailing stop may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
+    } else {
+      paperRequestId = null;
+      paperMessage(String(err.message || err));
+    }
+  } finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
+});
+$("alpaca-overview").addEventListener("click", async e => {
+  const button = e.target.closest("[data-paper-option-close]");
+  if (!button || paperBusy || paperOutcome === "unknown" || !paperArmed ||
+      lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready ||
+      lastState.market_hours?.is_open !== true) return;
+  const contract = button.dataset.paperOptionClose;
+  const position = (lastState.positions || []).find(p => p.symbol === contract &&
+    p.asset_type === "OPTION" && p.protection === "NONE" &&
+    Number.isInteger(Number(p.qty)) && Number(p.qty) > 0);
+  if (!position || (lastState.orders || []).some(o => o.symbol === contract)) return;
+  const count = window.prompt(`Close how many of ${position.qty} ${contract} contracts?`, String(position.qty));
+  if (count === null) return;
+  if (!Number.isInteger(Number(count)) || Number(count) <= 0 || Number(count) > Number(position.qty)) {
+    paperMessage("Close quantity must be whole and no greater than the held contracts."); return;
+  }
+  const price = window.prompt(`Limit premium per share to ${position.side === "LONG" ? "sell" : "buy"} ${contract}`,
+    String(position.side === "LONG" ? position.quote?.bid || "" : position.quote?.ask || ""));
+  if (price === null) return;
+  if (!Number.isFinite(Number(price)) || Number(price) <= 0) {
+    paperMessage("Enter a positive option limit price."); return;
+  }
+  const key = JSON.stringify([contract, position.opened, count, price]);
+  if (paperOptionCloseSentKeys.has(key)) {
+    paperMessage("This exact option close was already sent. Verify its broker status before another action."); return;
+  }
+  const requestId = crypto.randomUUID();
+  const payload = {contract, quantity:count, limit_price:price, request_id:requestId};
+  paperBusy = true; paperRequestId = requestId; paperCommand = "SubmitOrder"; paperIntentKey = null;
+  renderPaperControls(lastState);
+  let sent = false;
+  try {
+    const preview = await post("/api/paper/options/close/preview", payload, 45000);
+    if (!preview.ok) throw new Error(preview.error || preview.detail || "Option close preview refused");
+    if (!window.confirm(`${preview.side} ${preview.closing} of ${preview.held} ${preview.contract} contracts at a limit of ${preview.limit_price} per share? ` +
+        `${preview.remaining} expected to remain. Indicative bid/ask ${preview.indicative_bid ?? "—"}/${preview.indicative_ask ?? "—"}. ${preview.protection}.`)) {
+      paperMessage("Paper option close review canceled."); return;
+    }
+    paperMessage("Sending Paper option close once…");
+    sent = true;
+    const result = await post("/api/paper/options/close/submit", payload, 45000);
+    if (result.status === "unknown") {
+      paperOutcome = "unknown"; paperOptionCloseSentKeys.add(key);
+      paperMessage(result.message || "Option close outcome unknown. Reconcile before another action.");
+    } else {
+      paperRequestId = null; paperOutcome = null;
+      if (result.ok) paperOptionCloseSentKeys.add(key);
+      paperMessage(result.ok ? `Alpaca Paper accepted option close ${result.order_id}. Verify the fill and remaining position.` :
+        result.message || result.error || result.detail || "Option close refused");
+    }
+  } catch (err) {
+    if (sent) {
+      paperOutcome = "unknown"; paperOptionCloseSentKeys.add(key);
+      paperMessage(`Option close may have reached Alpaca: ${String(err.message || err)}. Reconcile before another action.`);
     } else {
       paperRequestId = null;
       paperMessage(String(err.message || err));

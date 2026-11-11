@@ -9,7 +9,8 @@ from zoneinfo import ZoneInfo
 
 from .models import (AccountSnapshot, AssetType, OptionChain, OptionChainQuery,
                      OptionExpirationsQuery, OptionType, OrderInstruction,
-                     OrderLegIntent, OrderType, SimpleOrderIntent, TimeInForce)
+                     OrderLegIntent, OrderType, Position, PositionSide,
+                     SimpleOrderIntent, TimeInForce)
 
 UNDERLYING = re.compile(r"[A-Z][A-Z0-9.]{0,5}\Z")
 OCC = re.compile(r"([A-Z0-9.]{1,6}) {0,5}(\d{2})(\d{2})(\d{2})([CP])(\d{8})\Z")
@@ -149,3 +150,45 @@ def long_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
     return SimpleOrderIntent(
         OrderLegIntent(symbol, AssetType.OPTION, OrderInstruction.BUY_TO_OPEN, quantity),
         OrderType.LIMIT, TimeInForce.DAY, f"et-opt-{request_id.hex}", limit_price=limit)
+
+
+def option_close_plan(body: dict, position: Position,
+                      now: datetime | None = None) -> SimpleOrderIntent:
+    """Limit close of up to the held whole-contract option quantity, without an exit chain."""
+    if not isinstance(body, dict) or position.asset_type != AssetType.OPTION:
+        raise ValueError("Paper option close requires a held option position")
+    symbol = body.get("contract")
+    match = OCC.fullmatch(position.symbol)
+    if match is None or symbol != position.symbol.replace(" ", ""):
+        raise ValueError("option close contract must match the held OCC position")
+    _, year, month, day, _, _ = match.groups()
+    try:
+        expiration = date(2000 + int(year), int(month), int(day))
+    except ValueError:
+        raise ValueError("held option OCC expiration is invalid") from None
+    today = (now or datetime.now(ET)).astimezone(ET).date()
+    if expiration < today:
+        raise ValueError("expired option position cannot be closed from this form")
+    held = position.quantity
+    if held <= 0 or held != held.to_integral_value() or held > 10000:
+        raise ValueError("held option quantity must be 1 to 10000 whole contracts")
+    try:
+        quantity = Decimal(str(body.get("quantity")))
+        limit = Decimal(str(body.get("limit_price")))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("contracts and limit price must be positive numbers") from None
+    if (not quantity.is_finite() or quantity <= 0 or quantity != quantity.to_integral_value() or
+            quantity > held):
+        raise ValueError("close quantity must be whole and no greater than the held contracts")
+    if not limit.is_finite() or limit <= 0 or limit != limit.quantize(Decimal("0.01")):
+        raise ValueError("option close limit must be positive with cent precision")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("request_id must be a UUID") from None
+    instruction = (OrderInstruction.SELL_TO_CLOSE if position.side == PositionSide.LONG else
+                   OrderInstruction.BUY_TO_CLOSE)
+    return SimpleOrderIntent(
+        OrderLegIntent(symbol, AssetType.OPTION, instruction, quantity),
+        OrderType.LIMIT, TimeInForce.DAY, f"et-opt-close-{request_id.hex}",
+        limit_price=limit)
