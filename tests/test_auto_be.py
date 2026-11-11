@@ -1,5 +1,6 @@
 """The poller's +1R watcher for Auto B/E tickets: fires once, only on a fresh quote after the fill."""
 import time
+from datetime import datetime, timedelta, timezone
 
 from companion import poller as poller_mod
 from companion import trading
@@ -46,15 +47,26 @@ def _state(mark, quote_ms=None):
 
 
 def test_fires_once_when_the_mark_touches_1r(tmp_path, monkeypatch):
+    # Keep the quote exactly one second old throughout the three observations. A CI runner's
+    # wall clock can jump while this test runs, making a generated "now" quote look future-dated.
+    fixed_now = datetime(2026, 11, 11, 15, 0, tzinfo=timezone.utc)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(poller_mod, "datetime", FixedDateTime)
+    quote_ms = (fixed_now - timedelta(seconds=1)).timestamp() * 1000
     p = _setup(tmp_path, monkeypatch)
-    st, p.quotes = _state(57.70)
+    st, p.quotes = _state(57.70, quote_ms=quote_ms)
     p._auto_be(st)
     assert p.trader.calls == [] and st["positions"][0]["auto_be"]["state"] == "PENDING"
     assert st["positions"][0]["auto_be"]["trigger"] == 57.65
-    st, p.quotes = _state(57.65)
+    st, p.quotes = _state(57.65, quote_ms=quote_ms)
     p._auto_be(st)
     assert len(p.trader.calls) == 1 and p.trader.calls[0][:4] == ("t1", "CRWV", "SHORT", 58.39)
-    st, p.quotes = _state(57.50)
+    st, p.quotes = _state(57.50, quote_ms=quote_ms)
     p._auto_be(st)
     assert len(p.trader.calls) == 1                     # claimed: never a second move
 
