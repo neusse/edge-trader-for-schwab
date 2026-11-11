@@ -427,3 +427,46 @@ def test_option_fixed_exit_route_rechecks_order_free_full_position(monkeypatch):
         **body, "role": "stop-limit", "limit_price": "0.90"}, headers=headers)
     assert stop_limit.json()["ok"] and stop_limit.json()["limit_price"] == "0.90"
     assert "may remain unfilled" in stop_limit.json()["protection"]
+
+
+def test_partially_filled_option_exit_blocks_rebuild_until_final_state(monkeypatch):
+    import companion.app as appmod
+
+    held = _held_option()
+    account = _account(positions=(held,))
+    order = BrokerOrder("partial-exit", OrderStatus.PARTIALLY_FILLED, OrderType.STOP,
+                        TimeInForce.GTC,
+                        (OrderLeg(held.symbol, AssetType.OPTION,
+                                  OrderInstruction.SELL_TO_CLOSE, D("3"), D("1")),),
+                        OrderRole.STOP, stop_price=D("1.00"),
+                        client_order_id="et-opt-exit-owned")
+    groups = (OrderGroup("partial-exit", OrderClass.SIMPLE,
+                         OrderStatus.PARTIALLY_FILLED, (order,)),)
+    def query(value):
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return groups
+        if isinstance(value, QuotesQuery): return {held.symbol: _chain().contracts[0].quote}
+        raise AssertionError(type(value))
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query), account_ref="paper-account")
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    monkeypatch.setattr("companion.brokers.paper_options.datetime", SimpleNamespace(
+        now=lambda _tz: NOW))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    exit_body = {"contract": held.symbol, "role": "stop", "price": "1.00",
+                 "request_id": _entry_body()["request_id"]}
+    blocked = client.post("/api/paper/options/exit/preview", json=exit_body, headers=headers)
+    assert not blocked.json()["ok"] and "active option order" in blocked.json()["error"]
+    close_body = {"contract": held.symbol, "quantity": "3", "limit_price": "1.40",
+                  "request_id": _entry_body()["request_id"]}
+    blocked_close = client.post("/api/paper/options/close/preview", json=close_body,
+                                headers=headers)
+    assert not blocked_close.json()["ok"] and "active order" in blocked_close.json()["error"]
+    groups = ()
+    account = _account(positions=(Position(held.symbol, AssetType.OPTION,
+                                           PositionSide.LONG, D("2"), D("1.10")),))
+    rebuilt = client.post("/api/paper/options/exit/preview", json=exit_body, headers=headers)
+    assert rebuilt.json()["ok"] and rebuilt.json()["quantity"] == "2"
+    overclose = client.post("/api/paper/options/close/preview", json=close_body,
+                            headers=headers)
+    assert not overclose.json()["ok"] and "no greater" in overclose.json()["error"]
