@@ -6,11 +6,28 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from .models import OptionChain, OptionChainQuery, OptionType
+from .models import OptionChain, OptionChainQuery, OptionExpirationsQuery, OptionType
 
 UNDERLYING = re.compile(r"[A-Z][A-Z0-9.]{0,5}\Z")
 OCC = re.compile(r"([A-Z0-9.]{1,6}) {0,5}(\d{2})(\d{2})(\d{2})([CP])(\d{8})\Z")
 ET = ZoneInfo("America/New_York")
+
+
+def expirations_query(body: dict, now: datetime | None = None) -> OptionExpirationsQuery:
+    if not isinstance(body, dict):
+        raise ValueError("option expiration request must be an object")
+    underlying = body.get("underlying")
+    if not isinstance(underlying, str) or not UNDERLYING.fullmatch(underlying):
+        raise ValueError("use an uppercase option underlying of at most 6 characters")
+    today = (now or datetime.now(ET)).astimezone(ET).date()
+    return OptionExpirationsQuery(underlying, today, today + timedelta(days=120))
+
+
+def expirations_response(query: OptionExpirationsQuery, dates: tuple[date, ...]) -> dict:
+    if len(dates) > 120 or any(not query.start <= day <= query.end for day in dates):
+        raise ValueError("Alpaca option expirations exceeded the requested range")
+    return {"ok": True, "underlying": query.underlying,
+            "expirations": [day.isoformat() for day in sorted(set(dates))]}
 
 
 def chain_query(body: dict, now: datetime | None = None) -> OptionChainQuery:

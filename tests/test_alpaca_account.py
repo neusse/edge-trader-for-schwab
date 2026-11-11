@@ -510,3 +510,23 @@ def test_option_contract_query_paginates_and_normalizes():
     assert chain.contracts[0].quote.mark == D("1.1")
     assert chain.contracts[0].quote.greeks.delta == D("0.5")
     assert chain.contracts[0].implied_volatility == D("0.3")
+
+
+def test_option_expirations_query_paginates_without_market_snapshot():
+    from datetime import date
+    from companion.brokers.models import OptionExpirationsQuery
+
+    requests = []
+    class Client:
+        def get_option_contracts(self, request):
+            requests.append(request)
+            day = date(2026, 11, 20) if request.page_token else date(2026, 11, 13)
+            return SimpleNamespace(option_contracts=[SimpleNamespace(
+                underlying_symbol="AAPL", expiration_date=day)],
+                next_page_token=None if request.page_token else "next")
+
+    dates = AlpacaPaperAdapter(Client()).query(OptionExpirationsQuery(
+        "AAPL", date(2026, 11, 11), date(2027, 3, 11)))
+    assert dates == (date(2026, 11, 13), date(2026, 11, 20))
+    assert len(requests) == 2 and requests[1].page_token == "next"
+    assert requests[0].expiration_date_lte == date(2027, 3, 11)

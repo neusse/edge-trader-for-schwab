@@ -388,8 +388,9 @@
   <p class="mut">Browse one expiration and type at a time. Alpaca option quotes and Greeks are indicative, may be delayed or absent, and are for discovery only. No option order is sent from this view.</p>
   <form id="paper-options-form" class="paper-fields">
     <label>Underlying<input class="in" name="underlying" required maxlength="6" placeholder="AAPL" autocomplete="off"></label>
-    <label>Expiration<input class="in" name="expiration" required type="date"></label>
+    <label>Expiration<select class="in" name="expiration" required><option value="">Find expirations</option></select></label>
     <label>Type<select class="in" name="option_type"><option value="call">Calls</option><option value="put">Puts</option></select></label>
+    <button class="btn ghost" type="button" id="paper-options-expirations">Find expirations</button>
     <button class="btn" type="submit" id="paper-options-load">Load contracts</button>
   </form>
   <p id="paper-options-msg" class="mut" role="status">Choose an underlying and expiration.</p>
@@ -1320,6 +1321,7 @@ function render(st) {
     paperArmed = false; paperOutcome = null; paperRequestId = null; paperCommand = "SubmitOrder";
     $("paper-options-chain").innerHTML = "";
     $("paper-options-msg").textContent = "Choose an underlying and expiration.";
+    $("paper-options-form").elements.expiration.innerHTML = '<option value="">Find expirations</option>';
     TV.pos = null; TV.closed = null; TV.flat = {}; TV.said = {};
     if ("speechSynthesis" in window) speechSynthesis.cancel();
   }
@@ -1459,6 +1461,41 @@ const post = (url, body, ms = 25000) => {
     body: JSON.stringify(body || {}), signal: ctl.signal})
     .then(r => r.json()).finally(() => clearTimeout(timer));
 };
+const paperOptionsForm = $("paper-options-form");
+const paperExpirySelect = paperOptionsForm.elements.expiration;
+paperOptionsForm.elements.underlying.addEventListener("input", () => {
+  paperExpirySelect.innerHTML = '<option value="">Find expirations</option>';
+  $("paper-options-chain").innerHTML = "";
+});
+$("paper-options-expirations").addEventListener("click", async () => {
+  if (lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready) {
+    $("paper-options-msg").textContent = "Alpaca Paper account data must be ready before discovery.";
+    return;
+  }
+  const underlying = paperOptionsForm.elements.underlying.value.trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9.]{0,5}$/.test(underlying)) {
+    $("paper-options-msg").textContent = "Enter an uppercase option underlying of at most 6 characters.";
+    return;
+  }
+  const button = $("paper-options-expirations");
+  button.disabled = true;
+  paperExpirySelect.innerHTML = '<option value="">Loading…</option>';
+  $("paper-options-msg").textContent = `Finding ${underlying} expirations…`;
+  try {
+    const result = await post("/api/paper/options/expirations", {underlying}, 45000);
+    if (!result.ok) throw new Error(result.error || result.detail || "Expiration lookup failed");
+    if (lastState?.broker?.key !== "alpaca-paper" ||
+        paperOptionsForm.elements.underlying.value.trim().toUpperCase() !== underlying) return;
+    const dates = result.expirations || [];
+    paperExpirySelect.innerHTML = '<option value="">Choose expiration</option>' +
+      dates.map(day => `<option value="${esc(day)}">${esc(day)}</option>`).join("");
+    $("paper-options-msg").textContent = dates.length ? `${dates.length} active expirations for ${underlying}. Choose one to load its contracts.` :
+      `No active ${underlying} expirations were returned in the next 120 days.`;
+  } catch (err) {
+    paperExpirySelect.innerHTML = '<option value="">Find expirations</option>';
+    $("paper-options-msg").textContent = String(err.message || err);
+  } finally { button.disabled = false; }
+});
 $("paper-options-form").addEventListener("submit", async e => {
   e.preventDefault();
   if (lastState?.broker?.key !== "alpaca-paper" || !lastState.broker_ready) {

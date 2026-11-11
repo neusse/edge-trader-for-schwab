@@ -21,6 +21,7 @@ from .models import (
     MutationResult,
     OcoOrderIntent,
     OptionChainQuery,
+    OptionExpirationsQuery,
     OrderQuery,
     OrdersQuery,
     QuotesQuery,
@@ -51,7 +52,7 @@ def required_query_capability(query: BrokerQuery) -> BrokerCapability:
         return BrokerCapability.MARKET_CALENDAR
     if isinstance(query, MarketClockQuery):
         return BrokerCapability.MARKET_CLOCK
-    if isinstance(query, OptionChainQuery):
+    if isinstance(query, (OptionChainQuery, OptionExpirationsQuery)):
         return BrokerCapability.OPTION_MARKET_DATA
     raise TypeError(f"unknown broker query: {type(query).__name__}")
 
