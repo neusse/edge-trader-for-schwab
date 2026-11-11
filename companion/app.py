@@ -1851,7 +1851,7 @@ def _paper_oco_auto_be_plan(body: dict):
     if (quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or
             not quote.realtime or not quote.timestamp_verified or
             quote.observed_at.tzinfo is None or
-            not 0 <= (now - quote.observed_at).total_seconds() <= 15 or
+            not -5 <= (now - quote.observed_at).total_seconds() <= 15 or
             (quote.mark or quote.last) is None or (quote.mark or quote.last) <= 0):
         raise ValueError("Fresh verified IEX quote is required to set Auto B/E")
     watch = getattr(poller, "auto_be", None)

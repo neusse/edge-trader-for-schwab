@@ -215,7 +215,7 @@ class PaperAutoBEWatch:
         if (quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or
                 not quote.realtime or not quote.timestamp_verified or
                 quote.observed_at.tzinfo is None or
-                not 0 <= (now - quote.observed_at).total_seconds() <= MAX_QUOTE_AGE or
+                not -5 <= (now - quote.observed_at).total_seconds() <= MAX_QUOTE_AGE or
                 quote.observed_at <= datetime.fromisoformat(row["set_at"])):
             return suspend("Fresh verified IEX quote is unavailable")
         mark = quote.mark or quote.last

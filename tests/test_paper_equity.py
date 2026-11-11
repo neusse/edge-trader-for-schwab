@@ -107,6 +107,10 @@ def test_entry_plan_checks_bracket_direction_and_quote_freshness():
         entry_plan(entry(stop_price="101"), quote(now), now)
     with pytest.raises(ValueError, match="stale"):
         entry_plan(entry(), quote(now - timedelta(seconds=31)), now)
+    # Broker timestamps may lead the local clock slightly; a large lead is invalid.
+    entry_plan(entry(), quote(now + timedelta(seconds=2)), now)
+    with pytest.raises(ValueError, match="stale"):
+        entry_plan(entry(), quote(now + timedelta(seconds=6)), now)
     with pytest.raises(ValueError, match="whole shares"):
         entry_plan(entry(quantity="1.5"), quote(now), now)
     with pytest.raises(ValueError, match="positive number"):

@@ -501,7 +501,7 @@ class AlpacaBootstrapPoller:
             if (quote is None or quote.symbol != row["symbol"] or quote.source != "Alpaca IEX" or
                     not quote.realtime or not quote.timestamp_verified or
                     quote.observed_at.tzinfo is None or
-                    not 0 <= (now - quote.observed_at).total_seconds() <= 15):
+                    not -5 <= (now - quote.observed_at).total_seconds() <= 15):
                 raise ValueError("Fresh verified IEX quote disappeared; no stop was moved")
             mark = quote.mark or quote.last
             if (mark is None or mark <= 0 or
