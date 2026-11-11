@@ -169,6 +169,19 @@ def prefer_complete_order_groups(*batches: tuple[OrderGroup, ...]) -> tuple[Orde
     return tuple(found.values())
 
 
+def query_complete_active_groups(adapter: BrokerAdapter, now: datetime) -> tuple[OrderGroup, ...]:
+    """Read active groups with recent nested parents needed for paired exit checks."""
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    working = adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=active))
+    if not any(group.order_class in (OrderClass.BRACKET, OrderClass.OCO) and
+               len(group.orders) < (3 if group.order_class == OrderClass.BRACKET else 2)
+               for group in working):
+        return working
+    recent = adapter.query(OrdersQuery(now - timedelta(days=30), now))
+    return prefer_complete_order_groups(recent, working)
+
+
 class AlpacaPaperAdapter(BrokerAdapter):
     def __init__(self, client=None, stock_data=None, option_data=None):
         super().__init__(ALPACA_PAPER)
