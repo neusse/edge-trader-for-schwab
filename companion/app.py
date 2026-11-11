@@ -91,7 +91,7 @@ APP_WORKFLOWS = {
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. An existing app-created OCO can opt into app-watched Auto B/E with fresh IEX quotes. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order; an exact held vertical can be closed or given one broker-held target. Held options can be closed or given one fixed stop, stop-limit, or target. Spread stops are app-watched and require fresh OPRA option quotes; the indicative feed never triggers one.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A filled app-created bracket or existing OCO can opt into app-watched Auto B/E with fresh IEX quotes. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order; an exact held vertical can be closed or given one broker-held target. Held options can be closed or given one fixed stop, stop-limit, or target. Spread stops are app-watched and require fresh OPRA option quotes; the indicative feed never triggers one.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -1811,11 +1811,11 @@ def _paper_oco_auto_be_plan(body: dict):
         leg.symbol == symbol for order in group.orders
         if order.status in active for leg in order.legs)]
     if len(touching) != 1:
-        raise ValueError("Exactly one active OCO group must protect this symbol")
+        raise ValueError("Exactly one active bracket or OCO group must protect this symbol")
     plan = oco_auto_be_plan(positions[0], touching[0])
     owned = service.store.get_mutation_by_client_id(plan["oco_client_id"])
     if owned is None or owned["status"] != "accepted" or owned["command"] != "SubmitOrder":
-        raise ValueError("Auto B/E requires an OCO accepted through this app")
+        raise ValueError("Auto B/E requires a bracket or OCO accepted through this app")
     quote = service.adapter.query(QuotesQuery((symbol,), AssetType.EQUITY)).get(symbol)
     if (quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or
             not quote.realtime or not quote.timestamp_verified or
@@ -1830,6 +1830,7 @@ def _paper_oco_auto_be_plan(body: dict):
 
 
 @app.post("/api/paper/oco/auto-be/preview")
+@app.post("/api/paper/equity/auto-be/preview")
 async def paper_oco_auto_be_preview(request: Request):
     _guard(request)
     try:
@@ -1841,7 +1842,7 @@ async def paper_oco_auto_be_preview(request: Request):
         return {"ok": True, **{key: str(value) if isinstance(value, Decimal) else value
                                for key, value in plan.items()},
                 "quote": str(quote.mark or quote.last),
-                "warning": "APP-WATCHED: at +1R the app attempts one fixed-stop replacement. The current OCO stop is broker-held; replacement protection is unconfirmed until Alpaca verifies the new OCO. Auto B/E needs this app running and fresh IEX quotes."}
+                "warning": "APP-WATCHED: at +1R the app attempts one fixed-stop replacement. The current bracket or OCO stop is broker-held; replacement protection is unconfirmed until Alpaca verifies the new exit group. Auto B/E needs this app running and fresh IEX quotes."}
     except (ValueError, TypeError, AttributeError) as exc:
         return {"ok": False, "error": str(exc)}
     except HTTPException:
@@ -1851,6 +1852,7 @@ async def paper_oco_auto_be_preview(request: Request):
 
 
 @app.post("/api/paper/oco/auto-be/set")
+@app.post("/api/paper/equity/auto-be/set")
 async def paper_oco_auto_be_set(request: Request):
     _guard(request)
     try:
@@ -1874,13 +1876,14 @@ def _set_paper_oco_auto_be(body: dict) -> dict:
         if reviewed != {key: str(plan[key]) for key in
                         ("quantity", "basis", "initial_stop", "target", "trigger",
                          "new_stop", "group_id", "stop_id", "target_id")}:
-            raise ValueError("OCO or Auto B/E risk changed since preview; review again")
+            raise ValueError("Protected exits or Auto B/E risk changed since preview; review again")
         row = watch.set(plan)
         return {"symbol": row["symbol"], "status": row["status"],
                 "trigger": str(row["trigger"]), "new_stop": str(row["new_stop"])}
 
 
 @app.post("/api/paper/oco/auto-be/clear")
+@app.post("/api/paper/equity/auto-be/clear")
 async def paper_oco_auto_be_clear(request: Request):
     _guard(request)
     try:
@@ -1907,6 +1910,7 @@ async def paper_oco_auto_be_clear(request: Request):
 
 
 @app.post("/api/paper/oco/auto-be/reconcile")
+@app.post("/api/paper/equity/auto-be/reconcile")
 async def paper_oco_auto_be_reconcile(request: Request):
     _guard(request)
     try:

@@ -40,6 +40,23 @@ def pair(side=PositionSide.LONG, *, basis="100", stop="95", target="110", qty="2
     return position, group
 
 
+def bracket_pair(side=PositionSide.LONG, **kwargs):
+    position, oco = pair(side, **kwargs)
+    opening = OrderInstruction.BUY if side == PositionSide.LONG else OrderInstruction.SELL
+    entry_leg = OrderLeg("AAPL", AssetType.EQUITY, opening,
+                         position.quantity, filled_quantity=position.quantity)
+    entry = BrokerOrder(oco.group_id, OrderStatus.FILLED, OrderType.LIMIT,
+                        TimeInForce.DAY, (entry_leg,), OrderRole.ENTRY,
+                        group_id=oco.group_id,
+                        client_order_id=f"et-{uuid4().hex}")
+    target = replace(oco.orders[0], client_order_id=None, parent_id=entry.order_id,
+                     time_in_force=TimeInForce.DAY)
+    stop = replace(oco.orders[1], parent_id=entry.order_id,
+                   time_in_force=TimeInForce.DAY)
+    return position, OrderGroup(oco.group_id, OrderClass.BRACKET,
+                                 OrderStatus.FILLED, (entry, target, stop))
+
+
 def quote(at, bid="105", ask="105.02", *, source="Alpaca IEX", verified=True):
     return Quote("AAPL", D(bid), D(ask), None, (D(bid) + D(ask)) / 2,
                  at, True, source, timestamp_verified=verified)
@@ -63,6 +80,18 @@ def test_auto_be_plan_requires_owned_working_pair_and_tightens_long_or_short():
         external = pair()[1]
         oco_auto_be_plan(long, replace(external, orders=(
             replace(external.orders[0], client_order_id="external"), external.orders[1])))
+
+
+def test_auto_be_plan_accepts_filled_bracket_but_not_partial_entry():
+    position, group = bracket_pair()
+    plan = oco_auto_be_plan(position, group)
+    assert plan["oco_client_id"] == group.orders[0].client_order_id
+    assert (plan["trigger"], plan["new_stop"]) == (D(105), D(100))
+    partial = replace(group, orders=(
+        replace(group.orders[0], status=OrderStatus.PARTIALLY_FILLED),
+        group.orders[1], group.orders[2]))
+    with pytest.raises(ValueError, match="changed"):
+        oco_auto_be_plan(position, partial)
 
 
 def test_auto_be_requires_two_new_verified_quotes_and_blocks_unknown_clear(tmp_path):
@@ -153,9 +182,10 @@ def test_auto_be_ends_when_oco_target_changes(tmp_path):
 
 
 @pytest.mark.parametrize("recovered", [False, True])
-def test_auto_be_poller_checks_third_quote_before_one_replace(tmp_path, recovered):
+@pytest.mark.parametrize("source", ["oco", "bracket"])
+def test_auto_be_poller_checks_third_quote_before_one_replace(tmp_path, recovered, source):
     now = datetime.now(timezone.utc)
-    position, group = pair()
+    position, group = bracket_pair() if source == "bracket" else pair()
     account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (position,))
     store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
     watch = PaperAutoBEWatch(store)
@@ -202,11 +232,12 @@ def test_auto_be_poller_checks_third_quote_before_one_replace(tmp_path, recovere
         store.close()
 
 
-def test_auto_be_route_reviews_and_sets_only_owned_unchanged_oco(monkeypatch, tmp_path):
+@pytest.mark.parametrize("source", ["oco", "bracket"])
+def test_auto_be_route_reviews_and_sets_only_owned_unchanged_oco(monkeypatch, tmp_path, source):
     import companion.app as appmod
 
     now = datetime.now(timezone.utc)
-    position, group = pair()
+    position, group = bracket_pair() if source == "bracket" else pair()
     account = AccountSnapshot("paper-account", "ACTIVE", BalanceSnapshot(), (position,))
     store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
     watch = PaperAutoBEWatch(store)
@@ -224,33 +255,35 @@ def test_auto_be_route_reviews_and_sets_only_owned_unchanged_oco(monkeypatch, tm
     monkeypatch.setattr(appmod, "poller", SimpleNamespace(auto_be=watch))
     client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
     headers = {"X-Companion": "1"}
+    route = "/api/paper/equity/auto-be" if source == "bracket" else "/api/paper/oco/auto-be"
     try:
-        preview = client.post("/api/paper/oco/auto-be/preview",
+        preview = client.post(f"{route}/preview",
                               json={"symbol": "AAPL"}, headers=headers).json()
         assert not preview["ok"] and "accepted through this app" in preview["error"]
+        client_id = oco_auto_be_plan(position, group)["oco_client_id"]
         assert store.record_mutation(str(uuid4()), "SubmitOrder", {},
-                                     group.orders[0].client_order_id)
-        owned = store.get_mutation_by_client_id(group.orders[0].client_order_id)
+                                     client_id)
+        owned = store.get_mutation_by_client_id(client_id)
         store.finish_mutation(owned["request_id"], "accepted", group.group_id)
-        preview = client.post("/api/paper/oco/auto-be/preview",
+        preview = client.post(f"{route}/preview",
                               json={"symbol": "AAPL"}, headers=headers).json()
         assert preview["ok"] and preview["trigger"] == "105"
         assert "APP-WATCHED" in preview["warning"]
         keys = ("quantity", "basis", "initial_stop", "target", "trigger",
                 "new_stop", "group_id", "stop_id", "target_id")
         reviewed = {key: preview[key] for key in keys}
-        refused = client.post("/api/paper/oco/auto-be/set",
+        refused = client.post(f"{route}/set",
                               json={"symbol": "AAPL", "reviewed": {**reviewed, "basis": "101"}},
                               headers=headers).json()
         assert not refused["ok"] and watch.get("AAPL") is None
-        set_result = client.post("/api/paper/oco/auto-be/set",
+        set_result = client.post(f"{route}/set",
                                  json={"symbol": "AAPL", "reviewed": reviewed},
                                  headers=headers).json()
         assert set_result["ok"] and set_result["status"] == "watching"
-        duplicate = client.post("/api/paper/oco/auto-be/preview",
+        duplicate = client.post(f"{route}/preview",
                                 json={"symbol": "AAPL"}, headers=headers).json()
         assert not duplicate["ok"]
-        cleared = client.post("/api/paper/oco/auto-be/clear",
+        cleared = client.post(f"{route}/clear",
                               json={"symbol": "AAPL"}, headers=headers).json()
         assert cleared["ok"] and watch.get("AAPL") is None
     finally:

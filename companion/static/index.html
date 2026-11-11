@@ -1334,7 +1334,7 @@ function renderAlpacaOverview(st) {
   const workingRows = working.map(o => `<tr><td>${esc(o.display)}</td><td>${esc(o.role)}</td><td>${esc(o.status)}</td><td>${esc(o.order_type)}</td><td>${esc(o.qty)}</td>
     <td>${o.cancellable && (o.group_type === "BRACKET" || (o.group_type === "SIMPLE" && o.asset_type === "EQUITY" && o.role === "ENTRY" && o.tag?.startsWith("et-"))) && st.broker_ready ? `<button type="button" class="btn sm ghost" data-paper-cancel="${esc(o.order_id)}" ${paperBusy || paperOutcome === "unknown" ? "disabled" : ""}>Cancel entry</button> <button type="button" class="btn sm ghost" data-paper-reprice="${esc(o.order_id)}" ${o.order_type === "LIMIT" && ["NEW", "WORKING"].includes(o.status) && !paperBusy && paperOutcome !== "unknown" ? "" : "disabled"}>Replace price</button>` : ""}
     ${o.group_type === "OCO" && ["STOP", "TARGET"].includes(o.role) && st.broker?.workflows?.includes("equity-oco-adjust") ? `<button type="button" class="btn sm ghost" data-paper-oco-adjust="${esc(o.order_id)}" data-paper-role="${o.role.toLowerCase()}" data-paper-symbol="${esc(o.symbol)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move ${esc(o.role.toLowerCase())}</button>` : ""}
-    ${o.group_type === "OCO" && o.role === "STOP" && st.broker?.workflows?.includes("equity-auto-be") && !(st.paper_auto_be || []).some(be => be.symbol === o.symbol && ["watching", "suspended", "sending", "unknown"].includes(be.status)) ? `<button type="button" class="btn sm ghost" data-paper-auto-be="${esc(o.symbol)}" ${!st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Auto B/E +1R</button>` : ""}
+    ${["OCO", "BRACKET"].includes(o.group_type) && o.role === "STOP" && st.broker?.workflows?.includes("equity-auto-be") && !(st.paper_auto_be || []).some(be => be.symbol === o.symbol && ["watching", "suspended", "sending", "unknown"].includes(be.status)) ? `<button type="button" class="btn sm ghost" data-paper-auto-be="${esc(o.symbol)}" ${!st.broker_ready || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Auto B/E +1R</button>` : ""}
     ${o.group_type === "SIMPLE" && o.asset_type === "OPTION" && o.tag?.startsWith("et-opt-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("option-cancel") ? `<button type="button" class="btn sm ghost" data-paper-option-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperOptionCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel remaining</button>` : ""}
     ${o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.asset_type === "OPTION" && o.tag?.startsWith("et-vertical-") && o.live && Number(o.qty) > 0 && st.broker?.workflows?.includes("vertical-cancel") ? `<button type="button" class="btn sm ghost" data-paper-vertical-cancel="${esc(o.order_id)}" ${!st.broker_ready || paperBusy || paperOutcome === "unknown" || paperVerticalCancelSentIds.has(o.order_id) ? "disabled" : ""}>Cancel spread remainder</button>` : ""}
     ${o.group_type === "MULTI-LEG" && o.leg_id === "1" && o.role === "TARGET" && o.tag?.startsWith("et-vertical-target-") && o.order_type === "LIMIT" && o.filled === 0 && st.broker?.workflows?.includes("vertical-target-reprice") ? `<button type="button" class="btn sm ghost" data-paper-vertical-reprice="${esc(o.order_id)}" ${!st.broker_ready || !paperArmed || st.market_hours?.is_open !== true || paperBusy || paperOutcome === "unknown" || paperVerticalRepriceSentIds.has(o.order_id) || !["NEW", "WORKING"].includes(o.status) ? "disabled" : ""}>Move spread target</button>` : ""}</td></tr>`).join("");
@@ -1354,7 +1354,7 @@ function renderAlpacaOverview(st) {
     <div class="alpaca-list"><h2>Working orders (${working.length})</h2>${working.length ? `<table><thead><tr><th>Symbol</th><th>Role</th><th>Status</th><th>Type</th><th>Remaining</th><th>Action</th></tr></thead><tbody>${workingRows}</tbody></table>` : `<p class="mut">No working orders.</p>`}</div>
     <div class="alpaca-list"><h2>Orders, last 30 days (${recent.length})</h2>${recent.length ? `<table><thead><tr><th>Symbol</th><th>Status</th><th>Type</th><th>Quantity</th></tr></thead><tbody>${orderRows}</tbody></table>` : `<p class="mut">No recent orders.</p>`}</div>
     <div class="alpaca-list"><h2>Recent fills (${fills.length}${(st.fills || []).length > fills.length ? "+" : ""})</h2>${fills.length ? `<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Quantity</th><th>Price</th></tr></thead><tbody>${fillRows}</tbody></table>` : `<p class="mut">No fills in the loaded history.</p>`}</div>
-    <div class="alpaca-list"><h2>App-watched Paper Auto B/E (${(st.paper_auto_be || []).length})</h2><p class="mut">The current OCO stop is broker-held. This app attempts one move to break-even at +1R only while running with fresh IEX quotes and an unchanged position/OCO. Replacement protection is unconfirmed until Alpaca verifies it.</p>${beRows ? `<table><thead><tr><th>Position</th><th>+1R mark</th><th>New stop</th><th>Status</th><th>Reason</th><th>Action</th></tr></thead><tbody>${beRows}</tbody></table>` : `<p class="mut">No Auto B/E watch.</p>`}</div>
+    <div class="alpaca-list"><h2>App-watched Paper Auto B/E (${(st.paper_auto_be || []).length})</h2><p class="mut">The current bracket or OCO stop is broker-held. This app attempts one move to break-even at +1R only while running with fresh IEX quotes and an unchanged position and exit group. Replacement protection is unconfirmed until Alpaca verifies it.</p>${beRows ? `<table><thead><tr><th>Position</th><th>+1R mark</th><th>New stop</th><th>Status</th><th>Reason</th><th>Action</th></tr></thead><tbody>${beRows}</tbody></table>` : `<p class="mut">No Auto B/E watch.</p>`}</div>
     <div class="alpaca-list"><h2>App-watched spread stops (${(st.paper_spread_stops || []).length})</h2><p class="mut">These are local app watches, never broker-held stops. They pause without fresh OPRA quotes, a running monitor, and regular market hours.</p>${stopRows ? `<table><thead><tr><th>Held pair</th><th>Stop</th><th>Mode</th><th>Status</th><th>Reason</th><th>Action</th></tr></thead><tbody>${stopRows}</tbody></table>` : `<p class="mut">No app-watched spread stops.</p>`}</div>`;
 }
 let renderedBroker = null;
@@ -2181,15 +2181,15 @@ $("alpaca-overview").addEventListener("click", async e => {
   paperBusy = true; renderPaperControls(lastState);
   try {
     const payload = {symbol};
-    const preview = await post("/api/paper/oco/auto-be/preview", payload);
+    const preview = await post("/api/paper/equity/auto-be/preview", payload);
     if (!preview.ok) throw new Error(preview.error || "Auto B/E preview refused");
     if (!window.confirm(`Watch ${preview.quantity} ${preview.side} ${symbol} shares for Auto B/E?\n\n` +
-        `Entry basis ${preview.basis}; OCO stop ${preview.initial_stop}; target ${preview.target}. ` +
+        `Entry basis ${preview.basis}; broker-held stop ${preview.initial_stop}; target ${preview.target}. ` +
         `At IEX mark ${preview.trigger} (+1R), attempt one stop move to ${preview.new_stop}.\n\n` +
         preview.warning)) { paperMessage("Paper Auto B/E review canceled."); return; }
     const reviewed = Object.fromEntries(["quantity", "basis", "initial_stop", "target",
       "trigger", "new_stop", "group_id", "stop_id", "target_id"].map(key => [key, preview[key]]));
-    const result = await post("/api/paper/oco/auto-be/set", {...payload, reviewed});
+    const result = await post("/api/paper/equity/auto-be/set", {...payload, reviewed});
     if (!result.ok) throw new Error(result.error || "Auto B/E setup refused");
     paperMessage(`App-watched Auto B/E set for ${symbol}: +1R ${result.trigger}, new stop ${result.new_stop}.`);
   } catch (err) { paperMessage(String(err.message || err)); }
@@ -2200,7 +2200,7 @@ $("alpaca-overview").addEventListener("click", async e => {
   if (!button || paperBusy || lastState?.broker?.key !== "alpaca-paper") return;
   paperBusy = true; renderPaperControls(lastState);
   try {
-    const result = await post("/api/paper/oco/auto-be/reconcile",
+    const result = await post("/api/paper/equity/auto-be/reconcile",
       {request_id: button.dataset.paperAutoBeReconcile});
     paperMessage(result.message || result.error || "Auto B/E replacement remains unknown");
   } catch (err) { paperMessage(String(err.message || err)); }
@@ -2215,7 +2215,7 @@ $("alpaca-overview").addEventListener("click", async e => {
       `Clear the app-watched Auto B/E for ${symbol}? The broker-held OCO remains at Alpaca.`)) return;
   paperBusy = true; renderPaperControls(lastState);
   try {
-    const result = await post("/api/paper/oco/auto-be/clear", {symbol, acknowledge: unknown});
+    const result = await post("/api/paper/equity/auto-be/clear", {symbol, acknowledge: unknown});
     paperMessage(result.ok ? `Paper Auto B/E watch cleared for ${symbol}.` : result.error || "Auto B/E clear refused");
   } catch (err) { paperMessage(String(err.message || err)); }
   finally { paperBusy = false; renderPaperControls(lastState); await tick(); }
