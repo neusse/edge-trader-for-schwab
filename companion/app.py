@@ -36,7 +36,7 @@ from .brokers.models import (AccountQuery, AssetType, CancelOrder,
 from .brokers.paper_equity import (add_plan, close_plan, entry_plan, oco_exit_reprice,
                                    oco_plan, trailing_plan)
 from .brokers.paper_options import (chain_query, chain_response, expirations_query,
-                                    expirations_response)
+                                    expirations_response, long_entry_plan)
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -78,12 +78,13 @@ BROKER_REQUEST_LOCK = asyncio.Lock()
 APP_WORKFLOWS = {
     "schwab": ("schwab-ticket", "schwab-spreads"),
     "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
-                     "equity-oco-adjust", "equity-add", "equity-trailing"),
+                     "equity-oco-adjust", "equity-add", "equity-trailing",
+                     "option-long-entry"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket entry, unfilled entry cancellation and repricing, OCO exits with fixed stop and target adjustments, and market close, partial close, add shares, or a standalone trailing stop for an order-free equity position are available. Other equity management, options, and spreads are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put with a reviewed limit order; no option exit is attached. Other option and spread workflows are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -360,6 +361,90 @@ async def paper_option_expirations(request: Request):
         raise
     except Exception:
         return {"ok": False, "error": "Alpaca Paper expiration lookup failed; no order was sent"}
+
+
+def _paper_option_long_entry(body: dict):
+    service, _ = _paper_service()
+    query = chain_query(body)
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref:
+        raise ValueError("Alpaca Paper account changed; no option order was sent")
+    symbol = body.get("contract")
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now, statuses=active))
+    if any(symbol == leg.symbol.replace(" ", "") for group in groups
+           for order in group.orders if order.status in active for leg in order.legs):
+        raise ValueError("an active order already touches this option contract")
+    chain = service.adapter.query(query)
+    intent = long_entry_plan(body, account, chain)
+    contract = next(contract for contract in chain.contracts
+                    if contract.symbol.replace(" ", "") == intent.leg.symbol)
+    return service, intent, contract
+
+
+@app.post("/api/paper/options/long/preview")
+async def paper_option_long_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, contract = await run_in_threadpool(_paper_option_long_entry,
+                                                       await request.json())
+        quote = contract.quote
+        return {"ok": True, "contract": intent.leg.symbol,
+                "quantity": str(intent.leg.quantity), "limit_price": str(intent.limit_price),
+                "maximum_premium": str(intent.limit_price * intent.leg.quantity * contract.multiplier),
+                "indicative_bid": str(quote.bid) if quote and quote.bid is not None else None,
+                "indicative_ask": str(quote.ask) if quote and quote.ask is not None else None,
+                "quote_at": quote.observed_at.isoformat() if quote else None,
+                "protection": "No broker-held stop or target is attached; maximum premium can be lost"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option preview failed; no order was sent"}
+
+
+@app.post("/api/paper/options/long/submit")
+async def paper_option_long_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_option_long, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper option preflight failed; no order was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_option_long(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, intent, _ = _paper_option_long_entry(body)
+        symbol = intent.leg.symbol
+        def preflight(account):
+            if (account.status.upper() != "ACTIVE" or account.options_trading_level is None or
+                    account.options_approved_level is None or
+                    min(account.options_trading_level, account.options_approved_level) < 2 or
+                    any(position.symbol.replace(" ", "") == symbol for position in account.positions) or
+                    account.balances.buying_power is None or
+                    intent.limit_price * intent.leg.quantity * 100 > account.balances.buying_power):
+                raise ValueError("option account level, buying power, or position changed; no order was sent")
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                       statuses=active))
+            if any(symbol == leg.symbol.replace(" ", "") for group in groups
+                   for order in group.orders if order.status in active for leg in order.legs):
+                raise ValueError("another order appeared for this option; no order was sent")
+        return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 
 def _paper_entry(body: dict, for_submit: bool = False):

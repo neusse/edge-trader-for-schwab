@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from .models import OptionChain, OptionChainQuery, OptionExpirationsQuery, OptionType
+from .models import (AccountSnapshot, AssetType, OptionChain, OptionChainQuery,
+                     OptionExpirationsQuery, OptionType, OrderInstruction,
+                     OrderLegIntent, OrderType, SimpleOrderIntent, TimeInForce)
 
 UNDERLYING = re.compile(r"[A-Z][A-Z0-9.]{0,5}\Z")
 OCC = re.compile(r"([A-Z0-9.]{1,6}) {0,5}(\d{2})(\d{2})(\d{2})([CP])(\d{8})\Z")
@@ -98,3 +101,51 @@ def chain_response(query: OptionChainQuery, chain: OptionChain) -> dict:
             "expiration": query.expiration.isoformat(), "option_type": query.option_type.value,
             "source": "Alpaca indicative options", "realtime": False,
             "observed_at": chain.observed_at.isoformat(), "contracts": rows}
+
+
+def long_entry_plan(body: dict, account: AccountSnapshot, chain: OptionChain,
+                    now: datetime | None = None) -> SimpleOrderIntent:
+    """One reviewed, unprotected, long call/put limit entry for Paper only."""
+    query = chain_query(body, now)
+    today = (now or datetime.now(ET)).astimezone(ET).date()
+    if query.expiration <= today:
+        raise ValueError("opening an option on its expiration day is unavailable")
+    if (account.status.upper() != "ACTIVE" or account.options_trading_level is None or
+            account.options_approved_level is None or
+            min(account.options_trading_level, account.options_approved_level) < 2):
+        raise ValueError("Alpaca Paper account needs active level 2 options access")
+    if chain.underlying != query.underlying:
+        raise ValueError("option chain underlying changed")
+    symbol = body.get("contract")
+    candidates = [contract for contract in chain.contracts if contract.symbol.replace(" ", "") == symbol]
+    if len(candidates) != 1:
+        raise ValueError("choose exactly one contract from the current option chain")
+    contract = candidates[0]
+    if (contract.expiration != query.expiration or contract.option_type != query.option_type or
+            contract.underlying != query.underlying or not contract.tradable or
+            contract.multiplier != 100 or _occ_symbol(contract.symbol, query, contract.strike) != symbol):
+        raise ValueError("selected option contract is not a tradable standard contract")
+    if any(position.symbol.replace(" ", "") == symbol for position in account.positions):
+        raise ValueError("an option position already exists; manage it before adding")
+    try:
+        quantity = Decimal(str(body.get("quantity")))
+        limit = Decimal(str(body.get("limit_price")))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("contracts and limit price must be positive numbers") from None
+    if (not quantity.is_finite() or quantity <= 0 or quantity != quantity.to_integral_value() or
+            quantity > 100):
+        raise ValueError("option entry requires 1 to 100 whole contracts")
+    if (not limit.is_finite() or limit <= 0 or
+            limit != limit.quantize(Decimal("0.01"))):
+        raise ValueError("option limit price must be positive with cent precision")
+    premium = quantity * limit * contract.multiplier
+    if (account.balances.buying_power is None or
+            premium > account.balances.buying_power):
+        raise ValueError("maximum premium exceeds available Paper buying power")
+    try:
+        request_id = UUID(str(body.get("request_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("request_id must be a UUID") from None
+    return SimpleOrderIntent(
+        OrderLegIntent(symbol, AssetType.OPTION, OrderInstruction.BUY_TO_OPEN, quantity),
+        OrderType.LIMIT, TimeInForce.DAY, f"et-opt-{request_id.hex}", limit_price=limit)

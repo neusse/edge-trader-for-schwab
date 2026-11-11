@@ -5,10 +5,14 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from companion.brokers.models import (OptionChain, OptionContract, OptionGreeks,
-                                      OptionType, Quote)
+from companion.brokers.models import (AccountQuery, AccountSnapshot, AssetType,
+                                      BalanceSnapshot, MutationResult, MutationStatus,
+                                      OptionChain, OptionChainQuery, OptionContract,
+                                      OptionGreeks, OptionType, OrderInstruction,
+                                      OrdersQuery, Position, PositionSide, Quote)
 from companion.brokers.paper_options import chain_query, chain_response
-from companion.brokers.paper_options import expirations_query, expirations_response
+from companion.brokers.paper_options import (expirations_query, expirations_response,
+                                             long_entry_plan)
 
 
 NOW = datetime(2026, 11, 11, 17, 0, tzinfo=timezone.utc)
@@ -23,6 +27,17 @@ def _chain():
                               D("225"), OptionType.CALL, quote=quote,
                               open_interest=D("111"), implied_volatility=D("0.27"))
     return OptionChain("AAPL", (contract,), NOW)
+
+
+def _account(level=3, positions=()):
+    return AccountSnapshot("paper-account", "ACTIVE",
+                           BalanceSnapshot(buying_power=D("10000")), positions,
+                           options_trading_level=level, options_approved_level=3)
+
+
+def _entry_body():
+    return {**BODY, "contract": "AAPL261113C00225000", "quantity": "2",
+            "limit_price": "1.35", "request_id": "8d112e10-6866-4bd1-9606-0f4e81a0cf6f"}
 
 
 def test_chain_query_requires_exact_near_expiry_and_type():
@@ -70,6 +85,26 @@ def test_chain_response_refuses_mismatched_terms_or_unexpected_quote():
                            contract.option_type, quote=wrong),), NOW))
 
 
+def test_long_option_entry_is_limit_day_bto_with_no_attached_exits():
+    plan = long_entry_plan(_entry_body(), _account(), _chain(), NOW)
+    assert plan.leg.instruction == OrderInstruction.BUY_TO_OPEN
+    assert plan.leg.asset_type == AssetType.OPTION and plan.leg.quantity == 2
+    assert plan.limit_price == D("1.35") and plan.client_order_id.startswith("et-opt-")
+
+
+def test_long_option_entry_refuses_level_position_and_bad_premium():
+    body = _entry_body()
+    with pytest.raises(ValueError, match="level 2"):
+        long_entry_plan(body, _account(level=1), _chain(), NOW)
+    held = Position(body["contract"], AssetType.OPTION, PositionSide.LONG, D("1"), D("1"))
+    with pytest.raises(ValueError, match="position already exists"):
+        long_entry_plan(body, _account(positions=(held,)), _chain(), NOW)
+    with pytest.raises(ValueError, match="buying power"):
+        long_entry_plan({**body, "limit_price": "100"}, _account(), _chain(), NOW)
+    with pytest.raises(ValueError, match="whole contracts"):
+        long_entry_plan({**body, "quantity": "1.5"}, _account(), _chain(), NOW)
+
+
 def test_option_discovery_route_uses_active_paper_adapter_without_mutation(monkeypatch):
     import companion.app as appmod
 
@@ -100,3 +135,33 @@ def test_option_expirations_route_reads_adapter_without_mutation(monkeypatch):
                          headers={"X-Companion": "1"})
     assert result.status_code == 200 and result.json()["expirations"] == ["2026-11-13"]
     assert len(observed) == 1 and observed[0].underlying == "AAPL"
+
+
+def test_long_option_preview_and_submit_are_account_bound_and_one_shot(monkeypatch):
+    import companion.app as appmod
+
+    queries, commands = [], []
+    account = _account()
+    def query(value):
+        queries.append(value)
+        if isinstance(value, AccountQuery): return account
+        if isinstance(value, OrdersQuery): return ()
+        if isinstance(value, OptionChainQuery): return _chain()
+        raise AssertionError(type(value))
+    def execute(command, request_id, preflight):
+        preflight(account)
+        commands.append((command, request_id))
+        return MutationResult(MutationStatus.ACCEPTED, "paper-option-order")
+    service = SimpleNamespace(adapter=SimpleNamespace(query=query),
+                              account_ref="paper-account", execute=execute)
+    monkeypatch.setattr(appmod, "_paper_service", lambda: (service, {}))
+    monkeypatch.setattr("companion.brokers.paper_options.datetime", SimpleNamespace(
+        now=lambda _tz: NOW))
+    client = TestClient(appmod.app, base_url=f"http://127.0.0.1:{appmod.PORT}")
+    headers = {"X-Companion": "1"}
+    preview = client.post("/api/paper/options/long/preview", json=_entry_body(), headers=headers)
+    assert preview.json()["maximum_premium"] == "270.00"
+    assert "No broker-held stop" in preview.json()["protection"]
+    submit = client.post("/api/paper/options/long/submit", json=_entry_body(), headers=headers)
+    assert submit.json()["ok"] and submit.json()["order_id"] == "paper-option-order"
+    assert len(commands) == 1 and commands[0][0].intent.leg.instruction == OrderInstruction.BUY_TO_OPEN
