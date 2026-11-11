@@ -344,7 +344,7 @@ def test_broker_metadata_distinguishes_api_capability_from_enabled_workflow():
     assert paper["workflows"] == ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
                                   "equity-oco-adjust", "equity-add", "equity-trailing",
                                   "option-long-entry", "option-close", "option-cancel",
-                                  "option-fixed-exit", "option-covered-short")
+                                  "option-fixed-exit", "option-covered-short", "vertical-entry")
     assert "option-bracket" in paper["unsupported"]
     assert "Paper" in paper["help"]
     demo = broker_info("demo")

@@ -39,6 +39,7 @@ from .brokers.paper_options import (chain_query, chain_response, expirations_que
                                     expirations_response, long_entry_plan,
                                     option_close_plan, option_fixed_exit_plan,
                                     short_entry_plan, covered_call_reserved_shares, OCC)
+from .brokers.paper_vertical import vertical_entry_plan
 from .poller import Poller
 from .trading import OCC_RE, Trader
 from .view import private_view
@@ -82,12 +83,12 @@ APP_WORKFLOWS = {
     "alpaca-paper": ("equity-bracket", "equity-oco", "equity-close", "equity-partial",
                      "equity-oco-adjust", "equity-add", "equity-trailing",
                      "option-long-entry", "option-close", "option-cancel",
-                     "option-fixed-exit", "option-covered-short"),
+                     "option-fixed-exit", "option-covered-short", "vertical-entry"),
     "demo": (),
 }
 BROKER_HELP = {
     "schwab": "Schwab ticket, position management, and spreads are available when account data is fresh.",
-    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Held options can be closed or given one fixed stop, stop-limit, or target, and unfilled option quantities canceled. Option exits are single orders, never OCO pairs. Other option and spread workflows are still being connected.",
+    "alpaca-paper": "Paper equity bracket and held-position management are available. A level-2-or-higher Paper account can open a long call or put; level 1 can sell a covered call or cash-secured put. Level 3 can open a defined-risk vertical with one multi-leg order. Held options can be closed or given one fixed stop, stop-limit, or target, and unfilled option quantities canceled. Spread exits and app-watched stops are still being connected.",
     "demo": "Invented demo data only. No broker orders can be sent or changed.",
 }
 
@@ -541,6 +542,86 @@ def _send_paper_option_short(body: dict, request_id: str):
                                                        statuses=active))
             if _short_collateral_order_conflict(groups, underlying):
                 raise ValueError("another order appeared for this underlying; no short order was sent")
+        return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
+
+
+def _paper_vertical_entry(body: dict):
+    service, _ = _paper_service()
+    query = chain_query(body)
+    account = service.adapter.query(AccountQuery())
+    if account.account_ref != service.account_ref:
+        raise ValueError("Alpaca Paper account changed; no vertical was sent")
+    now = datetime.now(timezone.utc)
+    active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                        OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+    groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                               statuses=active))
+    if _short_collateral_order_conflict(groups, query.underlying):
+        raise ValueError("an active order touches this underlying; resolve it before a vertical")
+    chain = service.adapter.query(query)
+    intent = vertical_entry_plan(body, account, chain)
+    return service, intent, chain
+
+
+@app.post("/api/paper/vertical/entry/preview")
+async def paper_vertical_entry_preview(request: Request):
+    _guard(request)
+    try:
+        _, intent, chain = await run_in_threadpool(_paper_vertical_entry, await request.json())
+        contracts = {contract.symbol.replace(" ", ""): contract
+                     for contract in chain.contracts}
+        long, short = (contracts[leg.symbol] for leg in intent.legs)
+        width = abs(long.strike - short.strike)
+        net = intent.limit_price
+        debit = net > 0
+        return {"ok": True, "long_contract": intent.legs[0].symbol,
+                "short_contract": intent.legs[1].symbol,
+                "quantity": str(intent.legs[0].quantity),
+                "net_price": str(net), "kind": "debit" if debit else "credit",
+                "strike_width": str(width),
+                "maximum_loss": str((net if debit else width + net) *
+                                    intent.legs[0].quantity * 100),
+                "protection": "One broker-held two-leg order. No broker-held spread stop or target is attached after fill; an app-watched stop is unavailable until monitoring is connected."}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper vertical preview failed; no order was sent"}
+
+
+@app.post("/api/paper/vertical/entry/submit")
+async def paper_vertical_entry_submit(request: Request):
+    _guard(request)
+    try:
+        body = await request.json()
+        request_id = str(UUID(str(body.get("request_id"))))
+        result = await run_in_threadpool(_send_paper_vertical_entry, body, request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    except HTTPException:
+        raise
+    except Exception:
+        return {"ok": False, "error": "Alpaca Paper vertical preflight failed; no order was sent"}
+    return {"ok": result.accepted, "status": result.status.value,
+            "order_id": result.order_id, "message": result.message,
+            "request_id": request_id}
+
+
+def _send_paper_vertical_entry(body: dict, request_id: str):
+    with BROKER_ACTION_LOCK:
+        service, intent, chain = _paper_vertical_entry(body)
+        def preflight(account):
+            if account.account_ref != service.account_ref:
+                raise ValueError("vertical account changed; no order was sent")
+            vertical_entry_plan(body, account, chain)
+            now = datetime.now(timezone.utc)
+            active = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
+                                OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
+            groups = service.adapter.query(OrdersQuery(now - timedelta(days=3650), now,
+                                                       statuses=active))
+            if _short_collateral_order_conflict(groups, chain.underlying):
+                raise ValueError("another order appeared for this underlying; no vertical was sent")
         return service.execute(SubmitOrder(intent), request_id, preflight=preflight)
 
 
