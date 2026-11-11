@@ -27,7 +27,7 @@ from . import schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .brokers.models import (
     AssetType, CancelOrder, MutationResult, MutationStatus, OrderInstruction,
-    OrderLegIntent, OrderType, SimpleOrderIntent, SubmitOrder, TimeInForce,
+    OrderLegIntent, OrderType, ReplaceOrder, SimpleOrderIntent, SubmitOrder, TimeInForce,
 )
 from .brokers.schwab_adapter import SchwabAdapter
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
@@ -1174,22 +1174,29 @@ class Trader:
     SETTLED = {"FLAT", "RATE_LIMITED", "REJECTED", "RESOLVED_MANUALLY", "DONE", "CHECK", "FINAL"}
 
     def _unresolved_close(self, symbol: str, client=None) -> dict | None:
-        """The latest close, partial, add, or target for this symbol if its outcome is open: SENDING /
+        """The latest symbol mutation if its outcome is open: SENDING /
         UNKNOWN (no answer), or a Schwab status that is not final (WORKING, QUEUED, SENT...). An
         open Schwab status is asked again first; once Schwab says it is final, it stops blocking.
         Until then no new close, partial, stop, target or trail is sent for the symbol. Looks back
         30 days, not just today: an unclear close before an overnight hold must still block."""
         start = datetime.now(timezone.utc) - timedelta(days=30)
         acts = [a for a in self.store.actions_since(start.isoformat())
-                if a["kind"] in ("close", "partial", "add", "set_target") and a["symbol"] == symbol]
+                if a["kind"] in ("close", "partial", "add", "set_target", "move_stop", "create_stop")
+                and a["symbol"] == symbol]
         if not acts:
             return None
-        last = acts[-1]
+        # Resolve is the user's explicit acknowledgement of every unclear action on the symbol.
+        # A later, settled protection action cannot silently settle an earlier unclear close.
+        resolved_at = max((i for i, a in enumerate(acts) if a["status"] == "RESOLVED_MANUALLY"), default=-1)
+        latest_by_kind = {a["kind"]: (i, a) for i, a in enumerate(acts[resolved_at + 1:])}
+        open_actions = [(i, a) for i, a in latest_by_kind.values()
+                        if a["status"] not in TERMINAL and a["status"] not in self.SETTLED]
+        if not open_actions:
+            return None
+        last = max(open_actions, key=lambda item: item[0])[1]
         st = last["status"]
         if st in ("SENDING", "UNKNOWN"):
             return last
-        if st in TERMINAL or st in self.SETTLED:
-            return None
         oid = last.get("order_id")
         if oid and client is not None:
             try:
@@ -1468,13 +1475,18 @@ class Trader:
                         "error": f"{symbol} has other working orders that Schwab would cancel. Do this in thinkorswim."}
             _, target = self._exit_plan(pend, symbol, side, 0)
             self.store.log_action("move_stop", symbol, None, "SENDING", f"trailing -> fixed {f(price)}")
-            return self._create_stop(client, symbol, side, abs(qty), asset, price, [], set(),
-                                     target=Decimal(str(target)) if target is not None else None, rebuild=True,
-                                     duration=_exit_tif(pend, symbol, side))
+            res = self._create_stop(client, symbol, side, abs(qty), asset, price, [], set(),
+                                    target=Decimal(str(target)) if target is not None else None, rebuild=True,
+                                    duration=_exit_tif(pend, symbol, side))
+            self.store.log_action("move_stop", symbol, None,
+                                  "UNKNOWN" if res.get("unknown") else "DONE" if res.get("ok") else "CHECK",
+                                  res.get("message") or res.get("error") or "stop replacement not confirmed")
+            return res
         had_oco = any(p.oco_id is not None for p in stops)
         had_targets = any(p.symbol == symbol and p.role == "TARGET" and p.live and p.exits(side)
                           for p in pending_orders(fresh, terminal))
         results = []
+        unknown_replace = False
         for p in stops:
             r = self._logged("order_details", lambda o=p.order_id: client.order_details(self._hash, o))
             cur = r.json() if r.status_code == 200 else {}
@@ -1490,34 +1502,49 @@ class Trader:
                     results.append({"order_id": p.order_id, "ok": False, "note": f"already at {f(was)}, not loosened"})
                     continue
             legs = cur.get("orderLegCollection") or []
-            body = {
-                "orderStrategyType": "SINGLE", "orderType": cur.get("orderType", "STOP"),
-                "session": cur.get("session", "NORMAL"), "duration": cur.get("duration", "DAY"),
-                "stopPrice": f(price),
-                "orderLegCollection": [{"instruction": l.get("instruction"),
-                                        "quantity": int(l.get("quantity")) if float(l.get("quantity") or 0).is_integer()
-                                        else l.get("quantity"),
-                                        "instrument": {"symbol": (l.get("instrument") or {}).get("symbol"),
-                                                       "assetType": (l.get("instrument") or {}).get("assetType", "EQUITY")}}
-                                       for l in legs],
-            }
-            if cur.get("orderType") == "STOP_LIMIT" and cur.get("price") is not None:
-                body["price"] = cur.get("price")
+            if len(legs) != 1 or cur.get("orderType") not in ("STOP", "STOP_LIMIT"):
+                results.append({"order_id": p.order_id, "ok": False,
+                                "note": "the current stop is not a single fixed stop"})
+                continue
+            leg = legs[0]
+            if ((leg.get("instrument") or {}).get("symbol") != symbol or
+                    (leg.get("instrument") or {}).get("assetType", "EQUITY") != asset or
+                    str(cur.get("duration", "DAY")).upper() not in ("DAY", "GTC", "GOOD_TILL_CANCEL")):
+                results.append({"order_id": p.order_id, "ok": False,
+                                "note": "the current stop's symbol, asset, or duration changed"})
+                continue
+            try:
+                replacement = SimpleOrderIntent(
+                    OrderLegIntent(symbol, AssetType[asset], OrderInstruction[leg["instruction"]],
+                                   Decimal(str(leg["quantity"]))),
+                    OrderType.STOP_LIMIT if cur["orderType"] == "STOP_LIMIT" else OrderType.STOP,
+                    TimeInForce.GTC if _gtc(cur.get("duration")) else TimeInForce.DAY,
+                    f"move-stop-{symbol}-{now_iso()}",
+                    limit_price=Decimal(str(cur["price"])) if cur["orderType"] == "STOP_LIMIT" else None,
+                    stop_price=Decimal(f(price)),
+                )
+            except (KeyError, ValueError, TypeError) as e:
+                results.append({"order_id": p.order_id, "ok": False, "note": f"invalid current stop: {e}"})
+                continue
             self.store.log_action("move_stop", symbol, p.order_id, "SENDING",
                                   f"{f(Decimal(str(cur.get('stopPrice') or 0)))} -> {f(price)}")
             try:
-                rr = self._logged("replace_order", lambda o=p.order_id, b=body: client.replace_order(self._hash, o, b))
+                result = self._broker_mutation("replace_order", ReplaceOrder(str(p.order_id), replacement))
             except Exception as e:
+                unknown_replace = True
                 self.store.log_action("move_stop", symbol, p.order_id, "UNKNOWN", repr(e))
                 results.append({"order_id": p.order_id, "ok": False, "note": "no answer from Schwab"})
                 continue
-            if rr.status_code not in (200, 201):
-                self.store.log_action("move_stop", symbol, p.order_id, "REJECTED", f"HTTP {rr.status_code} {rr.text[:200]}")
-                results.append({"order_id": p.order_id, "ok": False,
-                                 "note": f"Schwab refused (HTTP {rr.status_code}): {rr.text[:150]}"})
+            if result.status != MutationStatus.ACCEPTED:
+                unknown_replace |= result.status == MutationStatus.UNKNOWN
+                self.store.log_action("move_stop", symbol, p.order_id,
+                                      result.status.value.upper().replace("-", "_"), result.message)
+                note = ("outcome unknown; check thinkorswim before another move" if result.status == MutationStatus.UNKNOWN
+                        else result.message or "Schwab refused the stop move")
+                results.append({"order_id": p.order_id, "ok": False, "note": note})
                 continue
-            tail = rr.headers.get("Location", "").rstrip("/").split("/")[-1]
-            results.append({"order_id": p.order_id, "ok": True, "new_id": int(tail) if tail.isdigit() else None})
+            results.append({"order_id": p.order_id, "ok": True,
+                            "new_id": int(result.order_id) if result.order_id else None})
         # Verify: each new stop working at the new price, and the OCO's target still working.
         time.sleep(0.6)
         after = self._fresh_orders(client)
@@ -1546,7 +1573,7 @@ class Trader:
                 notes.append(f"Stop {x['order_id']} not moved: {x['note']}.")
         ok = (moved == len(stops) and covered >= abs(qty) - 1e-9 and oco_kept
               and (bool(live_targets) or not had_targets))
-        self.store.log_action("move_stop", symbol, None, "DONE" if ok else "CHECK",
+        self.store.log_action("move_stop", symbol, None, "UNKNOWN" if unknown_replace else "DONE" if ok else "CHECK",
                               " ".join(notes)[:900])
         return {"ok": ok, "symbol": symbol, "stop": f(price), "moved": moved, "of": len(stops),
                 "oco_kept": oco_kept, "message": " ".join(notes), "error": None if ok else " ".join(notes)}
@@ -1948,7 +1975,8 @@ class Trader:
                    (f"Target set at {label} with the trailing stop ({_trail_txt(trail)}) as one OCO."
                     if res.get("ok") else res.get("error") or res.get("message") or "Not confirmed: check thinkorswim.")
                    + self._restart_note(symbol, side, trail, prior_trail_level))
-            self.store.log_action("set_target", symbol, None, "DONE" if res.get("ok") else "CHECK", msg)
+            self.store.log_action("set_target", symbol, None,
+                                  "UNKNOWN" if res.get("unknown") else "DONE" if res.get("ok") else "CHECK", msg)
             return {"ok": bool(res.get("ok")), "symbol": symbol, "target": f(target), "message": msg,
                     "error": None if res.get("ok") else msg}
         if stop is None:
@@ -1973,7 +2001,8 @@ class Trader:
         msg = (res["message"] if res.get("closed") else
                f"Target set at {label} with stop {stop} for {abs(qty):g} {unit_w} as one OCO." + ended + res.get("note", "")
                if res.get("ok") else res.get("error") or res.get("message") or "Not confirmed: check thinkorswim.")
-        self.store.log_action("set_target", symbol, None, "DONE" if res.get("ok") else "CHECK", msg)
+        self.store.log_action("set_target", symbol, None,
+                              "UNKNOWN" if res.get("unknown") else "DONE" if res.get("ok") else "CHECK", msg)
         return {"ok": bool(res.get("ok")), "symbol": symbol, "target": f(target), "message": msg,
                 "error": None if res.get("ok") else msg}
 
@@ -2617,12 +2646,12 @@ class Trader:
             r = self._logged("place_order", lambda: client.place_order(self._hash, order))
         except Exception as e:
             self.store.log_action("create_stop", symbol, None, "UNKNOWN", repr(e))
-            return {"ok": False, "symbol": symbol,
+            return {"ok": False, "unknown": True, "symbol": symbol,
                     "error": "No answer from Schwab: the stop MAY have been placed. Check thinkorswim."}
         if r.status_code >= 500:
             # A server error is not a refusal: the order MAY be live.
             self.store.log_action("create_stop", symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:200]}")
-            return {"ok": False, "symbol": symbol,
+            return {"ok": False, "unknown": True, "symbol": symbol,
                     "error": f"Schwab answered HTTP {r.status_code}: the {what} MAY have been placed. Check thinkorswim "
                              "before setting it again."}
         if r.status_code not in (200, 201):

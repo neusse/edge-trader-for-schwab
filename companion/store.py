@@ -202,7 +202,7 @@ class Store:
     def actions_since(self, iso_utc: str) -> list[dict]:
         with self._lock:
             cur = self._con.execute("select created, kind, symbol, order_id, status, detail from actions "
-                                    "where created >= ? order by created", (iso_utc,))
+                                    "where created >= ? order by created, rowid", (iso_utc,))
             cols = [c[0] for c in cur.description]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
