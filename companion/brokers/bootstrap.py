@@ -460,7 +460,7 @@ class AlpacaBootstrapPoller:
             groups = self._adapter.query(OrdersQuery(now - timedelta(days=3650), now,
                                                      statuses=active))
             if account.account_ref != service.account_ref or not self._auto_be_pair(account, groups, row):
-                raise ValueError("Held position or broker-held OCO changed; no stop was moved")
+                raise ValueError("Held position or broker-held exits changed; no stop was moved")
             quote = self._adapter.query(QuotesQuery((row["symbol"],), AssetType.EQUITY)).get(row["symbol"])
             if (quote is None or quote.symbol != row["symbol"] or quote.source != "Alpaca IEX" or
                     not quote.realtime or not quote.timestamp_verified or
@@ -484,7 +484,7 @@ class AlpacaBootstrapPoller:
                                                         datetime.now(timezone.utc),
                                                         statuses=active))
                 if not self._auto_be_pair(current, later, row):
-                    raise ValueError("OCO changed immediately before Auto B/E; nothing was sent")
+                    raise ValueError("Protected exits changed immediately before Auto B/E; nothing was sent")
 
             attempted = True
             result = service.execute(command, row["request_id"], preflight=preflight)

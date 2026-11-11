@@ -325,3 +325,35 @@ def test_auto_be_replacement_reconciliation_requires_paired_equity_target(tmp_pa
         assert store.open_mutations() == []
     finally:
         store.close()
+
+
+def test_auto_be_bracket_reconciliation_requires_filled_entry_and_both_exits(tmp_path):
+    store = Store.for_broker("alpaca-paper", "paper-account", tmp_path)
+    adapter = FakeBrokerAdapter(ALPACA_PAPER)
+    adapter.given_query(AccountQuery, ACCOUNT, ACCOUNT, ACCOUNT)
+    adapter.given_command(ReplaceOrder, MutationResult(MutationStatus.UNKNOWN, "replacement"))
+    service = BrokerOrderService(adapter, store, "paper-account", clock=lambda: NOW)
+    entry_leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.BUY,
+                         Decimal(2), filled_quantity=Decimal(2))
+    exit_leg = OrderLeg("AAPL", AssetType.EQUITY, OrderInstruction.SELL, Decimal(2))
+    def group(entry_status):
+        entry = BrokerOrder("entry", entry_status, OrderType.LIMIT,
+                            TimeInForce.DAY, (entry_leg,), OrderRole.ENTRY)
+        target = BrokerOrder("target", OrderStatus.WORKING, OrderType.LIMIT,
+                             TimeInForce.DAY, (exit_leg,), OrderRole.TARGET,
+                             limit_price=Decimal(110))
+        stop = BrokerOrder("new-stop", OrderStatus.WORKING, OrderType.STOP,
+                           TimeInForce.DAY, (exit_leg,), OrderRole.STOP,
+                           client_order_id="et-autobe-bracket-test", stop_price=Decimal(100))
+        return OrderGroup("entry", OrderClass.BRACKET, entry_status,
+                          (entry, target, stop))
+    try:
+        command = ReplaceOrder("old-stop", stop_price=Decimal(100),
+                               client_order_id="et-autobe-bracket-test")
+        assert service.execute(command, "be-bracket").status == MutationStatus.UNKNOWN
+        adapter.given_query(ClientOrderQuery, group(OrderStatus.PARTIALLY_FILLED),
+                            group(OrderStatus.FILLED))
+        assert service.reconcile_replace("be-bracket").status == MutationStatus.UNKNOWN
+        assert service.reconcile_replace("be-bracket").status == MutationStatus.ACCEPTED
+    finally:
+        store.close()

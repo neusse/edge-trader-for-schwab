@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from uuid import uuid4
 
-from .models import (AssetType, OrderGroup, OrderStatus, Position, PositionSide,
-                     Quote)
+from .models import (AssetType, OrderClass, OrderGroup, OrderInstruction, OrderRole,
+                     OrderStatus, Position, PositionSide, Quote, TimeInForce)
 from .paper_equity import verified_oco_pair
 from ..store import Store
 
@@ -15,15 +15,51 @@ CONFIRM_GAP = 2.5
 MAX_OBSERVATION_GAP = 20
 
 
+def _bracket_exit_pair(position: Position, group: OrderGroup):
+    if group.order_class != OrderClass.BRACKET or len(group.orders) != 3:
+        raise ValueError("Auto B/E requires a filled Paper bracket with two working exits")
+    entries = [order for order in group.orders if order.role == OrderRole.ENTRY]
+    stops = [order for order in group.orders if order.role == OrderRole.STOP]
+    targets = [order for order in group.orders if order.role == OrderRole.TARGET]
+    if len(entries) != 1 or len(stops) != 1 or len(targets) != 1:
+        raise ValueError("Paper bracket must have exactly one entry, stop, and target")
+    entry, stop, target = entries[0], stops[0], targets[0]
+    if (entry.status != OrderStatus.FILLED or len(entry.legs) != 1 or
+            entry.legs[0].symbol != position.symbol or
+            entry.legs[0].asset_type != AssetType.EQUITY or
+            entry.legs[0].quantity != position.quantity or
+            entry.legs[0].filled_quantity != position.quantity or
+            entry.legs[0].instruction not in (
+                (OrderInstruction.BUY,) if position.side == PositionSide.LONG else
+                (OrderInstruction.SELL, OrderInstruction.SELL_SHORT)) or
+            not entry.client_order_id or not entry.client_order_id.startswith("et-") or
+            stop.time_in_force not in (TimeInForce.DAY, TimeInForce.GTC) or
+            target.time_in_force != stop.time_in_force or
+            any(order.status != OrderStatus.WORKING or len(order.legs) != 1 or
+                order.legs[0].symbol != position.symbol or
+                order.legs[0].asset_type != AssetType.EQUITY or
+                order.legs[0].quantity != position.quantity or
+                order.legs[0].filled_quantity != 0 or
+                order.legs[0].instruction != (OrderInstruction.SELL if
+                    position.side == PositionSide.LONG else OrderInstruction.BUY)
+                for order in (stop, target)) or
+            stop.stop_price is None or target.limit_price is None):
+        raise ValueError("Paper bracket entry or exits changed from the exact held position")
+    return stop, target, entry.client_order_id
+
+
 def oco_auto_be_plan(position: Position, group: OrderGroup) -> dict:
-    """Derive +1R and a tighter cent-priced stop from the held basis and exact OCO."""
-    stop, target = verified_oco_pair(position, group)
+    """Derive +1R from an app-created OCO or filled bracket with two working exits."""
+    if group.order_class == OrderClass.OCO:
+        stop, target = verified_oco_pair(position, group)
+        source_client_id = target.client_order_id
+        if not source_client_id or not source_client_id.startswith("et-oco-"):
+            raise ValueError("Paper Auto B/E needs an app-created, unchanged OCO")
+    else:
+        stop, target, source_client_id = _bracket_exit_pair(position, group)
     if (position.average_price is None or not position.average_price.is_finite() or
             position.average_price <= 0):
         raise ValueError("Paper Auto B/E needs a known positive held entry basis")
-    if (not target.client_order_id or
-            not target.client_order_id.startswith("et-oco-")):
-        raise ValueError("Paper Auto B/E needs an app-created, unchanged OCO")
     basis = position.average_price
     if position.side == PositionSide.LONG:
         risk = basis - stop.stop_price
@@ -48,7 +84,7 @@ def oco_auto_be_plan(position: Position, group: OrderGroup) -> dict:
             "target": target.limit_price, "trigger": trigger, "new_stop": price,
             "group_id": group.group_id, "stop_id": stop.order_id,
             "target_id": target.order_id,
-            "oco_client_id": target.client_order_id}
+            "oco_client_id": source_client_id}
 
 
 class PaperAutoBEWatch:
@@ -200,15 +236,15 @@ class PaperAutoBEWatch:
                                 OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN)
             for leg in order.legs)]
         if len(touching) != 1 or touching[0].group_id != row["group_id"]:
-            return end("Reviewed OCO is not the only active order; Auto B/E ended")
+            return end("Reviewed bracket or OCO is not the only active order; Auto B/E ended")
         try:
             plan = oco_auto_be_plan(position, touching[0])
         except ValueError:
-            return end("Broker-held OCO changed or is no longer fully working; Auto B/E ended")
+            return end("Broker-held exits changed or are no longer fully working; Auto B/E ended")
         if any(plan[key] != row[key] for key in
                ("side", "quantity", "basis", "initial_stop", "target", "trigger",
                 "new_stop", "group_id", "stop_id", "target_id", "oco_client_id")):
-            return end("Broker-held OCO changed since setup; Auto B/E ended")
+            return end("Broker-held exits changed since setup; Auto B/E ended")
         if (quote is None or quote.symbol != symbol or quote.source != "Alpaca IEX" or
                 not quote.realtime or not quote.timestamp_verified or
                 quote.observed_at.tzinfo is None or

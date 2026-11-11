@@ -25,13 +25,13 @@ one broker-held OCO target and fixed stop after a fresh position, order, and IEX
 OCO's working target can be moved, and its fixed stop can only be tightened, after a fresh broker
 read and an exact-price replacement confirmation. Replacement outcomes block further order actions
 until Alpaca confirms the new client order ID and price. The same
-app-created, unchanged OCO can opt into **Paper Auto B/E +1R** from its working stop row.
+app-created, unchanged OCO or filled bracket can opt into **Paper Auto B/E +1R** from its working stop row.
 This is an app-watched move: after two distinct fresh IEX quotes at +1R, the app checks the
 held position and both OCO exits again, then attempts one tighter fixed-stop replacement at
 the held entry basis. The original stop is broker-held before the move; protection is unconfirmed
 while Alpaca processes the replacement.
 Auto B/E pauses if the app is off, the market is closed, or quotes are stale. A changed position
-or OCO ends the watch and requires a new review. An uncertain replacement blocks further broker
+or protected exit group ends the watch and requires a new review. An uncertain replacement blocks further broker
 actions until reconciled; the app never retries it automatically.
 The same
 order-free position can instead be closed fully or partially with one market order from the Positions

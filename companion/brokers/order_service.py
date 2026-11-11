@@ -255,7 +255,19 @@ class BrokerOrderService:
             if client_order_id.startswith("et-autobe-") and order.status != OrderStatus.REJECTED:
                 target = next((item for item in group.orders
                                if item.role == OrderRole.TARGET), None)
-                if (group.order_class != OrderClass.OCO or len(group.orders) != 2 or
+                entry = next((item for item in group.orders
+                              if item.role == OrderRole.ENTRY), None)
+                shape_ok = (
+                    group.order_class == OrderClass.OCO and len(group.orders) == 2 or
+                    group.order_class == OrderClass.BRACKET and len(group.orders) == 3 and
+                    len(order.legs) == 1 and entry is not None and
+                    entry.status == OrderStatus.FILLED and
+                    len(entry.legs) == 1 and entry.legs[0].asset_type == AssetType.EQUITY and
+                    entry.legs[0].quantity == order.legs[0].quantity and
+                    entry.legs[0].filled_quantity == order.legs[0].quantity and
+                    entry.legs[0].symbol == order.legs[0].symbol and
+                    entry.legs[0].instruction != order.legs[0].instruction)
+                if (not shape_ok or
                         order.role != OrderRole.STOP or target is None or
                         target.status != OrderStatus.WORKING or
                         len(order.legs) != 1 or len(target.legs) != 1 or
@@ -266,8 +278,8 @@ class BrokerOrderService:
                         order.legs[0].instruction != target.legs[0].instruction or
                         order.legs[0].instruction not in (OrderInstruction.SELL,
                                                           OrderInstruction.BUY) or
-                        order.time_in_force != TimeInForce.GTC or
-                        target.time_in_force != TimeInForce.GTC or
+                        order.time_in_force not in (TimeInForce.DAY, TimeInForce.GTC) or
+                        target.time_in_force != order.time_in_force or
                         target.limit_price is None or
                         order.legs[0].filled_quantity != 0 or
                         target.legs[0].filled_quantity != 0):
