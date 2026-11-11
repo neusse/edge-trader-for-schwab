@@ -27,13 +27,17 @@ sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 
 from companion.brokers.alpaca_paper import AlpacaPaperAdapter  # noqa: E402
-from companion.brokers.models import (AccountQuery, FillsQuery, OrderStatus,
-                                      OrdersQuery)  # noqa: E402
+from companion.brokers.models import (AccountQuery, FillsQuery, MarketClockQuery,
+                                      OrderStatus, OrdersQuery)  # noqa: E402
 
 ACTIVE = frozenset((OrderStatus.PENDING, OrderStatus.WORKING,
                     OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN))
 ET = ZoneInfo("America/New_York")
 DATA = ROOT / "data"
+
+
+class PreflightRefused(ValueError):
+    """Safe, identifier-free reason to delay the first controlled Paper action."""
 
 
 def ref(value: object, salt: bytes) -> str:
@@ -107,12 +111,30 @@ def collect(scenario: str, app: dict, status: dict, account, groups, fills,
     }
 
 
+def require_clean_market(record: dict, broker_clock, now: datetime) -> None:
+    """Verify an empty, open Paper session before the first controlled order."""
+    app, paper = record["app"], record["paper"]
+    if (not broker_clock.is_open or broker_clock.observed_at.tzinfo is None or
+            not 0 <= (now - broker_clock.observed_at).total_seconds() <= 60 or
+            broker_clock.next_close <= now or not app["market_open"]):
+        raise PreflightRefused("the app and Alpaca Paper must both report a fresh open session")
+    if not app["ready"]:
+        raise PreflightRefused("the selected Paper app is not ready")
+    if app["armed"] or app["unresolved_request_refs"]:
+        raise PreflightRefused("the app must be disarmed with no unresolved mutation")
+    if (app["positions"] or app["working_orders"] or paper["positions"] or
+            paper["working_orders"] or paper["fills_today"]):
+        raise PreflightRefused("the Paper account must have no positions, working orders, or same-day fills")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scenario", help="Short scenario label, such as baseline or bracket-filled")
     parser.add_argument("--port", type=int, default=8770, help="Local Edge Trader port (default: 8770)")
     parser.add_argument("--output", default=str(DATA / "paper-e2e-evidence.jsonl"),
                         help="JSONL file under the repository's ignored data/ directory")
+    parser.add_argument("--require-clean-market", action="store_true",
+                        help="Require a fresh open Paper session and empty account before writing")
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", args.scenario):
         parser.error("scenario must be 1-40 lowercase letters, digits, or hyphens")
@@ -147,6 +169,11 @@ def main() -> None:
             raise ValueError("local evidence salt is invalid")
         record = collect(args.scenario, app, status, account, groups, fills,
                          now=now, revision=_git_revision(), salt=salt)
+        if args.require_clean_market:
+            broker_clock = adapter.query(MarketClockQuery())
+            require_clean_market(record, broker_clock, now)
+            record["preflight"] = {"clean_market": True,
+                                   "broker_clock_at": broker_clock.observed_at.isoformat()}
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
@@ -154,6 +181,8 @@ def main() -> None:
         print(f"Saved {args.scenario}: {len(record['paper']['positions'])} positions, "
               f"{len(record['paper']['working_orders'])} working orders, "
               f"{len(record['paper']['fills_today'])} fills today -> {output}")
+    except PreflightRefused as exc:
+        parser.exit(2, f"Preflight refused: {exc}; no record written.\n")
     except Exception as exc:
         detail = "record may already be written" if record_written else "no record written"
         parser.exit(1, f"Evidence capture failed ({type(exc).__name__}); {detail}.\n")

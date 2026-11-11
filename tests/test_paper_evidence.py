@@ -1,7 +1,7 @@
 """The Paper evidence file must preserve order state without disclosing broker IDs."""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -9,7 +9,8 @@ import pytest
 
 from companion.brokers.models import (AssetType, OrderClass, OrderInstruction,
                                       OrderRole, OrderStatus, PositionSide)
-from scripts.capture_paper_evidence import collect, ref
+from scripts.capture_paper_evidence import (PreflightRefused, collect, ref,
+                                            require_clean_market)
 
 
 def test_capture_redacts_account_order_fill_and_symbol_identifiers():
@@ -63,3 +64,31 @@ def test_capture_refuses_non_paper_app():
 def test_local_salt_keeps_references_stable_only_within_one_evidence_file():
     assert ref("private-order", b"first") == ref("private-order", b"first")
     assert ref("private-order", b"first") != ref("private-order", b"second")
+
+
+def test_clean_market_preflight_requires_independent_open_paper_clock_and_empty_views():
+    now = datetime(2026, 11, 11, 15, 0, tzinfo=timezone.utc)
+    clock = SimpleNamespace(is_open=True, observed_at=now - timedelta(seconds=5),
+                            next_close=now + timedelta(hours=5))
+    record = {"app": {"ready": True, "market_open": True, "armed": False,
+                      "unresolved_request_refs": [], "positions": [],
+                      "working_orders": []},
+              "paper": {"positions": [], "working_orders": [], "fills_today": []}}
+    require_clean_market(record, clock, now)
+    with pytest.raises(PreflightRefused, match="open session"):
+        require_clean_market(record, SimpleNamespace(**{**vars(clock), "is_open": False}), now)
+    with pytest.raises(PreflightRefused, match="open session"):
+        require_clean_market(record, SimpleNamespace(**{**vars(clock),
+                                                      "observed_at": now - timedelta(minutes=2)}), now)
+    with pytest.raises(PreflightRefused, match="open session"):
+        require_clean_market({**record, "app": {**record["app"], "market_open": False}},
+                             clock, now)
+    with pytest.raises(PreflightRefused, match="disarmed"):
+        require_clean_market({**record, "app": {**record["app"], "armed": True}}, clock, now)
+    with pytest.raises(PreflightRefused, match="unresolved"):
+        require_clean_market({**record, "app": {**record["app"],
+                                                "unresolved_request_refs": ["opaque"]}}, clock, now)
+    with pytest.raises(PreflightRefused, match="no positions"):
+        require_clean_market({**record, "paper": {**record["paper"],
+                                                    "working_orders": [{"order_ref": "opaque"}]}},
+                             clock, now)
