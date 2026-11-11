@@ -54,4 +54,10 @@ async (page) => {
   if (!(await page.locator("#paper-entry").isVisible())) throw new Error("Paper entry form is hidden");
   if (await page.locator("#paper-options").isVisible()) throw new Error("Option controls are visible");
   if (await page.locator('#t-asset button[data-v="OPTION"]').isVisible()) throw new Error("Option ticket is visible");
+  const optionWorkspace = await page.evaluate(() => renderWorkspace({
+    symbol: "SPY   261120C00600000", display: "SPY call", side: "LONG",
+    qty: 1, asset_type: "OPTION",
+  }, lastState));
+  if (!optionWorkspace.includes("Option trading is disabled") || optionWorkspace.includes("Cancel orders"))
+    throw new Error("Cockpit exposed option management controls");
 }
